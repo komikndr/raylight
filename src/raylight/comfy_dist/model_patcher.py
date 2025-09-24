@@ -3,6 +3,9 @@ from __future__ import annotations
 import collections
 
 import torch
+import gc
+from torch.distributed.utils import _free_storage
+from torch.distributed.fsdp import FSDPModule
 
 import comfy
 from comfy.model_patcher import (get_key_weight,
@@ -11,9 +14,16 @@ from comfy.model_patcher import (get_key_weight,
 
 from raylight import comfy_dist
 from comfy.patcher_extension import CallbacksMP
-
 from torch.distributed.tensor import DTensor
 import logging
+
+def model_size_mb(model: torch.nn.Module) -> float:
+    """
+    Return total model size in MB (parameters + buffers).
+    """
+    param_size = sum(p.numel() * p.element_size() for p in model.parameters())
+    buffer_size = sum(b.numel() * b.element_size() for b in model.buffers())
+    return (param_size + buffer_size) / (1024**2)
 
 
 class LowVramPatch:
@@ -203,3 +213,33 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         if src_cls != FSDPModelPatcher:
             n.size = 0
         return n
+
+    # def __del__(self):
+    #     print(self.model.__dict__.keys())
+    #     for m in self.model.modules():
+    #         if isinstance(m, FSDPModule):
+    #             _free_storage(m._modules._handle.data)
+    #     del self.model
+    #     gc.collect()
+    #     comfy.model_management.soft_empty_cache()
+    def __del__(self):
+        print(f"[DEL] Before cleanup: {model_size_mb(self.model):.2f} MB")
+        self.detach(unpatch_all=False)
+
+        for m in self.model.modules():
+            for p in m.parameters(recurse=False):
+                if isinstance(p, DTensor):
+                    local = p.to_local()
+                    _free_storage(local.data)
+                elif isinstance(p, torch.Tensor):
+                    _free_storage(p.data)
+
+        del self.model
+        self.model = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        print("[DEL] After cleanup (gc + cuda.empty_cache done)")
+        print(f"[DEL] CUDA mem allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+        print(f"[DEL] CUDA mem reserved : {torch.cuda.memory_reserved() / 1024**2:.2f} MB")

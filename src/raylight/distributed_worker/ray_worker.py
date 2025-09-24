@@ -7,6 +7,7 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 import ray
+from torch.distributed.fsdp import FSDPModule
 
 import comfy
 from comfy import (
@@ -138,8 +139,6 @@ class RayWorker:
         self.parallel_dict = parallel_dict
         self.device = torch.device(f"cuda:{self.device_id}")
         self.device_mesh = None
-        self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
-
         self.is_model_loaded = False
 
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
@@ -203,9 +202,6 @@ class RayWorker:
                     ulysses_degree=ulysses_degree,
                 )
 
-    def get_compute_capability(self):
-        return self.compute_capability
-
     def get_parallel_dict(self):
         return self.parallel_dict
 
@@ -244,6 +240,17 @@ class RayWorker:
             raise ValueError("Model recieved is not meta, can cause OOM in large model")
 
     def load_unet(self, unet_path, model_options):
+        try:
+            if isinstance(self.model.model.diffusion_model, FSDPModule):
+                print("WARNING FSDP MODULE ALREADY LOADED, DELETE")
+                del self.model
+                self.model = None
+        except:
+            print("NO FSDP MODULE DETECTED")
+
+        self.model = comfy.sd.load_diffusion_model(
+            unet_path, model_options=model_options,
+        )
         self.model = comfy.sd.load_diffusion_model(
             unet_path, model_options=model_options,
         )
@@ -272,6 +279,9 @@ class RayWorker:
         print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(self.model.model.diffusion_model).__name__}")
 
         if not isinstance(self.model.model.diffusion_model, FSDPModule):
+            print("============= BEFORE WRAP ==============")
+            print(type(self.model.model.diffusion_model))
+            print("THIS IS NOT FSDP MODULE")
             if isinstance(self.model.model, model_base.WAN21) or isinstance(self.model.model, model_base.WAN22):
                 from ..wan.distributed.fsdp import shard_model_fsdp2
                 self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
@@ -294,9 +304,13 @@ class RayWorker:
             self.state_dict = None
             comfy.model_management.soft_empty_cache()
             gc.collect()
+            print("============= AFTER WRAP ==============")
+            print(type(self.model.model.diffusion_model))
             print("FSDP registered")
         else:
+            print("============= NO NEED TO WRAP ==============")
             print("FSDP already registered, skip wrapping...")
+            print(type(self.model.model.diffusion_model))
 
     def load_lora(self,):
         for lora in self.lora_list:
@@ -511,6 +525,10 @@ def ensure_fresh_actors(ray_actors_init):
         # Actor already dead or crashed
         needs_restart = True
 
+    # ONLY FOR TESTING #
+    needs_restart = False
+    ####################
+
     if needs_restart:
         for actor in gpu_actors:
             try:
@@ -523,4 +541,3 @@ def ensure_fresh_actors(ray_actors_init):
     parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
 
     return ray_actors, gpu_actors, parallel_dict
-

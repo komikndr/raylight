@@ -145,6 +145,7 @@ class RayUNETLoader:
     CATEGORY = "Raylight"
 
     def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, lora=None):
+        # Kill actor if model exist
         ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
 
         model_options = {}
@@ -156,32 +157,7 @@ class RayUNETLoader:
         elif weight_dtype == "fp8_e5m2":
             model_options["dtype"] = torch.float8_e5m2
 
-        #  Collect compute capabilities from Ray workers
-        cc_futures = []
-        for actor in gpu_actors:
-            cc_futures.append(
-                actor.get_compute_capability.remote()
-            )
-
-        compute_capabilities = [ray.get(cc) for cc in cc_futures]
-        unique_cc = set(compute_capabilities)
-
-        if len(unique_cc) > 1:
-            print(f"Multiple device architectures detected: {unique_cc}, choosing the oldest")
-            oldest = min(unique_cc)
-        else:
-            oldest = next(iter(unique_cc))
-
-        device_arch = oldest
-        # Check for flash_attn compatibility
-        if parallel_dict["is_xdit"] is True and device_arch <= 61:
-            raise ValueError(
-                f"Pascal detected (sm{device_arch}), cannot use USP"
-            )
-
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
-
-        # Kill actor if model exist
 
         loaded_futures = []
         patched_futures = []
