@@ -24,6 +24,8 @@ from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_mod
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise
 from ray.exceptions import RayActorError
 
+from ..diffusion_models.modules.diffusionmodules.xdit_pipefusion_parallel import pipefusion_wrapper
+
 
 # Developer reminder, Checking model parameter outside ray actor is very expensive (e.g Comfy main thread)
 # the model need to be serialized, send to object store and can cause OOM !, so setter and getter is the pattern !
@@ -145,6 +147,12 @@ class RayWorker:
 
     def get_is_model_loaded(self):
         return self.is_model_loaded
+
+    def patch_pipefusion(self):
+        self.model.add_wrapper(
+            pe.WrappersMP.OUTER_SAMPLE,
+            pipefusion_wrapper
+        )
 
     def patch_cfg(self):
         self.model.add_wrapper(

@@ -220,6 +220,9 @@ class RayUNETLoader:
                 if parallel_dict["cfg_degree"] > 1:
                     patched_futures.append(actor.patch_cfg.remote())
 
+        for actor in gpu_actors:
+            patched_futures.append(actor.patch_pipefusion.remote())
+
         ray.get(patched_futures)
 
         return (ray_actors,)
