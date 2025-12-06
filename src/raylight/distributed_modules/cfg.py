@@ -67,6 +67,36 @@ def _inject_hunyuan():
     return cfg_parallel_forward_wrapper
 
 
+@CFGParallelInjectRegistry.register(model_base.AuraFlow)
+def _inject_aura_flow():
+    from ..diffusion_models.aura.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+    return cfg_parallel_forward_wrapper
+
+
+@CFGParallelInjectRegistry.register(model_base.CosmosVideo)
+def _inject_cosmos():
+    from ..diffusion_models.cosmos.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+    return cfg_parallel_forward_wrapper
+
+
+@CFGParallelInjectRegistry.register(model_base.HiDream)
+def _inject_hidream():
+    from ..diffusion_models.hidream.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+    return cfg_parallel_forward_wrapper
+
+
+@CFGParallelInjectRegistry.register(model_base.LTXV)
+def _inject_ltxv():
+    from ..diffusion_models.lightricks.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+    return cfg_parallel_forward_wrapper
+
+
+@CFGParallelInjectRegistry.register(model_base.Lumina2)
+def _inject_lumina():
+    from ..diffusion_models.lumina.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+    return cfg_parallel_forward_wrapper
+
+
 # This will cause error for all non specified models above, since all of that will be funneled into this
 @CFGParallelInjectRegistry.register(model_base.BaseModel)
 def _inject_unet():

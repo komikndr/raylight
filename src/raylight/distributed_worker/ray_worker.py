@@ -1,6 +1,7 @@
 import os
 import sys
 import gc
+import types
 from datetime import timedelta
 
 import torch
@@ -21,7 +22,7 @@ from raylight.distributed_modules.usp import USPInjectRegistry
 from raylight.distributed_modules.cfg import CFGParallelInjectRegistry
 
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
-from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise
+from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
 from ray.exceptions import RayActorError
 
 from ..diffusion_models.modules.diffusionmodules.xdit_pipefusion_parallel import pipefusion_wrapper
@@ -38,6 +39,7 @@ from ..diffusion_models.modules.diffusionmodules.xdit_pipefusion_parallel import
 class RayWorker:
     def __init__(self, local_rank, device_id, parallel_dict):
         self.model = None
+        self.vae_model = None
         self.model_type = None
         self.state_dict = None
         self.parallel_dict = parallel_dict
@@ -89,6 +91,7 @@ class RayWorker:
                 initialize_model_parallel,
             )
             xfuser_attn.set_attn_type(self.parallel_dict["attention"])
+            xfuser_attn.set_sync_ulysses(self.parallel_dict["sync_ulysses"])
 
             self.cp_degree = self.parallel_dict["ulysses_degree"] * parallel_dict["ring_degree"]
             self.cfg_degree = self.parallel_dict["cfg_degree"]
@@ -276,6 +279,65 @@ class RayWorker:
         dist.destroy_process_group()
         ray.actor.exit_actor()
 
+    def ray_vae_loader(self, vae_path):
+        from ..comfy_dist.sd import decode_tiled_1d, decode_tiled_, decode_tiled_3d
+        state_dict = {}
+        if "pixel_space" in vae_path:
+            state_dict["pixel_space_vae"] = torch.tensor(1.0)
+        else:
+            state_dict = comfy.utils.load_torch_file(vae_path)
+
+        vae_model = comfy.sd.VAE(sd=state_dict)
+        vae_model.throw_exception_if_invalid()
+
+        vae_model.decode_tiled_1d = types.MethodType(decode_tiled_1d, vae_model)
+        vae_model.decode_tiled_ = types.MethodType(decode_tiled_, vae_model)
+        vae_model.decode_tiled_3d = types.MethodType(decode_tiled_3d, vae_model)
+
+        if self.local_rank == 0:
+            print(f"VAE loaded in {self.global_world_size} GPUs")
+        self.vae_model = vae_model
+
+    @patch_ray_tqdm
+    def ray_vae_decode(
+        self,
+        samples,
+        tile_size,
+        overlap=64,
+        temporal_size=64,
+        temporal_overlap=8
+    ):
+        if tile_size < overlap * 4:
+            overlap = tile_size // 4
+        if temporal_size < temporal_overlap * 2:
+            temporal_overlap = temporal_overlap // 2
+        temporal_compression = self.vae_model.temporal_compression_decode()
+        if temporal_compression is not None:
+            temporal_size = max(2, temporal_size // temporal_compression)
+            temporal_overlap = max(
+                1, min(temporal_size // 2, temporal_overlap // temporal_compression)
+            )
+        else:
+            temporal_size = None
+            temporal_overlap = None
+
+        compression = self.vae_model.spacial_compression_decode()
+
+        images = self.vae_model.decode_tiled(
+            samples["samples"],
+            tile_x=tile_size // compression,
+            tile_y=tile_size // compression,
+            overlap=overlap // compression,
+            tile_t=temporal_size,
+            overlap_t=temporal_overlap,
+        )
+        if len(images.shape) == 5:
+            images = images.reshape(
+                -1, images.shape[-3], images.shape[-2], images.shape[-1]
+            )
+        return images
+
+    @patch_ray_tqdm
     def custom_sampler(
         self,
         add_noise,
@@ -334,6 +396,7 @@ class RayWorker:
         gc.collect()
         return out
 
+    @patch_ray_tqdm
     def common_ksampler(
         self,
         seed,

@@ -4,7 +4,16 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
+## 🚧 WARNING
+FSDP is **BROKEN** in the latest ComfyUI (0.3.76).
+A fix is in progress.
+
 ## UPDATE
+- TeaCache and EasyCache added thanks to [rmatif](https://github.com/rmatif/raylight/tree/easycache)
+- Flux2, Hunyuan 1.5 USP, FSDP
+- Fix broken tqdm progress bar
+- AMD ROCm Aiter attention
+- Z Image, Lumina, Model USP FSDP
 - SDXL and SD 1.5 supported through CFG
 - New parallelism, CFG. Check models note below about Flux or Hunyuan
 - Qwen Image fix for square dim
@@ -20,11 +29,29 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 - Full LoRA support.
 - FSDP CPU offload, analogous to block swap/DisTorch.
 
+
+## Table of Contents
+- [Raylight](#raylight)
+- [UPDATE](#update)
+- [What exactly is Raylight](#what-exactly-is-raylight)
+- [Raylight vs MultiGPU vs ComfyUI Worksplit vs ComfyUI-Distributed](#raylight-vs-multigpu-vs-comfyui-worksplit-branch-vs-comfyui-distributed)
+- [RTM and Known Issues](#rtm-and-known-issues)
+- [Operation](#operation)
+- [Tested GPU](#gpu-architectures)
+- [Supported Models](#supported-models)
+- [Scaled vs Non-Scaled Models](#scaled-vs-non-scaled-models)
+- [Attention](#attention)
+- [Example Wan](#wan-t2v-13b)
+- [Benchmark](#5090-vs-rtx-2000-ada)
+- [Installation](#installation)
+- [Support Me](#support)
+
+
 ## What exactly is Raylight
 
 Raylight is a parallelism node for ComfyUI, where the tensor of an image or video sequence
 is split among GPU ranks. Raylight, as its partial namesake, uses [Ray](https://docs.ray.io/en/latest/ray-core/walkthrough.html)
-to manage its GPU workers.
+to manage its GPU workers. [Introduction to Raylight on Youtube](https://youtu.be/KQxrkJAV4eI?si=JHjZAKZ3RGBCtmFx)
 
 <img width="834" height="1276" alt="image" src="https://github.com/user-attachments/assets/6a79e980-1111-4e31-b6cb-7b6ff35eb766" />
 
@@ -157,6 +184,7 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 | Flux Dev          | ✅  | ✅   | ❌  |
 | Flux Konteks      | ✅  | ✅   | ❌  |
 | Flux Krea         | ✅  | ✅   | ❌  |
+| Flux 2            | ✅  | ✅   | ❌  |
 | Flux ControlNet   | ❌  | ❌   | ❌  |
 
 
@@ -175,10 +203,18 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 | ControlNet        | ❌  | ❌   | ✅  |
 
 
+**Z Image, Lumina 2**
+| Model             | USP | FSDP | CFG |
+|-------------------|-----|------|-----|
+| Z Image           | ✅  | ✅   | ✅  |
+| Lumina 2          | ✅  | ✅   | ✅  |
+
+
 **Hunyuan Video**
 | Model             | USP | FSDP | CFG |
 |-------------------|-----|------|-----|
 | Hunyuan Video     | ✅  | ✅   | ❌  |
+| Hunyuan 1.5       | ✅  | ✅   | ❌  |
 | ControlNet        | ❌  | ❌   | ❌  |
 
 
@@ -258,9 +294,9 @@ https://github.com/user-attachments/assets/d5e262c7-16d5-4260-b847-27be2d809920
   - **Single RTX 2000 ADA:** OOM
   - **5090:** does not require FSDP
 - Results represent the **average of 5 runs**, after warm-up.
-- **All speeds are normalized to seconds per iteration (s/it).**  
+- **All speeds are normalized to seconds per iteration (s/it).**
   For models reporting **iterations per second**, we compute `1 / (it/s)` to convert.
-- **RTX 2000 ADA topology:** P2P is supported but runs over **SYS** path (NUMA cross-socket),  
+- **RTX 2000 ADA topology:** P2P is supported but runs over **SYS** path (NUMA cross-socket),
   meaning **no NVLink is present** and peer bandwidth is reduced.
 
 ## Installation

@@ -1,8 +1,8 @@
 {
   "id": "b2d37916-fab5-425f-850d-7a64886e4d54",
   "revision": 0,
-  "last_node_id": 761,
-  "last_link_id": 1388,
+  "last_node_id": 767,
+  "last_link_id": 1392,
   "nodes": [
     {
       "id": 737,
@@ -60,7 +60,7 @@
         82
       ],
       "flags": {},
-      "order": 11,
+      "order": 10,
       "mode": 0,
       "inputs": [
         {
@@ -132,7 +132,7 @@
         202.72727966308594
       ],
       "flags": {},
-      "order": 13,
+      "order": 12,
       "mode": 0,
       "inputs": [
         {
@@ -146,7 +146,7 @@
           "name": "CONDITIONING",
           "type": "CONDITIONING",
           "links": [
-            1384
+            1389
           ]
         }
       ],
@@ -170,165 +170,6 @@
       "bgcolor": "#353"
     },
     {
-      "id": 710,
-      "type": "VAELoader",
-      "pos": [
-        -2271.54931640625,
-        1335.689697265625
-      ],
-      "size": [
-        370,
-        60
-      ],
-      "flags": {
-        "collapsed": false
-      },
-      "order": 2,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "VAE",
-          "type": "VAE",
-          "links": [
-            1252
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "VAELoader",
-        "cnr_id": "comfy-core",
-        "ver": "0.3.27",
-        "models": [
-          {
-            "name": "ae.safetensors",
-            "url": "https://huggingface.co/Comfy-Org/Lumina_Image_2.0_Repackaged/resolve/main/split_files/vae/ae.safetensors",
-            "directory": "vae"
-          }
-        ],
-        "enableTabs": false,
-        "tabWidth": 65,
-        "tabXOffset": 10,
-        "hasSecondTab": false,
-        "secondTabText": "Send Back",
-        "secondTabOffset": 80,
-        "secondTabWidth": 65
-      },
-      "widgets_values": [
-        "ae.safetensors"
-      ]
-    },
-    {
-      "id": 733,
-      "type": "CLIPLoader",
-      "pos": [
-        -2273.75,
-        1183.48974609375
-      ],
-      "size": [
-        370,
-        110
-      ],
-      "flags": {},
-      "order": 3,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "CLIP",
-          "type": "CLIP",
-          "links": [
-            1342
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "CLIPLoader",
-        "cnr_id": "comfy-core",
-        "ver": "0.3.57",
-        "models": [
-          {
-            "name": "t5xxl_fp8_e4m3fn_scaled.safetensors",
-            "url": "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn_scaled.safetensors",
-            "directory": "text_encoders"
-          }
-        ],
-        "enableTabs": false,
-        "tabWidth": 65,
-        "tabXOffset": 10,
-        "hasSecondTab": false,
-        "secondTabText": "Send Back",
-        "secondTabOffset": 80,
-        "secondTabWidth": 65
-      },
-      "widgets_values": [
-        "t5xxl.safetensors",
-        "chroma",
-        "default"
-      ]
-    },
-    {
-      "id": 754,
-      "type": "XFuserKSamplerAdvanced",
-      "pos": [
-        -1815.9632568359375,
-        1269.5546875
-      ],
-      "size": [
-        312.7340393066406,
-        377.9230041503906
-      ],
-      "flags": {},
-      "order": 16,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "ray_actors",
-          "type": "RAY_ACTORS",
-          "link": 1386
-        },
-        {
-          "name": "positive",
-          "type": "CONDITIONING",
-          "link": 1384
-        },
-        {
-          "name": "negative",
-          "type": "CONDITIONING",
-          "link": 1385
-        },
-        {
-          "name": "latent_image",
-          "type": "LATENT",
-          "link": 1387
-        }
-      ],
-      "outputs": [
-        {
-          "name": "LATENT",
-          "type": "LATENT",
-          "links": [
-            1388
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "XFuserKSamplerAdvanced"
-      },
-      "widgets_values": [
-        "enable",
-        121381635473070,
-        "randomize",
-        26,
-        3.5,
-        "euler",
-        "simple",
-        0,
-        10000,
-        "disable"
-      ]
-    },
-    {
       "id": 298,
       "type": "VAEDecode",
       "pos": [
@@ -342,7 +183,7 @@
       "flags": {
         "collapsed": false
       },
-      "order": 17,
+      "order": 18,
       "mode": 0,
       "inputs": [
         {
@@ -391,7 +232,7 @@
         200
       ],
       "flags": {},
-      "order": 14,
+      "order": 13,
       "mode": 0,
       "inputs": [
         {
@@ -405,7 +246,7 @@
           "name": "CONDITIONING",
           "type": "CONDITIONING",
           "links": [
-            1385
+            1390
           ]
         }
       ],
@@ -440,7 +281,7 @@
         90
       ],
       "flags": {},
-      "order": 4,
+      "order": 2,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -453,18 +294,55 @@
       "bgcolor": "#653"
     },
     {
+      "id": 753,
+      "type": "RayModelSamplingAuraFlow",
+      "pos": [
+        -1794.863525390625,
+        1169.5511474609375
+      ],
+      "size": [
+        280.4234313964844,
+        58
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 1373
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "links": [
+            1386
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayModelSamplingAuraFlow"
+      },
+      "widgets_values": [
+        1
+      ]
+    },
+    {
       "id": 752,
       "type": "RayUNETLoader",
       "pos": [
-        -2250.17919921875,
-        1034.47021484375
+        -2260.8271992187506,
+        1041.1252148437488
       ],
       "size": [
         270,
         102
       ],
       "flags": {},
-      "order": 12,
+      "order": 11,
       "mode": 0,
       "inputs": [
         {
@@ -497,6 +375,199 @@
       ]
     },
     {
+      "id": 733,
+      "type": "CLIPLoader",
+      "pos": [
+        -2260.4399999999996,
+        1206.11674609375
+      ],
+      "size": [
+        370,
+        110
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            1342
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.57",
+        "models": [
+          {
+            "name": "t5xxl_fp8_e4m3fn_scaled.safetensors",
+            "url": "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn_scaled.safetensors",
+            "directory": "text_encoders"
+          }
+        ],
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65
+      },
+      "widgets_values": [
+        "t5xxl.safetensors",
+        "chroma",
+        "default"
+      ]
+    },
+    {
+      "id": 710,
+      "type": "VAELoader",
+      "pos": [
+        -2271.54931640625,
+        1368.964697265625
+      ],
+      "size": [
+        370,
+        60
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            1252
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAELoader",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.27",
+        "models": [
+          {
+            "name": "ae.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/Lumina_Image_2.0_Repackaged/resolve/main/split_files/vae/ae.safetensors",
+            "directory": "vae"
+          }
+        ],
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65
+      },
+      "widgets_values": [
+        "ae.safetensors"
+      ]
+    },
+    {
+      "id": 763,
+      "type": "MarkdownNote",
+      "pos": [
+        -2716.5543462836777,
+        522.532558742641
+      ],
+      "size": [
+        403.4657275075731,
+        1054.769169761564
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Introduction",
+      "properties": {},
+      "widgets_values": [
+        "## Raylight Overview\n\nAs the name implies, **Raylight** uses Ray workers, called *Actors*.  \nEach worker is its own Python process. While this allows splitting across multiple VRAMs,  \nit does increase overall RAM usage.  \n\nThat said, RAM is generally much cheaper than VRAM, so this trade-off is acceptable in most cases.  \n\n---\n\n## More info: \n\n### [Raylight on GitHub](https://github.com/komikndr/raylight)\n### [Raylight guide on Youtube](https://youtu.be/KQxrkJAV4eI?si=hAFY1rKD6Y2UHXqY)\n\n\n## Supported Models\n\n| Model               | USP | FSDP | CFG |\n|---------------------|-----|------|-----|\n| Wan2.X 14B T2V      | ✅  | ✅   | ✅  |\n| Wan2.X 14B I2V      | ✅  | ✅   | ✅  |\n| Wan2.1 1.3B T2V     | ✅  | ✅   | ✅  |\n| Wan2.2 5B TI2V      | ✅  | ✅   | ✅  |\n| Flux Dev            | ✅  | ✅   | ❌  |\n| Flux Konteks        | ✅  | ✅   | ❌  |\n| Flux Krea           | ✅  | ✅   | ❌  |\n| Flux 2              | ✅  | ✅   | ❌  |\n| Chroma              | ✅  | ✅   | ✅  |\n| Chroma Radiance     | ✅  | ✅   | ✅  |\n| Qwen Image/Edit     | ✅  | ✅   | ✅  |\n| Z Image             | ✅  | ✅   | ✅  |\n| Lumina 2            | ✅  | ✅   | ✅  |\n| Hunyuan Video       | ✅  | ❌   | ❌  |\n| Hunyuan 1.5         | ✅  | ❌   | ❌  |\n| SD1.5 (UNet)        | ❌  | ❌   | ✅  |\n| SDXL (UNet)         | ❌  | ❌   | ✅  |\n\n**Legend:**\n- ✅ = Supported  \n- ❌ = Not supported  \n\n**Notes:**\n- Non standard Wan variant (Phantom, S2V, etc...) is not tested\n\n## Scaled vs Non-Scaled Models\n\n| Model       | USP | FSDP |\n|-------------|-----|------|\n| Non-Scaled  | ✅  | ✅   |\n| Scaled      | ✅  | ⚠️ |\n\n**Notes:**\n- Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.\n- Only Ada Lovelace and newer GPUs support **FP8 scaled FSDP2**.\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 764,
+      "type": "Note",
+      "pos": [
+        -2293.3773445710985,
+        288.2712557910764
+      ],
+      "size": [
+        221.074128638272,
+        189.35890875820826
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Rule of thumb",
+      "properties": {},
+      "widgets_values": [
+        "Just jack up more ulysses per number of GPUs, and set ring only 1.\n\nNo need FSDP if all of your model can be fitted into individual card. Especially image model who has low sequence length.\n\nFor SDXL and SD1.5 only CFG parallel"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 765,
+      "type": "Note",
+      "pos": [
+        -2061.430077564321,
+        291.1565288152337
+      ],
+      "size": [
+        210,
+        178.59762243597055
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Glosarry",
+      "properties": {},
+      "widgets_values": [
+        "rank = id assigned to the GPU\nworld_size = number of GPUs\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 762,
+      "type": "MarkdownNote",
+      "pos": [
+        -2708.222285221882,
+        294.4441556740657
+      ],
+      "size": [
+        385.26349810726197,
+        184.87935303020652
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "\nRaylight uses **FSDP2** to shard the model across GPUs.\n\nIn rare cases, a memory leak may occur when switching from one LoRA to another while using FSDP. However, in most tests this issue does not appear, even with the same Docker setup....\n\nIf memory leak cases continue to grow, I will force a reinitialization of the Ray worker.\n\nIn the meantime, if you encounter this issue, please restart Comfy.\nOpen Issue on [Raylight Issue](https://github.com/komikndr/raylight/issues)\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
       "id": 751,
       "type": "RayInitializer",
       "pos": [
@@ -505,10 +576,10 @@
       ],
       "size": [
         291.400390625,
-        226
+        274
       ],
       "flags": {},
-      "order": 5,
+      "order": 9,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -527,9 +598,11 @@
         "local",
         "default",
         2,
-        0,
-        0,
+        2,
+        1,
         true,
+        false,
+        false,
         false,
         "TORCH"
       ]
@@ -538,15 +611,15 @@
       "id": 740,
       "type": "SaveImage",
       "pos": [
-        -1105.2894287109375,
-        557.5250854492188
+        -846.3494287109374,
+        559.9450854492187
       ],
       "size": [
         539.2999877929688,
         1114.699951171875
       ],
       "flags": {},
-      "order": 18,
+      "order": 19,
       "mode": 0,
       "inputs": [
         {
@@ -573,159 +646,134 @@
       ]
     },
     {
-      "id": 760,
-      "type": "Note",
+      "id": 767,
+      "type": "easy cleanGpuUsed",
       "pos": [
-        -2286.951904296875,
-        303.3262634277344
+        -1111.247346283676,
+        890.8512557910768
       ],
       "size": [
-        412.62823486328125,
-        184.78659057617188
+        157.3892578125,
+        26
       ],
       "flags": {},
-      "order": 6,
+      "order": 16,
       "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Ulyssess vs Ring",
-      "properties": {},
-      "widgets_values": [
-        "Why use Ulysses instead of Ring? Ulysses requires less VRAM, but the attention heads must be divisible among the GPUs. For example, Wan14 has 40 attention head, so the number of GPUs per Ulysses can be 2, 4, 5, 8, 10, or 20.\n\nRing, on the other hand, doesn’t have that restriction since it’s basically like a game of musical chairs—just without removing the chairs. However, the biggest problem with Ring is communication inefficiency and computation overhead"
+      "inputs": [
+        {
+          "name": "anything",
+          "type": "*",
+          "link": 1390
+        }
       ],
-      "color": "#432",
-      "bgcolor": "#653"
+      "outputs": [
+        {
+          "name": "output",
+          "type": "*",
+          "links": [
+            1391
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "easy cleanGpuUsed"
+      },
+      "widgets_values": []
     },
     {
-      "id": 757,
-      "type": "MarkdownNote",
+      "id": 766,
+      "type": "easy cleanGpuUsed",
       "pos": [
-        -2665.41796875,
-        295.19818115234375
+        -1102.7773462836744,
+        656.1112557910761
       ],
       "size": [
-        359.8093566894531,
-        188.35037231445312
-      ],
-      "flags": {},
-      "order": 7,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "properties": {},
-      "widgets_values": [
-        "\nRaylight uses **FSDP2** to shard the model across GPUs.\n\nIn rare cases, a memory leak may occur when switching from one LoRA to another while using FSDP. However, in most tests this issue does not appear, even with the same Docker setup....\n\nIf memory leak cases continue to grow, I will force a reinitialization of the Ray worker.\n\nIn the meantime, if you encounter this issue, please restart Comfy.\nOpen Issue on [Raylight Issue](https://github.com/komikndr/raylight/issues)\n"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
-      "id": 759,
-      "type": "Note",
-      "pos": [
-        -1853.919677734375,
-        304.5466003417969
-      ],
-      "size": [
-        214.7521209716797,
-        126.13883209228516
-      ],
-      "flags": {},
-      "order": 8,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Rule of thumb",
-      "properties": {},
-      "widgets_values": [
-        "Just jack up more ulysses per number of GPUs, and set ring only 1.\n"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
-      "id": 758,
-      "type": "Note",
-      "pos": [
-        -1621.3402099609375,
-        302.2162170410156
-      ],
-      "size": [
-        215.3394317626953,
-        117.74829864501953
-      ],
-      "flags": {},
-      "order": 9,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Glosarry",
-      "properties": {},
-      "widgets_values": [
-        "rank = id assigned to the GPU\nworld_size = number of GPUs\n\n"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
-      "id": 761,
-      "type": "MarkdownNote",
-      "pos": [
-        -2670.173828125,
-        532.0167236328125
-      ],
-      "size": [
-        365.2845153808594,
-        860.39208984375
-      ],
-      "flags": {},
-      "order": 10,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Introduction",
-      "properties": {},
-      "widgets_values": [
-        "## Raylight Overview\n\nAs the name implies, **Raylight** uses Ray workers, called *Actors*.  \nEach worker is its own Python process. While this allows splitting across multiple VRAMs,  \nit does increase overall RAM usage.  \n\nThat said, RAM is generally much cheaper than VRAM, so this trade-off is acceptable in most cases.  \n\n---\n\nMore info: [Raylight on GitHub](https://github.com/komikndr/raylight)\n\n\n## Supported Models\n\n| Model             | USP | FSDP |\n|-------------------|-----|------|\n| Wan2.1 1.3B T2V      | ✅  | ✅   |\n| Wan2.1 14B T2V       | ✅  | ✅   |\n| Wan2.1 14B I2V       | ✅  | ✅   |\n| Wan2.1 Vace             | ✅  | ❌   |\n| Wan2.2 5B TI2V       | ✅  | ✅   |\n| Wan2.2 14B I2V       | ✅  | ✅   |\n| Flux Dev          | ✅  | ✅   |\n| Flux Konteks      | ✅  | ✅   |\n| Flux ControlNet   | ❌  | ❌   |\n| Qwen Image        | ✅  | ✅   |\n| Hunyuan Video     | ❌  | ❓   |\n| Chroma             | ✅  | ✅  |\n\n**Legend:**\n- ✅ = Supported\n- ❌ = Not currently supported\n- ❓ = Maybe work?\n\n**Notes:**\n- Non standard Wan variant (Phantom, S2V, etc...) is not tested\n\n## Scaled vs Non-Scaled Models\n\n| Model       | USP | FSDP |\n|-------------|-----|------|\n| Non-Scaled  | ✅  | ✅   |\n| Scaled      | ✅  | ⚠️ |\n\n**Notes:**\n- Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.\n- Only Ada Lovelace and newer GPUs support **FP8 scaled FSDP2**.\n\n"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
-      "id": 753,
-      "type": "RayModelSamplingAuraFlow",
-      "pos": [
-        -1794.863525390625,
-        1169.5511474609375
-      ],
-      "size": [
-        280.4234313964844,
-        58
+        157.3892578125,
+        26
       ],
       "flags": {},
       "order": 15,
       "mode": 0,
       "inputs": [
         {
-          "name": "ray_actors",
-          "type": "RAY_ACTORS",
-          "link": 1373
+          "name": "anything",
+          "type": "*",
+          "link": 1389
         }
       ],
       "outputs": [
         {
-          "name": "ray_actors",
-          "type": "RAY_ACTORS",
+          "name": "output",
+          "type": "*",
           "links": [
-            1386
+            1392
           ]
         }
       ],
       "properties": {
-        "Node name for S&R": "RayModelSamplingAuraFlow"
+        "Node name for S&R": "easy cleanGpuUsed"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 754,
+      "type": "XFuserKSamplerAdvanced",
+      "pos": [
+        -1782.083256835937,
+        1275.6046875000002
+      ],
+      "size": [
+        312.7340393066406,
+        377.9230041503906
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 1386
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 1392
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 1391
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 1387
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            1388
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "XFuserKSamplerAdvanced"
       },
       "widgets_values": [
-        1
+        "enable",
+        121381635473070,
+        "randomize",
+        26,
+        3.5,
+        "euler",
+        "simple",
+        0,
+        10000,
+        "disable"
       ]
     }
   ],
@@ -787,22 +835,6 @@
       "RAY_ACTORS"
     ],
     [
-      1384,
-      748,
-      0,
-      754,
-      1,
-      "CONDITIONING"
-    ],
-    [
-      1385,
-      749,
-      0,
-      754,
-      2,
-      "CONDITIONING"
-    ],
-    [
       1386,
       753,
       0,
@@ -825,6 +857,38 @@
       298,
       0,
       "LATENT"
+    ],
+    [
+      1389,
+      748,
+      0,
+      766,
+      0,
+      "*"
+    ],
+    [
+      1390,
+      749,
+      0,
+      767,
+      0,
+      "*"
+    ],
+    [
+      1391,
+      767,
+      0,
+      754,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      1392,
+      766,
+      0,
+      754,
+      1,
+      "CONDITIONING"
     ]
   ],
   "groups": [
@@ -845,10 +909,10 @@
       "id": 5,
       "title": "Step 1: Load models",
       "bounding": [
-        -2293.025146484375,
-        824.5338745117188,
-        424.5450134277344,
-        611.5570068359375
+        -2286.370146484375,
+        952.3098745117194,
+        416.5590134277345,
+        491.7670068359374
       ],
       "color": "#3f789e",
       "font_size": 24,
@@ -886,8 +950,8 @@
       "bounding": [
         -1543.958984375,
         510.64794921875,
-        420,
-        550
+        628.1200000000001,
+        557.2600000000002
       ],
       "color": "#3f789e",
       "font_size": 24,
@@ -899,8 +963,8 @@
       "bounding": [
         -2286.787353515625,
         504.43536376953125,
-        416.54937744140625,
-        309.6000061035156
+        415.21837744140635,
+        434.71400610351566
       ],
       "color": "#3f789e",
       "font_size": 24,
@@ -910,13 +974,13 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.7513148009015777,
+      "scale": 0.8264462809917354,
       "offset": [
-        2858.9713462836785,
-        -330.86325579107654
+        2479.7573462836767,
+        -278.59125579107655
       ]
     },
-    "frontendVersion": "1.27.10",
+    "frontendVersion": "1.28.8",
     "VHS_latentpreview": false,
     "VHS_latentpreviewrate": 0,
     "VHS_MetadataImage": true,

@@ -6,17 +6,10 @@ from xfuser.core.distributed import (
 )
 import raylight.distributed_modules.attention as xfuser_attn
 import comfy
+from ..utils import pad_to_world_size
 attn_type = xfuser_attn.get_attn_type()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type)
-
-
-def pad_if_odd(t: torch.Tensor, dim: int = 1):
-    if t.size(dim) % 2 != 0:
-        pad_shape = list(t.shape)
-        pad_shape[dim] = 1  # add one element along target dim
-        pad_tensor = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
-        t = torch.cat([t, pad_tensor], dim=dim)
-    return t
+sync_ulysses = xfuser_attn.get_sync_ulysses()
+xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -37,17 +30,17 @@ def pad_freqs(original_tensor, target_len):
     """
     original_tensor: [B, L_global, 1, D/2, 2, 2] — full freq tensor
     """
-    b, seq_len, z, dim, a, c = original_tensor.shape
+    b, seq_len, n, dim, f1, f2 = original_tensor.shape
     pad_size = target_len - seq_len
     if pad_size <= 0:
         return original_tensor
     padding_tensor = torch.ones(
         b,
         pad_size,
-        z,
+        n,
         dim,
-        a,
-        c,
+        f1,
+        f2,
         dtype=original_tensor.dtype,
         device=original_tensor.device,
     )
@@ -88,6 +81,7 @@ def apply_rope_sp(xq, xk, freqs_cis):
     return xq_out.reshape_as(xq).type_as(xq), xk_out.reshape_as(xk).type_as(xk)
 
 
+@torch.compiler.disable
 def usp_dit_forward(
     self,
     x,
@@ -142,9 +136,10 @@ def usp_dit_forward(
             context = torch.concat([context_clip, context], dim=1)
         context_img_len = clip_fea.shape[-2]
 
-    # Context Parallel
-    x = pad_if_odd(x, dim=1)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    x, orig_size = pad_to_world_size(x, dim=1)
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
@@ -172,10 +167,14 @@ def usp_dit_forward(
                 x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len
             )
 
-    x = self.head(x, e)
-
-    # Context Parallel
+    torch._dynamo.graph_break()
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
     x = get_sp_group().all_gather(x, dim=1)
+    x = x[:, :orig_size, :]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    torch._dynamo.graph_break()
+
+    x = self.head(x, e)
 
     # unpatchify
     x = self.unpatchify(x, grid_sizes)
@@ -221,9 +220,10 @@ def usp_vace_dit_forward(
     c = c.flatten(2).transpose(1, 2)
     c = list(c.split(orig_shape[0], dim=0))
 
-    # arguments
-    x = pad_if_odd(x, dim=1)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    x, orig_size = pad_to_world_size(x, dim=1)
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
     x_orig = x
 
     patches_replace = transformer_options.get("patches_replace", {})
@@ -245,9 +245,11 @@ def usp_vace_dit_forward(
                 c_skip, c[iii] = self.vace_blocks[ii](c[iii], x=x_orig, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
                 x += c_skip * vace_strength[iii]
             del c_skip
-    # head
+
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
     x = get_sp_group().all_gather(x, dim=1)
-    x = self.head(x, e)
+    x = x[:, :orig_size, :]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     # unpatchify
     x = self.unpatchify(x, grid_sizes)
@@ -287,8 +289,10 @@ def usp_camera_dit_forward(
             context = torch.concat([context_clip, context], dim=1)
         context_img_len = clip_fea.shape[-2]
 
-    x = pad_if_odd(x, dim=1)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    x, orig_size = pad_to_world_size(x, dim=1)
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
@@ -303,9 +307,10 @@ def usp_camera_dit_forward(
         else:
             x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
 
-    # head
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
     x = get_sp_group().all_gather(x, dim=1)
-    x = self.head(x, e)
+    x = x[:, :orig_size, :]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     # unpatchify
     x = self.unpatchify(x, grid_sizes)
@@ -356,8 +361,10 @@ def usp_humo_dit_forward(
     else:
         audio = None
 
-    x = pad_if_odd(x, dim=1)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    x, orig_size = pad_to_world_size(x, dim=1)
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
@@ -372,8 +379,10 @@ def usp_humo_dit_forward(
         else:
             x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, audio=audio, transformer_options=transformer_options)
 
-    # head
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
     x = get_sp_group().all_gather(x, dim=1)
+    x = x[:, :orig_size, :]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
     x = self.head(x, e)
 
     # unpatchify
@@ -446,8 +455,10 @@ def usp_s2v_dit_forward(
     # context
     context = self.text_embedding(context)
 
-    x = pad_if_odd(x, dim=1)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    x, orig_size = pad_to_world_size(x, dim=1)
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
@@ -463,9 +474,12 @@ def usp_s2v_dit_forward(
             x = block(x, e=e0, freqs=freqs, context=context)
         if audio_emb is not None:
             x = self.audio_injector(x, i, audio_emb, audio_emb_global, seq_len)
-    # head
-    x = self.head(x, e)
+
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
     x = get_sp_group().all_gather(x, dim=1)
+    x = x[:, :orig_size, :]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    x = self.head(x, e)
 
     # unpatchify
     x = self.unpatchify(x, grid_sizes)

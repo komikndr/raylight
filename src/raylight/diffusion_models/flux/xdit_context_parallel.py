@@ -8,18 +8,11 @@ from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
+from ..utils import pad_to_world_size
 import raylight.distributed_modules.attention as xfuser_attn
 attn_type = xfuser_attn.get_attn_type()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type)
-
-
-def pad_if_odd(t: torch.Tensor, dim: int = 1):
-    if t.size(dim) % 2 != 0:
-        pad_shape = list(t.shape)
-        pad_shape[dim] = 1  # add one element along target dim
-        pad_tensor = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
-        t = torch.cat([t, pad_tensor], dim=dim)
-    return t
+sync_ulysses = xfuser_attn.get_sync_ulysses()
+xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
 
 
 def apply_mod(tensor, m_mult, m_add=None, modulation_dims=None):
@@ -94,19 +87,17 @@ def usp_dit_forward(
     transformer_options={},
     attn_mask: Tensor = None,
 ) -> Tensor:
-
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
-    img = pad_if_odd(img, dim=1)
-    img_ids = pad_if_odd(img_ids, dim=1)
-    txt = pad_if_odd(txt, dim=1)
-    txt_ids = pad_if_odd(txt_ids, dim=1)
-    if y is None:
-        y = torch.zeros((img.shape[0], self.params.vec_in_dim), device=img.device, dtype=img.dtype)
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
-
+    patches = transformer_options.get("patches", {})
     patches_replace = transformer_options.get("patches_replace", {})
     if img.ndim != 3 or txt.ndim != 3:
         raise ValueError("Input img and txt tensors must have 3 dimensions.")
+
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    img, img_orig_size = pad_to_world_size(img, dim=1)
+    img_ids, _ = pad_to_world_size(img_ids, dim=1)
+    txt, txt_orig_size = pad_to_world_size(txt, dim=1)
+    txt_ids, _ = pad_to_world_size(txt_ids, dim=1)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     # running on sequences img
     img = self.img_in(img)
@@ -115,8 +106,16 @@ def usp_dit_forward(
         if guidance is not None:
             vec = vec + self.guidance_in(timestep_embedding(guidance, 256).to(img.dtype))
 
-    vec = vec + self.vector_in(y[:, :self.params.vec_in_dim])
+    if self.vector_in is not None:
+        if y is None:
+            y = torch.zeros((img.shape[0], self.params.vec_in_dim), device=img.device, dtype=img.dtype)
+        vec = vec + self.vector_in(y[:, :self.params.vec_in_dim])
+
     txt = self.txt_in(txt)
+
+    vec_orig = vec
+    if self.params.global_modulation:
+        vec = (self.double_stream_modulation_img(vec_orig), self.double_stream_modulation_txt(vec_orig))
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     if img_ids is not None:
@@ -134,7 +133,17 @@ def usp_dit_forward(
     txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
+    if "post_input" in patches:
+        for p in patches["post_input"]:
+            out = p({"img": img, "txt": txt, "img_ids": img_ids, "txt_ids": txt_ids})
+            img = out["img"]
+            txt = out["txt"]
+            img_ids = out["img_ids"]
+            txt_ids = out["txt_ids"]
+
     blocks_replace = patches_replace.get("dit", {})
+    transformer_options["total_blocks"] = len(self.double_blocks)
+    transformer_options["block_type"] = "double"
     for i, block in enumerate(self.double_blocks):
         if ("double_block", i) in blocks_replace:
             def block_wrap(args):
@@ -167,18 +176,28 @@ def usp_dit_forward(
                 add = control_i[i]
                 if add is not None:
                     img += add
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    img = get_sp_group().all_gather(img.contiguous(), dim=1)
+    txt = get_sp_group().all_gather(txt.contiguous(), dim=1)
+    img = img[:, :img_orig_size, :]
+    txt = txt[:, :txt_orig_size, :]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     if img.dtype == torch.float16:
         img = torch.nan_to_num(img, nan=0.0, posinf=65504, neginf=-65504)
 
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
-    img = get_sp_group().all_gather(img.contiguous(), dim=1)
-    txt = get_sp_group().all_gather(txt.contiguous(), dim=1)
 
     img = torch.cat((txt, img), 1)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    img, img_orig_size = pad_to_world_size(img, dim=1)
 
+    if self.params.global_modulation:
+        vec, _ = self.single_stream_modulation(vec_orig)
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
+
+    transformer_options["total_blocks"] = len(self.single_blocks)
+    transformer_options["block_type"] = "single"
     for i, block in enumerate(self.single_blocks):
         if ("single_block", i) in blocks_replace:
             def block_wrap(args):
@@ -206,32 +225,61 @@ def usp_dit_forward(
                     img[:, txt.shape[1]:, ...] += add
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    img = get_sp_group().all_gather(img, dim=1)
-    img = img[:, txt.shape[1]:, ...]
+    img = get_sp_group().all_gather(img.contiguous(), dim=1)
+    img = img[:, :img_orig_size, :]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
+    img = img[:, txt.shape[1]:, ...]
 
-    img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
+    img = self.final_layer(img, vec_orig)  # (N, T, patch_size ** 2 * out_channels)
     return img
 
 
-def usp_single_stream_forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mask=None, modulation_dims=None, **kwargs) -> Tensor:
-    mod, _ = self.modulation(vec)
-    qkv, mlp = torch.split(self.linear1(apply_mod(self.pre_norm(x), (1 + mod.scale), mod.shift, modulation_dims)), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
+def usp_single_stream_forward(
+    self,
+    x: Tensor,
+    vec: Tensor,
+    pe: Tensor,
+    attn_mask=None,
+    modulation_dims=None,
+    **kwargs
+) -> Tensor:
+    if self.modulation:
+        mod, _ = self.modulation(vec)
+    else:
+        mod = vec
+
+    qkv, mlp = torch.split(self.linear1(apply_mod(self.pre_norm(x), (1 + mod.scale), mod.shift, modulation_dims)), [3 * self.hidden_size, self.mlp_hidden_dim_first], dim=-1)
 
     q, k, v = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
     q, k = self.norm(q, k, v)
 
+    # compute attention
     attn = attention(q, k, v, pe=pe, mask=attn_mask)
-    output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+    # compute activation in mlp stream, cat again and run second linear layer
+    mlp = self.mlp_act(mlp)
+    output = self.linear2(torch.cat((attn, mlp), 2))
     x += apply_mod(output, mod.gate, None, modulation_dims)
     if x.dtype == torch.float16:
         x = torch.nan_to_num(x, nan=0.0, posinf=65504, neginf=-65504)
     return x
 
 
-def usp_double_stream_forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, attn_mask=None, modulation_dims_img=None, modulation_dims_txt=None, **kwargs):
-    img_mod1, img_mod2 = self.img_mod(vec)
-    txt_mod1, txt_mod2 = self.txt_mod(vec)
+def usp_double_stream_forward(
+    self,
+    img: Tensor,
+    txt: Tensor,
+    vec: Tensor,
+    pe: Tensor,
+    attn_mask=None,
+    modulation_dims_img=None,
+    modulation_dims_txt=None,
+    **kwargs
+):
+    if self.modulation:
+        img_mod1, img_mod2 = self.img_mod(vec)
+        txt_mod1, txt_mod2 = self.txt_mod(vec)
+    else:
+        (img_mod1, img_mod2), (txt_mod1, txt_mod2) = vec
 
     # prepare image for attention
     img_modulated = self.img_norm1(img)
@@ -249,26 +297,26 @@ def usp_double_stream_forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: T
 
     if self.flipped_img_txt:
         img_q, img_k = apply_rope(img_q, img_k, pe)
-        attn = attention(torch.cat((img_q, txt_q), dim=2),
-                         torch.cat((img_k, txt_k), dim=2),
-                         torch.cat((img_v, txt_v), dim=2),
-                         pe=None,
-                         mask=attn_mask)
+        q = torch.cat((img_q, txt_q), dim=2)
+        k = torch.cat((img_k, txt_k), dim=2)
+        v = torch.cat((img_v, txt_v), dim=2)
+        # run actual attention
+        attn = attention(q, k, v, pe=None, mask=attn_mask)
 
         img_attn, txt_attn = attn[:, : img.shape[1]], attn[:, img.shape[1]:]
     else:
         img_q, img_k = apply_rope(img_q, img_k, pe)
-        attn = attention(torch.cat((txt_q, img_q), dim=2),
-                         torch.cat((txt_k, img_k), dim=2),
-                         torch.cat((txt_v, img_v), dim=2),
-                         pe=None,
-                         mask=attn_mask)
+        q = torch.cat((txt_q, img_q), dim=2)
+        k = torch.cat((txt_k, img_k), dim=2)
+        v = torch.cat((txt_v, img_v), dim=2)
+        # run actual attention
+        attn = attention(q, k, v, pe=None, mask=attn_mask)
 
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
 
     # calculate the img bloks
-    img = img + apply_mod(self.img_attn.proj(img_attn), img_mod1.gate, None, modulation_dims_img)
-    img = img + apply_mod(self.img_mlp(apply_mod(self.img_norm2(img), (1 + img_mod2.scale), img_mod2.shift, modulation_dims_img)), img_mod2.gate, None, modulation_dims_img)
+    img += apply_mod(self.img_attn.proj(img_attn), img_mod1.gate, None, modulation_dims_img)
+    img += apply_mod(self.img_mlp(apply_mod(self.img_norm2(img), (1 + img_mod2.scale), img_mod2.shift, modulation_dims_img)), img_mod2.gate, None, modulation_dims_img)
 
     # calculate the txt bloks
     txt += apply_mod(self.txt_attn.proj(txt_attn), txt_mod1.gate, None, modulation_dims_txt)

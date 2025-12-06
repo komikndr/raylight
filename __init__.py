@@ -23,6 +23,8 @@ from raylight.comfy_extra_dist.nodes_torch_compile import NODE_CLASS_MAPPINGS as
 from raylight.comfy_extra_dist.nodes_torch_compile import NODE_DISPLAY_NAME_MAPPINGS as COMPILE_DISPLAY_NAME_MAPPINGS
 
 from raylight.comfy_extra_dist.nodes_model_advanced import NODE_CLASS_MAPPINGS as MODEL_ADV_CLASS_MAPPINGS
+from raylight.comfy_extra_dist.nodes_easycache import NODE_CLASS_MAPPINGS as EASY_CACHE_NODE_CLASS_MAPPINGS
+from raylight.comfy_extra_dist.nodes_easycache import NODE_DISPLAY_NAME_MAPPINGS as EASY_CACHE_DISPLAY_NAME_MAPPINGS
 
 from raylight.comfy_extra_dist.nodes_custom_sampler import NODE_CLASS_MAPPINGS as SAMPLER_CLASS_MAPPINGS
 from raylight.comfy_extra_dist.nodes_custom_sampler import NODE_DISPLAY_NAME_MAPPINGS as SAMPLER_DISPLAY_MAPPINGS
@@ -51,11 +53,14 @@ else:
 # CLASS
 NODE_CLASS_MAPPINGS.update(COMPILE_NODE_CLASS_MAPPINGS)
 NODE_CLASS_MAPPINGS.update(MODEL_ADV_CLASS_MAPPINGS)
+NODE_CLASS_MAPPINGS.update(EASY_CACHE_NODE_CLASS_MAPPINGS)
+
 NODE_CLASS_MAPPINGS.update(SAMPLER_CLASS_MAPPINGS)
 
 
 # DISPLAY
 NODE_DISPLAY_NAME_MAPPINGS.update(COMPILE_DISPLAY_NAME_MAPPINGS)
+NODE_DISPLAY_NAME_MAPPINGS.update(EASY_CACHE_DISPLAY_NAME_MAPPINGS)
 NODE_DISPLAY_NAME_MAPPINGS.update(SAMPLER_DISPLAY_MAPPINGS)
 
 __all__ = [
@@ -65,4 +70,4 @@ __all__ = [
 
 __author__ = """Micko Lesmana"""
 __email__ = "mickolesmana@gmail.com"
-__version__ = "0.11.0"
+__version__ = "0.14.0"

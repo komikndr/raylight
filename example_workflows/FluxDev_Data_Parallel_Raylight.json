@@ -1,52 +1,9 @@
 {
   "id": "74d472ce-c2b2-4c7b-aabc-51b7428dee99",
   "revision": 0,
-  "last_node_id": 69,
+  "last_node_id": 73,
   "last_link_id": 83,
   "nodes": [
-    {
-      "id": 33,
-      "type": "CLIPTextEncode",
-      "pos": [
-        16.11848258972168,
-        453.4114990234375
-      ],
-      "size": [
-        422.8500061035156,
-        164.30999755859375
-      ],
-      "flags": {
-        "collapsed": false
-      },
-      "order": 9,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "clip",
-          "type": "CLIP",
-          "link": 72
-        }
-      ],
-      "outputs": [
-        {
-          "name": "CONDITIONING",
-          "type": "CONDITIONING",
-          "slot_index": 0,
-          "links": [
-            61
-          ]
-        }
-      ],
-      "title": "CLIP Text Encode (Negative Prompt)",
-      "properties": {
-        "Node name for S&R": "CLIPTextEncode"
-      },
-      "widgets_values": [
-        ""
-      ],
-      "color": "#322",
-      "bgcolor": "#533"
-    },
     {
       "id": 46,
       "type": "DualCLIPLoader",
@@ -83,30 +40,6 @@
       ]
     },
     {
-      "id": 49,
-      "type": "MarkdownNote",
-      "pos": [
-        -691.6290283203125,
-        -261.6722106933594
-      ],
-      "size": [
-        363.9535217285156,
-        819.131103515625
-      ],
-      "flags": {},
-      "order": 1,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Introduction",
-      "properties": {},
-      "widgets_values": [
-        "## Raylight Overview\n\nAs the name implies, **Raylight** uses Ray workers, called *Actors*.  \nEach worker is its own Python process. While this allows splitting across multiple VRAMs,  \nit does increase overall RAM usage.  \n\nThat said, RAM is generally much cheaper than VRAM, so this trade-off is acceptable in most cases.  \n\n---\n\nMore info: [Raylight on GitHub](https://github.com/komikndr/raylight)\n\n\n## Supported Models\n\n| Model             | USP | FSDP |\n|-------------------|-----|------|\n| Wan2.1 1.3B T2V      | ✅  | ✅   |\n| Wan2.1 14B T2V       | ✅  | ✅   |\n| Wan2.1 14B I2V       | ✅  | ✅   |\n| Wan2.1 Vace             | ✅  | ❌   |\n| Wan2.2 5B TI2V       | ✅  | ✅   |\n| Wan2.2 14B I2V       | ✅  | ✅   |\n| Flux Dev          | ✅  | ✅   |\n| Flux Konteks      | ✅  | ✅   |\n| Flux ControlNet   | ❌  | ❌   |\n| Qwen Image        | ✅  | ✅   |\n| Hunyuan Video     | ❌  | ❓   |\n\n**Legend:**\n- ✅ = Supported\n- ❌ = Not currently supported\n- ❓ = Maybe work?\n\n**Notes:**\n- Non standard Wan variant (Phantom, S2V, etc...) is not tested\n\n## Scaled vs Non-Scaled Models\n\n| Model       | USP | FSDP |\n|-------------|-----|------|\n| Non-Scaled  | ✅  | ✅   |\n| Scaled      | ✅  | ⚠️ |\n\n**Notes:**\n- Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.\n- Only Ada Lovelace and newer GPUs support **FP8 scaled FSDP2**.\n\n"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
       "id": 27,
       "type": "EmptySD3LatentImage",
       "pos": [
@@ -118,7 +51,7 @@
         106
       ],
       "flags": {},
-      "order": 2,
+      "order": 1,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -154,7 +87,7 @@
         26
       ],
       "flags": {},
-      "order": 12,
+      "order": 14,
       "mode": 0,
       "inputs": [
         {
@@ -189,7 +122,7 @@
         26
       ],
       "flags": {},
-      "order": 14,
+      "order": 16,
       "mode": 0,
       "inputs": [
         {
@@ -224,7 +157,7 @@
         58
       ],
       "flags": {},
-      "order": 11,
+      "order": 13,
       "mode": 0,
       "inputs": [
         {
@@ -262,7 +195,7 @@
         58
       ],
       "flags": {},
-      "order": 13,
+      "order": 15,
       "mode": 4,
       "inputs": [
         {
@@ -299,7 +232,7 @@
         102
       ],
       "flags": {},
-      "order": 10,
+      "order": 12,
       "mode": 0,
       "inputs": [
         {
@@ -332,85 +265,6 @@
       ]
     },
     {
-      "id": 6,
-      "type": "CLIPTextEncode",
-      "pos": [
-        17.08505630493164,
-        241.85986328125
-      ],
-      "size": [
-        422.8500061035156,
-        164.30999755859375
-      ],
-      "flags": {},
-      "order": 8,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "clip",
-          "type": "CLIP",
-          "link": 71
-        }
-      ],
-      "outputs": [
-        {
-          "name": "CONDITIONING",
-          "type": "CONDITIONING",
-          "slot_index": 0,
-          "links": [
-            56
-          ]
-        }
-      ],
-      "title": "CLIP Text Encode (Positive Prompt)",
-      "properties": {
-        "Node name for S&R": "CLIPTextEncode"
-      },
-      "widgets_values": [
-        "A cat sleeping on a grass plain, while 2 graphic cards lay beside the cat"
-      ],
-      "color": "#232",
-      "bgcolor": "#353"
-    },
-    {
-      "id": 54,
-      "type": "RayInitializer",
-      "pos": [
-        -311.276123046875,
-        92.89726257324219
-      ],
-      "size": [
-        291.400390625,
-        226
-      ],
-      "flags": {},
-      "order": 3,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "ray_actors_init",
-          "type": "RAY_ACTORS_INIT",
-          "links": [
-            74
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "RayInitializer"
-      },
-      "widgets_values": [
-        "local",
-        "default",
-        2,
-        0,
-        0,
-        true,
-        false,
-        "TORCH"
-      ]
-    },
-    {
       "id": 48,
       "type": "VAELoader",
       "pos": [
@@ -422,7 +276,7 @@
         58
       ],
       "flags": {},
-      "order": 4,
+      "order": 2,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -453,7 +307,7 @@
         441.7977600097656
       ],
       "flags": {},
-      "order": 17,
+      "order": 19,
       "mode": 0,
       "inputs": [
         {
@@ -482,7 +336,7 @@
         46
       ],
       "flags": {},
-      "order": 16,
+      "order": 18,
       "mode": 0,
       "inputs": [
         {
@@ -523,7 +377,7 @@
         478
       ],
       "flags": {},
-      "order": 15,
+      "order": 17,
       "mode": 0,
       "inputs": [
         {
@@ -577,30 +431,6 @@
       ]
     },
     {
-      "id": 50,
-      "type": "Note",
-      "pos": [
-        -305.9508056640625,
-        -82.63044738769531
-      ],
-      "size": [
-        215.3394317626953,
-        117.74829864501953
-      ],
-      "flags": {},
-      "order": 5,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Glosarry",
-      "properties": {},
-      "widgets_values": [
-        "rank = id assigned to the GPU\nworld_size = number of GPUs\n\n"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
       "id": 67,
       "type": "DPNoiseList",
       "pos": [
@@ -612,7 +442,7 @@
         418
       ],
       "flags": {},
-      "order": 6,
+      "order": 3,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -659,7 +489,7 @@
         201.8240749260115
       ],
       "flags": {},
-      "order": 7,
+      "order": 4,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -670,6 +500,225 @@
       ],
       "color": "#432",
       "bgcolor": "#653"
+    },
+    {
+      "id": 33,
+      "type": "CLIPTextEncode",
+      "pos": [
+        16.11848258972168,
+        453.4114990234375
+      ],
+      "size": [
+        422.8500061035156,
+        164.30999755859375
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 72
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            61
+          ]
+        }
+      ],
+      "title": "CLIP Text Encode (Negative Prompt)",
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        ""
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 6,
+      "type": "CLIPTextEncode",
+      "pos": [
+        17.08505630493164,
+        241.85986328125
+      ],
+      "size": [
+        422.8500061035156,
+        164.30999755859375
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 71
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            56
+          ]
+        }
+      ],
+      "title": "CLIP Text Encode (Positive Prompt)",
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        "A cat sleeping on a grass plain, while 2 graphic cards lay beside the cat"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 71,
+      "type": "Note",
+      "pos": [
+        -315.40173780452636,
+        -216.6575167996947
+      ],
+      "size": [
+        221.074128638272,
+        189.35890875820826
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Rule of thumb",
+      "properties": {},
+      "widgets_values": [
+        "Just jack up more ulysses per number of GPUs, and set ring only 1.\n\nNo need FSDP if all of your model can be fitted into individual card. Especially image model who has low sequence length.\n\nFor SDXL and SD1.5 only CFG parallel"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 73,
+      "type": "MarkdownNote",
+      "pos": [
+        -738.5787395171055,
+        17.603786151869883
+      ],
+      "size": [
+        403.4657275075731,
+        1054.769169761564
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Introduction",
+      "properties": {},
+      "widgets_values": [
+        "## Raylight Overview\n\nAs the name implies, **Raylight** uses Ray workers, called *Actors*.  \nEach worker is its own Python process. While this allows splitting across multiple VRAMs,  \nit does increase overall RAM usage.  \n\nThat said, RAM is generally much cheaper than VRAM, so this trade-off is acceptable in most cases.  \n\n---\n\n## More info: \n\n### [Raylight on GitHub](https://github.com/komikndr/raylight)\n### [Raylight guide on Youtube](https://youtu.be/KQxrkJAV4eI?si=hAFY1rKD6Y2UHXqY)\n\n\n## Supported Models\n\n| Model               | USP | FSDP | CFG |\n|---------------------|-----|------|-----|\n| Wan2.X 14B T2V      | ✅  | ✅   | ✅  |\n| Wan2.X 14B I2V      | ✅  | ✅   | ✅  |\n| Wan2.1 1.3B T2V     | ✅  | ✅   | ✅  |\n| Wan2.2 5B TI2V      | ✅  | ✅   | ✅  |\n| Flux Dev            | ✅  | ✅   | ❌  |\n| Flux Konteks        | ✅  | ✅   | ❌  |\n| Flux Krea           | ✅  | ✅   | ❌  |\n| Flux 2              | ✅  | ✅   | ❌  |\n| Chroma              | ✅  | ✅   | ✅  |\n| Chroma Radiance     | ✅  | ✅   | ✅  |\n| Qwen Image/Edit     | ✅  | ✅   | ✅  |\n| Z Image             | ✅  | ✅   | ✅  |\n| Lumina 2            | ✅  | ✅   | ✅  |\n| Hunyuan Video       | ✅  | ❌   | ❌  |\n| Hunyuan 1.5         | ✅  | ❌   | ❌  |\n| SD1.5 (UNet)        | ❌  | ❌   | ✅  |\n| SDXL (UNet)         | ❌  | ❌   | ✅  |\n\n**Legend:**\n- ✅ = Supported  \n- ❌ = Not supported  \n\n**Notes:**\n- Non standard Wan variant (Phantom, S2V, etc...) is not tested\n\n## Scaled vs Non-Scaled Models\n\n| Model       | USP | FSDP |\n|-------------|-----|------|\n| Non-Scaled  | ✅  | ✅   |\n| Scaled      | ✅  | ⚠️ |\n\n**Notes:**\n- Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.\n- Only Ada Lovelace and newer GPUs support **FP8 scaled FSDP2**.\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 70,
+      "type": "MarkdownNote",
+      "pos": [
+        -730.2466784553098,
+        -210.48461691670536
+      ],
+      "size": [
+        385.26349810726197,
+        184.87935303020652
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "\nRaylight uses **FSDP2** to shard the model across GPUs.\n\nIn rare cases, a memory leak may occur when switching from one LoRA to another while using FSDP. However, in most tests this issue does not appear, even with the same Docker setup....\n\nIf memory leak cases continue to grow, I will force a reinitialization of the Ray worker.\n\nIn the meantime, if you encounter this issue, please restart Comfy.\nOpen Issue on [Raylight Issue](https://github.com/komikndr/raylight/issues)\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 72,
+      "type": "Note",
+      "pos": [
+        -83.45447079774884,
+        -213.7722437755374
+      ],
+      "size": [
+        210,
+        178.59762243597055
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Glosarry",
+      "properties": {},
+      "widgets_values": [
+        "rank = id assigned to the GPU\nworld_size = number of GPUs\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 54,
+      "type": "RayInitializer",
+      "pos": [
+        -315.4083544518337,
+        31.9468493501017
+      ],
+      "size": [
+        291.400390625,
+        274
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "ray_actors_init",
+          "type": "RAY_ACTORS_INIT",
+          "links": [
+            74
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayInitializer"
+      },
+      "widgets_values": [
+        "local",
+        "default",
+        2,
+        2,
+        1,
+        true,
+        false,
+        false,
+        false,
+        "TORCH"
+      ]
     }
   ],
   "links": [
@@ -798,13 +847,13 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.9680000000000003,
+      "scale": 0.8000000000000002,
       "offset": [
-        168.51675604603113,
-        321.2546242377113
+        808.5787395171053,
+        297.90751679969463
       ]
     },
-    "frontendVersion": "1.28.7"
+    "frontendVersion": "1.28.8"
   },
   "version": 0.4
 }

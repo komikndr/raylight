@@ -1,7 +1,7 @@
 {
   "id": "b590dcc4-90de-4786-b0a4-6b9020fb3eb3",
   "revision": 0,
-  "last_node_id": 46,
+  "last_node_id": 50,
   "last_link_id": 48,
   "nodes": [
     {
@@ -16,7 +16,7 @@
         88
       ],
       "flags": {},
-      "order": 12,
+      "order": 11,
       "mode": 0,
       "inputs": [
         {
@@ -59,7 +59,7 @@
         46
       ],
       "flags": {},
-      "order": 19,
+      "order": 18,
       "mode": 0,
       "inputs": [
         {
@@ -102,7 +102,7 @@
         78
       ],
       "flags": {},
-      "order": 20,
+      "order": 19,
       "mode": 0,
       "inputs": [
         {
@@ -147,7 +147,7 @@
         82
       ],
       "flags": {},
-      "order": 10,
+      "order": 9,
       "mode": 0,
       "inputs": [
         {
@@ -229,7 +229,7 @@
         102
       ],
       "flags": {},
-      "order": 13,
+      "order": 12,
       "mode": 0,
       "inputs": [
         {
@@ -315,7 +315,7 @@
         855.9075927734375
       ],
       "size": [
-        210.09432983398438,
+        210.0943359375,
         130
       ],
       "flags": {},
@@ -356,7 +356,7 @@
         453.8443908691406
       ],
       "flags": {},
-      "order": 21,
+      "order": 20,
       "mode": 0,
       "inputs": [
         {
@@ -378,101 +378,6 @@
       ]
     },
     {
-      "id": 43,
-      "type": "MarkdownNote",
-      "pos": [
-        861.647216796875,
-        -17.82110023498535
-      ],
-      "size": [
-        470.2823486328125,
-        127.1243667602539
-      ],
-      "flags": {},
-      "order": 3,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "properties": {},
-      "widgets_values": [
-        "\nRaylight uses **FSDP2** to shard the model across GPUs.\n\nIn rare cases, a memory leak may occur when switching from one LoRA to another while using FSDP. However, in most tests this issue does not appear, even with the same Docker setup....\n\nIf memory leak cases continue to grow, I will force a reinitialization of the Ray worker.\n\nIn the meantime, if you encounter this issue, please restart Comfy.\nOpen Issue on [Raylight Issue](https://github.com/komikndr/raylight/issues)\n"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
-      "id": 26,
-      "type": "Note",
-      "pos": [
-        634.6205444335938,
-        -17.458473205566406
-      ],
-      "size": [
-        215.3394317626953,
-        117.74829864501953
-      ],
-      "flags": {},
-      "order": 4,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Glosarry",
-      "properties": {},
-      "widgets_values": [
-        "rank = id assigned to the GPU\nworld_size = number of GPUs\n\n"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
-      "id": 25,
-      "type": "Note",
-      "pos": [
-        637.6275634765625,
-        149.91604614257812
-      ],
-      "size": [
-        214.7521209716797,
-        126.13883209228516
-      ],
-      "flags": {},
-      "order": 5,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Rule of thumb",
-      "properties": {},
-      "widgets_values": [
-        "Just jack up more ulysses per number of GPUs, and set ring only 1.\n"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
-      "id": 24,
-      "type": "Note",
-      "pos": [
-        866.1021728515625,
-        151.35765075683594
-      ],
-      "size": [
-        462.6545715332031,
-        127.88713836669922
-      ],
-      "flags": {},
-      "order": 6,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Ulyssess vs Ring",
-      "properties": {},
-      "widgets_values": [
-        "Why use Ulysses instead of Ring? Ulysses requires less VRAM, but the attention heads must be divisible among the GPUs. For example, Wan has 40 blocks, so the number of GPUs per Ulysses can be 2, 4, 5, 8, 10, or 20.\n\nRing, on the other hand, doesn’t have that restriction since it’s basically like a game of musical chairs—just without removing the chairs. However, the biggest problem with Ring is communication inefficiency and computation overhead"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
       "id": 16,
       "type": "VAELoader",
       "pos": [
@@ -484,7 +389,7 @@
         61.84592056274414
       ],
       "flags": {},
-      "order": 7,
+      "order": 3,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -514,68 +419,6 @@
       ]
     },
     {
-      "id": 44,
-      "type": "MarkdownNote",
-      "pos": [
-        240.78379821777344,
-        -17.8378849029541
-      ],
-      "size": [
-        363.9535217285156,
-        819.131103515625
-      ],
-      "flags": {},
-      "order": 8,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Introduction",
-      "properties": {},
-      "widgets_values": [
-        "## Raylight Overview\n\nAs the name implies, **Raylight** uses Ray workers, called *Actors*.  \nEach worker is its own Python process. While this allows splitting across multiple VRAMs,  \nit does increase overall RAM usage.  \n\nThat said, RAM is generally much cheaper than VRAM, so this trade-off is acceptable in most cases.  \n\n---\n\nMore info: [Raylight on GitHub](https://github.com/komikndr/raylight)\n\n\n## Supported Models\n\n| Model             | USP | FSDP |\n|-------------------|-----|------|\n| Wan2.1 1.3B T2V      | ✅  | ✅   |\n| Wan2.1 14B T2V       | ✅  | ✅   |\n| Wan2.1 14B I2V       | ✅  | ✅   |\n| Wan2.1 Vace             | ✅  | ❌   |\n| Wan2.2 5B TI2V       | ✅  | ✅   |\n| Wan2.2 14B I2V       | ✅  | ✅   |\n| Flux Dev          | ✅  | ✅   |\n| Flux Konteks      | ✅  | ✅   |\n| Flux ControlNet   | ❌  | ❌   |\n| Qwen Image        | ✅  | ✅   |\n| Hunyuan Video     | ❌  | ❓   |\n\n**Legend:**\n- ✅ = Supported\n- ❌ = Not currently supported\n- ❓ = Maybe work?\n\n**Notes:**\n- Non standard Wan variant (Phantom, S2V, etc...) is not tested\n\n## Scaled vs Non-Scaled Models\n\n| Model       | USP | FSDP |\n|-------------|-----|------|\n| Non-Scaled  | ✅  | ✅   |\n| Scaled      | ✅  | ⚠️ |\n\n**Notes:**\n- Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.\n- Only Ada Lovelace and newer GPUs support **FP8 scaled FSDP2**.\n\n"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
-      "id": 38,
-      "type": "RayInitializer",
-      "pos": [
-        625.0982666015625,
-        329.71026611328125
-      ],
-      "size": [
-        270.17230224609375,
-        226
-      ],
-      "flags": {},
-      "order": 9,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "ray_actors_init",
-          "type": "RAY_ACTORS_INIT",
-          "links": [
-            40
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "RayInitializer"
-      },
-      "widgets_values": [
-        "local",
-        "default",
-        2,
-        2,
-        1,
-        false,
-        false,
-        "TORCH"
-      ]
-    },
-    {
       "id": 17,
       "type": "CLIPTextEncode",
       "pos": [
@@ -587,7 +430,7 @@
         88
       ],
       "flags": {},
-      "order": 11,
+      "order": 10,
       "mode": 0,
       "inputs": [
         {
@@ -630,7 +473,7 @@
         58
       ],
       "flags": {},
-      "order": 16,
+      "order": 15,
       "mode": 4,
       "inputs": [
         {
@@ -663,11 +506,11 @@
         611.811767578125
       ],
       "size": [
-        157.38925170898438,
+        157.3892578125,
         26
       ],
       "flags": {},
-      "order": 14,
+      "order": 13,
       "mode": 0,
       "inputs": [
         {
@@ -704,7 +547,7 @@
         58
       ],
       "flags": {},
-      "order": 17,
+      "order": 16,
       "mode": 0,
       "inputs": [
         {
@@ -737,11 +580,11 @@
         751.2163696289062
       ],
       "size": [
-        157.38925170898438,
+        157.3892578125,
         26
       ],
       "flags": {},
-      "order": 15,
+      "order": 14,
       "mode": 0,
       "inputs": [
         {
@@ -778,7 +621,7 @@
         334
       ],
       "flags": {},
-      "order": 18,
+      "order": 17,
       "mode": 0,
       "inputs": [
         {
@@ -825,6 +668,141 @@
         0,
         10000,
         "disable"
+      ]
+    },
+    {
+      "id": 48,
+      "type": "MarkdownNote",
+      "pos": [
+        195.15691336841428,
+        306.85996718893904
+      ],
+      "size": [
+        403.4657275075731,
+        1054.769169761564
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Introduction",
+      "properties": {},
+      "widgets_values": [
+        "## Raylight Overview\n\nAs the name implies, **Raylight** uses Ray workers, called *Actors*.  \nEach worker is its own Python process. While this allows splitting across multiple VRAMs,  \nit does increase overall RAM usage.  \n\nThat said, RAM is generally much cheaper than VRAM, so this trade-off is acceptable in most cases.  \n\n---\n\n## More info: \n\n### [Raylight on GitHub](https://github.com/komikndr/raylight)\n### [Raylight guide on Youtube](https://youtu.be/KQxrkJAV4eI?si=hAFY1rKD6Y2UHXqY)\n\n\n## Supported Models\n\n| Model               | USP | FSDP | CFG |\n|---------------------|-----|------|-----|\n| Wan2.X 14B T2V      | ✅  | ✅   | ✅  |\n| Wan2.X 14B I2V      | ✅  | ✅   | ✅  |\n| Wan2.1 1.3B T2V     | ✅  | ✅   | ✅  |\n| Wan2.2 5B TI2V      | ✅  | ✅   | ✅  |\n| Flux Dev            | ✅  | ✅   | ❌  |\n| Flux Konteks        | ✅  | ✅   | ❌  |\n| Flux Krea           | ✅  | ✅   | ❌  |\n| Flux 2              | ✅  | ✅   | ❌  |\n| Chroma              | ✅  | ✅   | ✅  |\n| Chroma Radiance     | ✅  | ✅   | ✅  |\n| Qwen Image/Edit     | ✅  | ✅   | ✅  |\n| Z Image             | ✅  | ✅   | ✅  |\n| Lumina 2            | ✅  | ✅   | ✅  |\n| Hunyuan Video       | ✅  | ❌   | ❌  |\n| Hunyuan 1.5         | ✅  | ❌   | ❌  |\n| SD1.5 (UNet)        | ❌  | ❌   | ✅  |\n| SDXL (UNet)         | ❌  | ❌   | ✅  |\n\n**Legend:**\n- ✅ = Supported  \n- ❌ = Not supported  \n\n**Notes:**\n- Non standard Wan variant (Phantom, S2V, etc...) is not tested\n\n## Scaled vs Non-Scaled Models\n\n| Model       | USP | FSDP |\n|-------------|-----|------|\n| Non-Scaled  | ✅  | ✅   |\n| Scaled      | ✅  | ⚠️ |\n\n**Notes:**\n- Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.\n- Only Ada Lovelace and newer GPUs support **FP8 scaled FSDP2**.\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 49,
+      "type": "Note",
+      "pos": [
+        618.3339150809932,
+        72.59866423737499
+      ],
+      "size": [
+        221.074128638272,
+        189.35890875820826
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Rule of thumb",
+      "properties": {},
+      "widgets_values": [
+        "Just jack up more ulysses per number of GPUs, and set ring only 1.\n\nNo need FSDP if all of your model can be fitted into individual card. Especially image model who has low sequence length.\n\nFor SDXL and SD1.5 only CFG parallel"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 50,
+      "type": "Note",
+      "pos": [
+        850.2811820877703,
+        75.4839372615323
+      ],
+      "size": [
+        210,
+        178.59762243597055
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Glosarry",
+      "properties": {},
+      "widgets_values": [
+        "rank = id assigned to the GPU\nworld_size = number of GPUs\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 47,
+      "type": "MarkdownNote",
+      "pos": [
+        203.48897443020996,
+        78.77156412036436
+      ],
+      "size": [
+        385.26349810726197,
+        184.87935303020652
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "\nRaylight uses **FSDP2** to shard the model across GPUs.\n\nIn rare cases, a memory leak may occur when switching from one LoRA to another while using FSDP. However, in most tests this issue does not appear, even with the same Docker setup....\n\nIf memory leak cases continue to grow, I will force a reinitialization of the Ray worker.\n\nIn the meantime, if you encounter this issue, please restart Comfy.\nOpen Issue on [Raylight Issue](https://github.com/komikndr/raylight/issues)\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 38,
+      "type": "RayInitializer",
+      "pos": [
+        625.0982666015625,
+        329.71026611328125
+      ],
+      "size": [
+        270.17230224609375,
+        274
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "ray_actors_init",
+          "type": "RAY_ACTORS_INIT",
+          "links": [
+            40
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayInitializer"
+      },
+      "widgets_values": [
+        "local",
+        "default",
+        2,
+        2,
+        1,
+        1,
+        false,
+        false,
+        false,
+        "TORCH"
       ]
     }
   ],
@@ -970,13 +948,13 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 1.0834705943388416,
+      "scale": 1.0834705943388419,
       "offset": [
-        -892.1209140026943,
-        -99.49371810617129
+        -238.70300436288215,
+        -84.64497010853952
       ]
     },
-    "frontendVersion": "1.26.11"
+    "frontendVersion": "1.28.8"
   },
   "version": 0.4
 }

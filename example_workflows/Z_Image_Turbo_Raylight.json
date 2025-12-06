@@ -1,0 +1,704 @@
+{
+  "id": "92112d97-bb64-4b44-86f2-ea5691ef8f6e",
+  "revision": 0,
+  "last_node_id": 37,
+  "last_link_id": 61,
+  "nodes": [
+    {
+      "id": 7,
+      "type": "CLIPTextEncode",
+      "pos": [
+        420,
+        400
+      ],
+      "size": [
+        425.27801513671875,
+        180.6060791015625
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 44
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            59
+          ]
+        }
+      ],
+      "title": "CLIP Text Encode (Negative Prompt)",
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        "blurry ugly bad"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 13,
+      "type": "EmptySD3LatentImage",
+      "pos": [
+        530,
+        620
+      ],
+      "size": [
+        315,
+        106
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            56
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "EmptySD3LatentImage"
+      },
+      "widgets_values": [
+        1024,
+        1024,
+        1
+      ]
+    },
+    {
+      "id": 6,
+      "type": "CLIPTextEncode",
+      "pos": [
+        422.38363530754566,
+        187.61636469245474
+      ],
+      "size": [
+        423.83001708984375,
+        177.11770629882812
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 43
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            58
+          ]
+        }
+      ],
+      "title": "CLIP Text Encode (Positive Prompt)",
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        "Crow eating cheese from a wooden bowl at night, illuminated by shimmering green and purple aurora lights stretching across the sky; moonlight casting soft highlights on the crow’s feathers; cold mountain landscape in the background; subtle mist on the ground; cinematic lighting; high contrast; highly detailed; dramatic atmosphere; 4k."
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 9,
+      "type": "SaveImage",
+      "pos": [
+        1430.8952354965395,
+        433.9899788073179
+      ],
+      "size": [
+        712.1525796204273,
+        750.9253219413491
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 16
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "ComfyUI"
+      ]
+    },
+    {
+      "id": 8,
+      "type": "VAEDecode",
+      "pos": [
+        1465.9821061417736,
+        338.69938323128633
+      ],
+      "size": [
+        210,
+        46
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 57
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 45
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            16
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 30,
+      "type": "XFuserKSamplerAdvanced",
+      "pos": [
+        1108.7841035355993,
+        175.53785433731795
+      ],
+      "size": [
+        304.748046875,
+        334
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 53
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 61
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 60
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 56
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            57
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "XFuserKSamplerAdvanced"
+      },
+      "widgets_values": [
+        "enable",
+        430371320220295,
+        "randomize",
+        9,
+        1,
+        "euler",
+        "simple",
+        0,
+        10000,
+        "disable"
+      ]
+    },
+    {
+      "id": 31,
+      "type": "easy cleanGpuUsed",
+      "pos": [
+        905.2088109306867,
+        283.24055768954884
+      ],
+      "size": [
+        157.3892578125,
+        26
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "anything",
+          "type": "*",
+          "link": 58
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "*",
+          "links": [
+            61
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "easy cleanGpuUsed"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 32,
+      "type": "easy cleanGpuUsed",
+      "pos": [
+        899.8361855950735,
+        373.6306384302945
+      ],
+      "size": [
+        157.3892578125,
+        26
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "anything",
+          "type": "*",
+          "link": 59
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "*",
+          "links": [
+            60
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "easy cleanGpuUsed"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 34,
+      "type": "MarkdownNote",
+      "pos": [
+        -690.1016559384755,
+        -46.91803475908724
+      ],
+      "size": [
+        385.26349810726197,
+        184.87935303020652
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "\nRaylight uses **FSDP2** to shard the model across GPUs.\n\nIn rare cases, a memory leak may occur when switching from one LoRA to another while using FSDP. However, in most tests this issue does not appear, even with the same Docker setup....\n\nIf memory leak cases continue to grow, I will force a reinitialization of the Ray worker.\n\nIn the meantime, if you encounter this issue, please restart Comfy.\nOpen Issue on [Raylight Issue](https://github.com/komikndr/raylight/issues)\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 35,
+      "type": "MarkdownNote",
+      "pos": [
+        -698.4337170002711,
+        181.17036830948786
+      ],
+      "size": [
+        403.4657275075731,
+        1054.769169761564
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Introduction",
+      "properties": {},
+      "widgets_values": [
+        "## Raylight Overview\n\nAs the name implies, **Raylight** uses Ray workers, called *Actors*.  \nEach worker is its own Python process. While this allows splitting across multiple VRAMs,  \nit does increase overall RAM usage.  \n\nThat said, RAM is generally much cheaper than VRAM, so this trade-off is acceptable in most cases.  \n\n---\n\n## More info: \n\n### [Raylight on GitHub](https://github.com/komikndr/raylight)\n### [Raylight guide on Youtube](https://youtu.be/KQxrkJAV4eI?si=hAFY1rKD6Y2UHXqY)\n\n\n## Supported Models\n\n| Model               | USP | FSDP | CFG |\n|---------------------|-----|------|-----|\n| Wan2.X 14B T2V      | ✅  | ✅   | ✅  |\n| Wan2.X 14B I2V      | ✅  | ✅   | ✅  |\n| Wan2.1 1.3B T2V     | ✅  | ✅   | ✅  |\n| Wan2.2 5B TI2V      | ✅  | ✅   | ✅  |\n| Flux Dev            | ✅  | ✅   | ❌  |\n| Flux Konteks        | ✅  | ✅   | ❌  |\n| Flux Krea           | ✅  | ✅   | ❌  |\n| Flux 2              | ✅  | ✅   | ❌  |\n| Chroma              | ✅  | ✅   | ✅  |\n| Chroma Radiance     | ✅  | ✅   | ✅  |\n| Qwen Image/Edit     | ✅  | ✅   | ✅  |\n| Z Image             | ✅  | ✅   | ✅  |\n| Lumina 2            | ✅  | ✅   | ✅  |\n| Hunyuan Video       | ✅  | ❌   | ❌  |\n| Hunyuan 1.5         | ✅  | ❌   | ❌  |\n| SD1.5 (UNet)        | ❌  | ❌   | ✅  |\n| SDXL (UNet)         | ❌  | ❌   | ✅  |\n\n**Legend:**\n- ✅ = Supported  \n- ❌ = Not supported  \n\n**Notes:**\n- Non standard Wan variant (Phantom, S2V, etc...) is not tested\n\n## Scaled vs Non-Scaled Models\n\n| Model       | USP | FSDP |\n|-------------|-----|------|\n| Non-Scaled  | ✅  | ✅   |\n| Scaled      | ✅  | ⚠️ |\n\n**Notes:**\n- Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.\n- Only Ada Lovelace and newer GPUs support **FP8 scaled FSDP2**.\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 36,
+      "type": "Note",
+      "pos": [
+        -275.25671528769163,
+        -53.090934642076576
+      ],
+      "size": [
+        221.074128638272,
+        189.35890875820826
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Rule of thumb",
+      "properties": {},
+      "widgets_values": [
+        "Just jack up more ulysses per number of GPUs, and set ring only 1.\n\nNo need FSDP if all of your model can be fitted into individual card. Especially image model who has low sequence length.\n\nFor SDXL and SD1.5 only CFG parallel"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 29,
+      "type": "RayUNETLoader",
+      "pos": [
+        38.64927773964898,
+        193.76431544845104
+      ],
+      "size": [
+        314.0972531895893,
+        124.64453542168093
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors_init",
+          "type": "RAY_ACTORS_INIT",
+          "link": 52
+        },
+        {
+          "name": "lora",
+          "shape": 7,
+          "type": "RAY_LORA",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "links": [
+            53
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayUNETLoader"
+      },
+      "widgets_values": [
+        "z_image_turbo_bf16.safetensors",
+        "default"
+      ]
+    },
+    {
+      "id": 18,
+      "type": "CLIPLoader",
+      "pos": [
+        42.965005138964706,
+        373.71634175992847
+      ],
+      "size": [
+        270,
+        106
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            43,
+            44
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "qwen_3_4b.safetensors",
+        "lumina2",
+        "default"
+      ]
+    },
+    {
+      "id": 17,
+      "type": "VAELoader",
+      "pos": [
+        46.54180798646831,
+        537.5646018554545
+      ],
+      "size": [
+        270,
+        58
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            45
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "ae.safetensors"
+      ]
+    },
+    {
+      "id": 15,
+      "type": "Note",
+      "pos": [
+        421.0260259695737,
+        -62.443058029775784
+      ],
+      "size": [
+        422.1948431809358,
+        189.22849073845367
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "The \"You are an assistant... <Prompt Start> \" text before the actual prompt is the one used in the official example.\n\nThe reason it is exposed to the user like this is because the model still works if you modify or remove it."
+      ],
+      "color": "#323",
+      "bgcolor": "#535"
+    },
+    {
+      "id": 37,
+      "type": "Note",
+      "pos": [
+        -43.30944828091446,
+        -50.205661617919276
+      ],
+      "size": [
+        210,
+        178.59762243597055
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Glosarry",
+      "properties": {},
+      "widgets_values": [
+        "rank = id assigned to the GPU\nworld_size = number of GPUs\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 28,
+      "type": "RayInitializer",
+      "pos": [
+        -276.17504148645,
+        194.45379673575857
+      ],
+      "size": [
+        291.400390625,
+        274
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "ray_actors_init",
+          "type": "RAY_ACTORS_INIT",
+          "links": [
+            52
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayInitializer"
+      },
+      "widgets_values": [
+        "local",
+        "default",
+        2,
+        2,
+        1,
+        1,
+        false,
+        false,
+        false,
+        "TORCH"
+      ]
+    }
+  ],
+  "links": [
+    [
+      16,
+      8,
+      0,
+      9,
+      0,
+      "IMAGE"
+    ],
+    [
+      43,
+      18,
+      0,
+      6,
+      0,
+      "CLIP"
+    ],
+    [
+      44,
+      18,
+      0,
+      7,
+      0,
+      "CLIP"
+    ],
+    [
+      45,
+      17,
+      0,
+      8,
+      1,
+      "VAE"
+    ],
+    [
+      52,
+      28,
+      0,
+      29,
+      0,
+      "RAY_ACTORS_INIT"
+    ],
+    [
+      53,
+      29,
+      0,
+      30,
+      0,
+      "RAY_ACTORS"
+    ],
+    [
+      56,
+      13,
+      0,
+      30,
+      3,
+      "LATENT"
+    ],
+    [
+      57,
+      30,
+      0,
+      8,
+      0,
+      "LATENT"
+    ],
+    [
+      58,
+      6,
+      0,
+      31,
+      0,
+      "*"
+    ],
+    [
+      59,
+      7,
+      0,
+      32,
+      0,
+      "*"
+    ],
+    [
+      60,
+      32,
+      0,
+      30,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      61,
+      31,
+      0,
+      30,
+      1,
+      "CONDITIONING"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1.015255979947744,
+      "offset": [
+        1102.4108479053803,
+        44.325234827232336
+      ]
+    },
+    "frontendVersion": "1.28.8",
+    "workflowRendererVersion": "LG"
+  },
+  "version": 0.4
+}

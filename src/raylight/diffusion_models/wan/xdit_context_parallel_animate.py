@@ -7,10 +7,12 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 import raylight.distributed_modules.attention as xfuser_attn
-from .xdit_context_parallel import sinusoidal_embedding_1d, pad_if_odd
+from .xdit_context_parallel import sinusoidal_embedding_1d
+from ..utils import pad_to_world_size
 
 attn_type = xfuser_attn.get_attn_type()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type)
+sync_ulysses = xfuser_attn.get_sync_ulysses()
+xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
 
 
 def usp_face_block_forward(
@@ -95,9 +97,10 @@ def usp_animate_dit_forward(
             context = torch.concat([context_clip, context], dim=1)
         context_img_len = clip_fea.shape[-2]
 
-    # Context Parallel
-    x = pad_if_odd(x, dim=1)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    x, orig_size = pad_to_world_size(x, dim=1)
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
@@ -116,10 +119,13 @@ def usp_animate_dit_forward(
             x = x + self.face_adapter.fuser_blocks[i // 5](x, motion_vec)
 
     # head
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    x = get_sp_group().all_gather(x, dim=1)
+    x = x[:, :orig_size, :]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
     x = self.head(x, e)
 
     # Context Parallel
-    x = get_sp_group().all_gather(x, dim=1)
 
     if full_ref is not None:
         x = x[:, full_ref.shape[1]:]

@@ -6,18 +6,11 @@ from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
+from ..utils import pad_to_world_size
 import raylight.distributed_modules.attention as xfuser_attn
 attn_type = xfuser_attn.get_attn_type()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type)
-
-
-def pad_if_odd(t: torch.Tensor, dim: int = 1):
-    if t.size(dim) % 2 != 0:
-        pad_shape = list(t.shape)
-        pad_shape[dim] = 1  # add one element along target dim
-        pad_tensor = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
-        t = torch.cat([t, pad_tensor], dim=dim)
-    return t
+sync_ulysses = xfuser_attn.get_sync_ulysses()
+xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
 
 
 def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor):
@@ -40,8 +33,6 @@ def usp_dit_forward(
     control=None,
     **kwargs
 ):
-    context = pad_if_odd(context, dim=1)
-
     timestep = timesteps
     encoder_hidden_states = context
     encoder_hidden_states_mask = attention_mask
@@ -74,8 +65,6 @@ def usp_dit_forward(
             hidden_states = torch.cat([hidden_states, kontext], dim=1)
             img_ids = torch.cat([img_ids, kontext_ids], dim=1)
 
-    hidden_states = pad_if_odd(hidden_states, dim=1)
-    img_ids = pad_if_odd(img_ids, dim=1)
     image_rotary_emb = self.pe_embedder(img_ids).squeeze(1).unsqueeze(2).to(x.dtype)
     del img_ids
 
@@ -92,18 +81,22 @@ def usp_dit_forward(
         else self.time_text_embed(timestep, guidance, hidden_states)
     )
 
-    # Context parallel
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    hidden_states, hidden_states_orig_size = pad_to_world_size(hidden_states, dim=1)
+    encoder_hidden_states, _ = pad_to_world_size(encoder_hidden_states, dim=1)
+    image_rotary_emb, _ = pad_to_world_size(image_rotary_emb, dim=1)
 
     sp_rank = get_sequence_parallel_rank()
     sp_world_size = get_sequence_parallel_world_size()
+
     hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
     encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_world_size, dim=1)[sp_rank]
     image_rotary_emb = torch.chunk(image_rotary_emb, sp_world_size, dim=1)[sp_rank]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     patches_replace = transformer_options.get("patches_replace", {})
     patches = transformer_options.get("patches", {})
     blocks_replace = patches_replace.get("dit", {})
-
     for i, block in enumerate(self.transformer_blocks):
         if ("double_block", i) in blocks_replace:
             def block_wrap(args):
@@ -135,7 +128,11 @@ def usp_dit_forward(
                 if add is not None:
                     hidden_states[:, :add.shape[1]] += add
 
-    hidden_states = get_sp_group().all_gather(hidden_states, dim=1)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    hidden_states = get_sp_group().all_gather(hidden_states.contiguous(), dim=1)
+    hidden_states = hidden_states[:, :hidden_states_orig_size, :]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+
     hidden_states = self.norm_out(hidden_states, temb)
     hidden_states = self.proj_out(hidden_states)
 

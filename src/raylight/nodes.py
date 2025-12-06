@@ -1,6 +1,8 @@
 import raylight
 import os
 import gc
+from pathlib import Path
+from copy import deepcopy
 
 import ray
 import torch
@@ -17,6 +19,86 @@ from .distributed_worker.ray_worker import (
 )
 
 
+def _resolve_module_dir(module):
+    module_file = getattr(module, '__file__', None)
+    if module_file:
+        path = Path(module_file).resolve()
+        if path.is_file():
+            return path.parent
+
+    module_paths = getattr(module, '__path__', None)
+    if module_paths:
+        for path in module_paths:
+            if path:
+                resolved = Path(path).resolve()
+                if resolved.exists():
+                    return resolved
+
+    raise RuntimeError(f"Unable to determine module path for {getattr(module, '__name__', module)}")
+
+
+def _resolve_repo_root():
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / 'main.py').exists() and (parent / 'execution.py').exists():
+            return parent
+    raise RuntimeError('Unable to locate ComfyUI repository root')
+
+
+def _ensure_runtime_workdir(module_dir: Path) -> Path:
+    runtime_dir = module_dir.parent / '_ray_runtime_env'
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    return runtime_dir
+
+
+def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir: Path):
+    python_path_entries = [str(repo_root)]
+    existing = os.environ.get('PYTHONPATH')
+    if existing:
+        python_path_entries.extend(part for part in existing.split(os.pathsep) if part)
+    python_path = os.pathsep.join(dict.fromkeys(python_path_entries))
+
+    env_vars = {
+        'PYTHONPATH': python_path,
+        'COMFYUI_BASE_DIRECTORY': str(repo_root),
+    }
+
+    return {
+        'py_modules': [str(module_dir)],
+        'working_dir': str(runtime_workdir),
+        'env_vars': env_vars,
+    }
+
+
+def _build_remote_runtime_env(module_dir: Path, repo_root: Path):
+    excludes = [
+        '.git',
+        '.git/**',
+        '__pycache__',
+        '**/__pycache__',
+        '*.pyc',
+    ]
+
+    return {
+        'py_modules': [str(module_dir)],
+        'working_dir': str(repo_root),
+        'env_vars': {
+            'COMFYUI_BASE_DIRECTORY': '.',
+        },
+        'excludes': excludes,
+    }
+
+
+_RAYLIGHT_MODULE_PATH = _resolve_module_dir(raylight)
+_COMFY_ROOT_PATH = _resolve_repo_root()
+_RAYLIGHT_RUNTIME_WORKDIR = _ensure_runtime_workdir(_RAYLIGHT_MODULE_PATH)
+_RAY_RUNTIME_ENV_LOCAL = _build_local_runtime_env(
+    _RAYLIGHT_MODULE_PATH, _COMFY_ROOT_PATH, _RAYLIGHT_RUNTIME_WORKDIR
+)
+_RAY_RUNTIME_ENV_REMOTE = _build_remote_runtime_env(_RAYLIGHT_MODULE_PATH, _COMFY_ROOT_PATH)
+_LOCAL_CLUSTER_ADDRESSES = {None, '', 'local', 'LOCAL'}
+
+
 class RayInitializer:
     @classmethod
     def INPUT_TYPES(s):
@@ -28,6 +110,7 @@ class RayInitializer:
                 "ulysses_degree": ("INT", {"default": 2}),
                 "ring_degree": ("INT", {"default": 1}),
                 "cfg_degree": ("INT", {"default": 1}),
+                "sync_ulysses": ("BOOLEAN", {"default": False}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
                 "XFuser_attention": (
@@ -40,6 +123,7 @@ class RayInitializer:
                         "SAGE_FP16_CUDA",
                         "SAGE_FP8_CUDA",
                         "SAGE_FP8_SM90",
+                        "AITER_ROCM",
                     ],
                     {"default": "TORCH"},
                 ),
@@ -60,6 +144,7 @@ class RayInitializer:
         ulysses_degree,
         ring_degree,
         cfg_degree,
+        sync_ulysses,
         FSDP,
         FSDP_CPU_OFFLOAD,
         XFuser_attention,
@@ -67,8 +152,10 @@ class RayInitializer:
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
         # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = "29500"
+        if "MASTER_ADDR" not in os.environ or "MASTER_PORT" not in os.environ:
+            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            os.environ.setdefault("MASTER_PORT", "29500")
+            print("No env for torch dist MASTER_ADDR and MASTER_PORT, defaulting to 127.0.0.1:29500")
 
         # HF Tokenizer warning when forking
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -81,7 +168,9 @@ class RayInitializer:
         if world_size == 0:
             raise ValueError("Num of cuda/cudalike device is 0")
         if world_size < ulysses_degree * ring_degree * cfg_degree:
-            raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=}")
+            raise ValueError(
+                f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} x {ring_degree=} x {cfg_degree=}"
+            )
         if cfg_degree > 2:
             raise ValueError(
                 "CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2"
@@ -89,22 +178,34 @@ class RayInitializer:
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
+        self.parallel_dict["sync_ulysses"] = False
         self.parallel_dict["global_world_size"] = world_size
 
         if (
-            ulysses_degree > 1
-            or ring_degree > 1
-            or cfg_degree > 1
+            ulysses_degree > 0
+            or ring_degree > 0
+            or cfg_degree > 0
         ):
+            if ulysses_degree * ring_degree * cfg_degree == 0:
+                raise ValueError(f"""ERROR, parallel product of {ulysses_degree=} x {ring_degree=} x {cfg_degree=} is 0.
+                 Please make sure to set any parallel degree to be greater than 0,
+                 or switch into DPKSampler and set 0 to all parallel degree""")
             self.parallel_dict["attention"] = XFuser_attention
             self.parallel_dict["is_xdit"] = True
             self.parallel_dict["ulysses_degree"] = ulysses_degree
             self.parallel_dict["ring_degree"] = ring_degree
             self.parallel_dict["cfg_degree"] = cfg_degree
+            self.parallel_dict["sync_ulysses"] = sync_ulysses
 
         if FSDP:
             self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
             self.parallel_dict["is_fsdp"] = True
+
+
+
+        runtime_env_base = _RAY_RUNTIME_ENV_LOCAL
+        if ray_cluster_address not in _LOCAL_CLUSTER_ADDRESSES:
+            runtime_env_base = _RAY_RUNTIME_ENV_REMOTE
 
         try:
             # Shut down so if comfy user try another workflow it will not cause error
@@ -112,16 +213,12 @@ class RayInitializer:
             ray.init(
                 ray_cluster_address,
                 namespace=ray_cluster_namespace,
-                runtime_env={
-                    "py_modules": [raylight],
-                },
+                runtime_env=deepcopy(runtime_env_base),
             )
         except Exception as e:
             ray.shutdown()
             ray.init(
-                runtime_env={
-                    "py_modules": [raylight],
-                }
+                runtime_env=deepcopy(runtime_env_base)
             )
             raise RuntimeError(f"Ray connection failed: {e}")
 
@@ -539,6 +636,66 @@ class DPNoiseList:
         return (noise_list,)
 
 
+class RayVAEDecodeDistributed:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS", {"tooltip": "Ray Actor to submit the model into"}),
+                "samples": ("LATENT",),
+                "vae_name": (folder_paths.get_filename_list("vae"),),
+                "tile_size": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 32},),
+                "overlap": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 32}),
+                "temporal_size": (
+                    "INT",
+                    {
+                        "default": 64,
+                        "min": 8,
+                        "max": 4096,
+                        "step": 4,
+                        "tooltip": "Only used for video VAEs: Amount of frames to decode at a time.",
+                    },
+                ),
+                "temporal_overlap": (
+                    "INT",
+                    {
+                        "default": 8,
+                        "min": 4,
+                        "max": 4096,
+                        "step": 4,
+                        "tooltip": "Only used for video VAEs: Amount of frames to overlap.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "ray_decode"
+
+    CATEGORY = "Raylight"
+
+    def ray_decode(self, ray_actors, vae_name, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8):
+        gpu_actors = ray_actors["workers"]
+        vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
+
+        for actor in gpu_actors:
+            ray.get(actor.ray_vae_loader.remote(vae_path))
+
+        futures = [
+            actor.ray_vae_decode.remote(
+                samples,
+                tile_size,
+                overlap=64,
+                temporal_size=64,
+                temporal_overlap=8
+            )
+            for i, actor in enumerate(gpu_actors)
+        ]
+
+        image = ray.get(futures)
+        return (image[0],)
+
+
 NODE_CLASS_MAPPINGS = {
     "XFuserKSamplerAdvanced": XFuserKSamplerAdvanced,
     "DPKSamplerAdvanced": DPKSamplerAdvanced,
@@ -546,6 +703,7 @@ NODE_CLASS_MAPPINGS = {
     "RayLoraLoader": RayLoraLoader,
     "RayInitializer": RayInitializer,
     "DPNoiseList": DPNoiseList,
+    "RayVAEDecodeDistributed": RayVAEDecodeDistributed
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -554,5 +712,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayUNETLoader": "Load Diffusion Model (Ray)",
     "RayLoraLoader": "Load Lora Model (Ray)",
     "RayInitializer": "Ray Init Actor",
-    "DPNoiseList": "Data Parallel Noise List"
+    "DPNoiseList": "Data Parallel Noise List",
+    "RayVAEDecodeDistributed": "Distributed VAE (Ray)"
 }

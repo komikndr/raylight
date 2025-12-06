@@ -222,3 +222,15 @@ def _inject_cosmos_video(model_patcher, base_model, *args):
     )
     model = base_model.diffusion_model
     model._forward = types.MethodType(usp_general_dit_forward, model)
+
+
+@USPInjectRegistry.register(model_base.Lumina2)  # Lumina and Z Image
+def _inject_lumina(model_patcher, base_model, *args):
+    from ..diffusion_models.lumina.xdit_context_parallel import (
+        usp_dit_forward,
+        usp_joint_attention_forward
+    )
+    model = base_model.diffusion_model
+    for block in model.layers:
+        block.attention.forward = types.MethodType(usp_joint_attention_forward, block.attention)
+    model._forward = types.MethodType(usp_dit_forward, model)

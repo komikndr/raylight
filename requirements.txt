@@ -1,2 +1,5 @@
 ray>=2.48.0
 xfuser>=0.4.4
+kernels
+huggingface_hub
+hf_transfer
