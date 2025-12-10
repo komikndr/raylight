@@ -119,6 +119,20 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
         return n
 
+    def _load_list(self):
+        loading = []
+        for n, m in self.model.named_modules():
+            params = []
+            skip = False
+            for name, param in m.named_parameters(recurse=False):
+                params.append(name)
+            for name, param in m.named_parameters(recurse=True):
+                if name not in params:
+                    skip = True  # skip random weights in non leaf modules
+                    break
+            if not skip and (hasattr(m, "comfy_cast_weights") or len(params) > 0):
+                loading.append((comfy.model_management.module_size(m), n, m, params))
+        return loading
 
     def load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False):
         with self.use_ejected():
@@ -127,66 +141,17 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
             else:
                 pass
             self.unpatch_hooks()
+
             mem_counter = 0
             patch_counter = 0
-            lowvram_counter = 0
-            loading = self._load_list()
-
-            load_completely = []
-            loading.sort(reverse=True)
-            for x in loading:
-                n = x[1]
-                m = x[2]
-                params = x[3]
-                module_mem = x[0]
-
-                weight_key = "{}.weight".format(n)
-                bias_key = "{}.bias".format(n)
-
-                if not full_load and hasattr(m, "comfy_cast_weights"):
-                    if mem_counter + module_mem >= lowvram_model_memory:
-                        lowvram_counter += 1
-                        if hasattr(m, "prev_comfy_cast_weights"):  # Already lowvramed
-                            continue
-
-                # This single line, take my entire week
-                cast_weight = self.force_cast_weights
-                if hasattr(m, "comfy_cast_weights"):
-                    m.weight_function = []
-                    m.bias_function = []
-
-                if weight_key in self.patches:
-                    if force_patch_weights:
-                        self.patch_weight_to_device(weight_key)
-                    else:
-                        m.weight_function = [LowVramPatch(weight_key, self.patches)]
-                        patch_counter += 1
-                if bias_key in self.patches:
-                    if force_patch_weights:
-                        self.patch_weight_to_device(bias_key)
-                    else:
-                        m.bias_function = [LowVramPatch(bias_key, self.patches)]
-                        patch_counter += 1
-
-                cast_weight = True
-
-                if cast_weight and hasattr(m, "comfy_cast_weights"):
-                    m.prev_comfy_cast_weights = m.comfy_cast_weights
-                    m.comfy_cast_weights = True
-
-                if weight_key in self.weight_wrapper_patches:
-                    m.weight_function.extend(self.weight_wrapper_patches[weight_key])
-
-                if bias_key in self.weight_wrapper_patches:
-                    m.bias_function.extend(self.weight_wrapper_patches[bias_key])
-
-                mem_counter += move_weight_functions(m, device_to)
-
+            load_completely = self._load_list()
             load_completely.sort(reverse=True)
             for x in load_completely:
                 n = x[1]
                 m = x[2]
                 params = x[3]
+                module_mem = x[0]
+
                 if hasattr(m, "comfy_patched_weights"):
                     if m.comfy_patched_weights is True:
                         continue
@@ -196,19 +161,16 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
                 logging.debug("lowvram: loaded module regularly {} {}".format(n, m))
                 m.comfy_patched_weights = True
+                mem_counter += module_mem
 
             for x in load_completely:
                 x[2].to(device_to)
 
-            if lowvram_counter > 0:
-                logging.info("loaded partially {} {} {}".format(lowvram_model_memory / (1024 * 1024), mem_counter / (1024 * 1024), patch_counter))
-                self.model.model_lowvram = True
-            else:
-                logging.info("loaded completely {} {} {}".format(lowvram_model_memory / (1024 * 1024), mem_counter / (1024 * 1024), full_load))
-                self.model.model_lowvram = False
-                if full_load:
-                    self.model.to(device_to)
-                    mem_counter = self.model_size()
+            logging.info("loaded completely {} {} {}".format(lowvram_model_memory / (1024 * 1024), mem_counter / (1024 * 1024), full_load))
+            self.model.model_lowvram = False
+            if full_load:
+                self.model.to(device_to)
+                mem_counter = self.model_size()
 
             self.model.lowvram_patch_counter += patch_counter
             self.model.device = device_to

@@ -58,28 +58,28 @@ class RayWorker:
 
         os.environ["XDIT_LOGGING_LEVEL"] = "WARN"
         os.environ["NCCL_DEBUG"] = "WARN"
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
 
+        if sys.platform.startswith("linux"):
+            dist.init_process_group(
+                "nccl",
+                rank=local_rank,
+                world_size=self.global_world_size,
+                timeout=timedelta(minutes=1),
+                # device_id=self.device
+            )
+        elif sys.platform.startswith("win"):
+            os.environ["USE_LIBUV"] = "0"
+            dist.init_process_group(
+                "gloo",
+                rank=local_rank,
+                world_size=self.global_world_size,
+                timeout=timedelta(minutes=1),
+                # device_id=self.device
+            )
+
+        # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
-            if sys.platform.startswith("linux"):
-                dist.init_process_group(
-                    "nccl",
-                    rank=local_rank,
-                    world_size=self.global_world_size,
-                    timeout=timedelta(minutes=1),
-                    # device_id=self.device
-                )
-            elif sys.platform.startswith("win"):
-                os.environ["USE_LIBUV"] = "0"
-                dist.init_process_group(
-                    "gloo",
-                    rank=local_rank,
-                    world_size=self.global_world_size,
-                    timeout=timedelta(minutes=1),
-                    # device_id=self.device
-                )
-
-            # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
             self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
         else:
             print(f"Running Ray in normal seperate sampler with: {self.global_world_size} number of workers")
@@ -171,16 +171,21 @@ class RayWorker:
 
     def load_unet(self, unet_path, model_options):
         if self.parallel_dict["is_fsdp"] is True:
+            # Monkey patch
             import comfy.model_patcher as model_patcher
             import comfy.model_management as model_management
 
+            # Monkey patch
             from raylight.comfy_dist.model_management import cleanup_models_gc
             from raylight.comfy_dist.model_patcher import LowVramPatch
 
             from raylight.comfy_dist.sd import fsdp_load_diffusion_model
             from torch.distributed.fsdp import FSDPModule
+
+            # Monkey patch
             model_patcher.LowVramPatch = LowVramPatch
             model_management.cleanup_models_gc = cleanup_models_gc
+
             m = getattr(self.model, "model", None)
             if m is not None and isinstance(getattr(m, "diffusion_model", None), FSDPModule):
                 del self.model

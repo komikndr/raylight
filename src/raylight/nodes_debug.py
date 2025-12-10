@@ -9,6 +9,7 @@ import torch
 from comfy import sd, sample, utils
 from .distributed_worker.ray_worker import (
     make_ray_actor_fn,
+    ensure_fresh_actors,
     ray_nccl_tester
 )
 
