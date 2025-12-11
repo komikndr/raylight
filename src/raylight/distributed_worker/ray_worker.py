@@ -80,10 +80,11 @@ class RayWorker:
             )
 
         # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
-        if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
-            self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
-        else:
-            print(f"Running Ray in normal seperate sampler with: {self.global_world_size} number of workers")
+        # DISABLE WINDOWS BUILT FOR FSDP
+        # if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
+        #     self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
+        # else:
+        #     print(f"Running Ray in normal seperate sampler with: {self.global_world_size} number of workers")
 
         # From mochi-xdit, xdit, pipelines.py
         if self.parallel_dict["is_xdit"]:
@@ -477,6 +478,7 @@ class RayWorker:
 class RayCOMMTester:
     def __init__(self, local_rank, world_size, device_id):
         device = torch.device(f"cuda:{device_id}")
+        self.global_world_size = world_size
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
         comm_lib = os.environ.get('COMM_LIBS', 'GLOO')
 
