@@ -57,8 +57,12 @@ class RayWorker:
         os.environ["XDIT_LOGGING_LEVEL"] = "WARN"
         os.environ["NCCL_DEBUG"] = "WARN"
         os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
+        comm_lib = os.environ.get('COMM_LIBS', 'GLOO')
 
-        if sys.platform.startswith("linux"):
+        if sys.platform.startswith("win"):
+            os.environ["USE_LIBUV"] = "0"
+
+        if comm_lib == "NCCL":
             dist.init_process_group(
                 "nccl",
                 rank=local_rank,
@@ -66,8 +70,7 @@ class RayWorker:
                 timeout=timedelta(minutes=1),
                 # device_id=self.device
             )
-        elif sys.platform.startswith("win"):
-            os.environ["USE_LIBUV"] = "0"
+        elif comm_lib == "GLOO":
             dist.init_process_group(
                 "gloo",
                 rank=local_rank,
@@ -475,23 +478,24 @@ class RayCOMMTester:
     def __init__(self, local_rank, world_size, device_id):
         device = torch.device(f"cuda:{device_id}")
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+        comm_lib = os.environ.get('COMM_LIBS', 'GLOO')
 
-        if sys.platform.startswith("linux"):
+        if sys.platform.startswith("win"):
+            os.environ["USE_LIBUV"] = "0"
+
+        if comm_lib == "NCCL":
             dist.init_process_group(
                 "nccl",
                 rank=local_rank,
-                world_size=world_size,
+                world_size=self.global_world_size,
                 timeout=timedelta(minutes=1),
                 # device_id=self.device
             )
-        elif sys.platform.startswith("win"):
-            os.environ["USE_LIBUV"] = "0"
-            if local_rank == 0:
-                print("Windows detected, falling back to GLOO backend, consider using WSL, GLOO is slower than NCCL")
+        elif comm_lib == "GLOO":
             dist.init_process_group(
                 "gloo",
                 rank=local_rank,
-                world_size=world_size,
+                world_size=self.global_world_size,
                 timeout=timedelta(minutes=1),
                 # device_id=self.device
             )

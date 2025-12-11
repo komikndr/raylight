@@ -333,11 +333,11 @@ https://github.com/user-attachments/assets/d5e262c7-16d5-4260-b847-27be2d809920
    ..\..\..\python_embeded\python.exe -m pip install -r .\requirements.txt
    ..\..\..\python_embeded\python.exe -m pip install -e .
    ```
-4. Highly experimental — please open an issue if you encounter errors.
-5. Advisable to run in WSL since windows does not have NCCL support from PyTorch, raylight will run using GLOO,
+4. To choose which communication libs to use e.g: gloo or NCCL please export env variable
+   "COMM_LIBS=GLOO" or "COMM_LIBS=NCCL", defaulted to "GLOO"
+5. Highly experimental — please open an issue if you encounter errors.
+6. Advisable to run in WSL since windows does not have NCCL support from PyTorch, raylight will run using GLOO,
    which is slower than NCCL. Might not even worth it to run in windows other than WSL.
-
-
 
 ## Support
 [PayPal](https://paypal.me/Komikndr)
