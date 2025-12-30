@@ -1,0 +1,1 @@
+pip install "yunchang @ git+https://github.com/feifeibear/long-context-attention.git@a52d85007ced2065dd71c498be65a02d62b51cac"

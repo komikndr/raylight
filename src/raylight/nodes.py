@@ -9,6 +9,7 @@ import ray
 import torch
 import comfy
 import folder_paths
+from yunchang.kernels import AttnType
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils # type: ignore
@@ -126,17 +127,7 @@ class RayInitializer:
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
                 "XFuser_attention": (
-                    [
-                        "TORCH",
-                        "FLASH_ATTN",
-                        "FLASH_ATTN_3",
-                        "SAGE_AUTO_DETECT",
-                        "SAGE_FP16_TRITON",
-                        "SAGE_FP16_CUDA",
-                        "SAGE_FP8_CUDA",
-                        "SAGE_FP8_SM90",
-                        "AITER_ROCM",
-                    ],
+                    [member.name for member in AttnType],
                     {"default": "TORCH"},
                 ),
             }
