@@ -3,6 +3,18 @@ from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateD
 from raylight.distributed_modules.utils import detect_dtype_mismatch
 
 
+def build_ignored_params(module, ref_dtype):
+    ignored = set()
+
+    for name, param in module.named_parameters(recurse=True):
+        if param.dtype != ref_dtype:
+            ignored.add(param)
+            continue
+        if not (name.endswith("weight") or name.endswith("bias")):
+            ignored.add(param)
+    return ignored
+
+
 def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
     diffusion_model = model.diffusion_model
 
@@ -17,10 +29,17 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
         ):
             ignored_params.add(param)
     # Shard distilled_guidance_layer
+    ref_dtype = diffusion_model.distilled_guidance_layer.layers[0].in_layer.weight.dtype
+    distil_ignored_params = build_ignored_params(
+        diffusion_model.distilled_guidance_layer,
+        ref_dtype
+    )
+
     diffusion_model.distilled_guidance_layer = fully_shard(
         module=diffusion_model.distilled_guidance_layer,
         mp_policy=MixedPrecisionPolicy(),
         reshard_after_forward=True,
+        ignored_params=distil_ignored_params,
     )
 
     # Check dtype missmatch from scaled model
