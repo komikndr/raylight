@@ -42,6 +42,7 @@ class RayWorker:
         self.model_type = None
         self.state_dict = None
         self.parallel_dict = parallel_dict
+        self.overwrite_cast_dtype = None
 
         self.local_rank = local_rank
         self.global_world_size = self.parallel_dict["global_world_size"]
@@ -198,12 +199,13 @@ class RayWorker:
             gc.collect()
         else:
             self.model = comfy.sd.load_diffusion_model(
-                unet_path, model_options=model_options,
+                unet_path, model_options={},
             )
 
         if self.lora_list is not None:
             self.load_lora()
 
+        self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
         self.is_model_loaded = True
 
     def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype):
