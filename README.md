@@ -179,7 +179,7 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 | Model             | USP | FSDP | CFG |
 |-------------------|-----|------|-----|
 | Flux Dev          | ✅  | ✅   | ❌  |
-| Flux Konteks      | ✅  | ✅   | ❌  |
+| Flux Kontext      | ✅  | ✅   | ❌  |
 | Flux Krea         | ✅  | ✅   | ❌  |
 | Flux 2            | ✅  | ✅   | ❌  |
 | Flux ControlNet   | ❌  | ❌   | ❌  |
