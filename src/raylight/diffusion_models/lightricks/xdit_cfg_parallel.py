@@ -10,7 +10,7 @@ def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
     cfg_rank = get_classifier_free_guidance_rank()
     cfg_world_size = get_classifier_free_guidance_world_size()
 
-    x, timestep, context, attention_mask, frame_rate, transformer_options, keyframe_idxs = args
+    x, timestep, context, attention_mask, frame_rate, transformer_options, keyframe_idxs, denoise_mask = args
 
     if x.shape[0] == cfg_world_size:
         x = torch.chunk(x, cfg_world_size, dim=0)[cfg_rank]
@@ -25,6 +25,18 @@ def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
     if keyframe_idxs is not None:
         keyframe_idxs = torch.chunk(keyframe_idxs, cfg_world_size, dim=0)[cfg_rank]
 
-    result = executor(x, timestep, context, attention_mask, frame_rate, transformer_options, keyframe_idxs, **kwargs)
+    if denoise_mask is not None:
+        denoise_mask = torch.chunk(denoise_mask, cfg_world_size, dim=0)[cfg_rank]
+
+    result = executor(x,
+                      timestep,
+                      context,
+                      attention_mask,
+                      frame_rate,
+                      transformer_options,
+                      keyframe_idxs,
+                      denoise_mask,
+                      **kwargs)
+
     result = get_cfg_group().all_gather(result, dim=0)
     return result

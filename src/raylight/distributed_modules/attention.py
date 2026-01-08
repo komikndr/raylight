@@ -43,7 +43,19 @@ def make_xfuser_attention(attn_type, sync_ulysses):
 
     xfuser_attn = xFuserLongContextAttention(use_sync=sync_ulysses, attn_type=attn)
 
-    def _attention_xfuser_unmask(q, k, v, heads, join_q=None, join_k=None, join_v=None, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False):
+    def _attention_xfuser_unmask(
+            q,
+            k,
+            v,
+            heads,
+            join_q=None,
+            join_k=None,
+            join_v=None,
+            mask=None,
+            attn_precision=None,
+            skip_reshape=False,
+            skip_output_reshape=False):
+
         if skip_reshape:
             b, _, _, dim_head = q.shape
             if join_q is not None:

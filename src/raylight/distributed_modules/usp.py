@@ -278,3 +278,9 @@ if hasattr(model_base, "Kandinsky5"):
                 usp_cross_attn_forward, visual_block.cross_attention)
 
         model.forward_orig = types.MethodType(usp_dit_forward, model)
+
+if hasattr(model_base, "LTXV"):
+    @USPInjectRegistry.register(model_base.LTXV)
+    def _inject_ltxv():
+        from ..diffusion_models.lightricks.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+        return cfg_parallel_forward_wrapper
