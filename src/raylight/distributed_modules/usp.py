@@ -279,8 +279,36 @@ if hasattr(model_base, "Kandinsky5"):
 
         model.forward_orig = types.MethodType(usp_dit_forward, model)
 
+if hasattr(model_base, "LTXAV"):
+    @USPInjectRegistry.register(model_base.LTXAV)
+    def _inject_ltxvav(model_patcher, base_model, *args):
+        from ..diffusion_models.lightricks.xdit_context_parallel import (
+            usp_dit_forward,
+            usp_cross_attn_forward
+        )
+
+        model = base_model.diffusion_model
+        for block in model.transformer_blocks:
+            block.attn1.forward = types.MethodType(usp_cross_attn_forward, block.attn1)
+            block.audio_attn1.forward = types.MethodType(usp_cross_attn_forward, block.audio_attn1)
+            block.attn2.forward = types.MethodType(usp_cross_attn_forward, block.attn2)
+            block.audio_attn2.forward = types.MethodType(usp_cross_attn_forward, block.audio_attn2)
+            block.audio_to_video_attn.forward = types.MethodType(usp_cross_attn_forward, block.audio_to_video_attn)
+            block.video_to_audio_attn.forward = types.MethodType(usp_cross_attn_forward, block.video_to_audio_attn)
+
+        model._forward = types.MethodType(usp_dit_forward, model)
+
 if hasattr(model_base, "LTXV"):
     @USPInjectRegistry.register(model_base.LTXV)
-    def _inject_ltxv():
-        from ..diffusion_models.lightricks.xdit_cfg_parallel import cfg_parallel_forward_wrapper
-        return cfg_parallel_forward_wrapper
+    def _inject_ltxv(model_patcher, base_model, *args):
+        from ..diffusion_models.lightricks.xdit_context_parallel import (
+            usp_dit_forward,
+            usp_cross_attn_forward
+        )
+
+        model = base_model.diffusion_model
+        for block in model.transformer_blocks:
+            block.attn1.forward = types.MethodType(usp_cross_attn_forward, block.attn1)
+            block.attn2.forward = types.MethodType(usp_cross_attn_forward, block.attn2)
+
+        model._forward = types.MethodType(usp_dit_forward, model)
