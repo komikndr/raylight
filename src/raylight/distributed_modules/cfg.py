@@ -87,6 +87,7 @@ if hasattr(model_base, "HiDream"):
 
 if hasattr(model_base, "LTXV"):
     @CFGParallelInjectRegistry.register(model_base.LTXV)
+    @CFGParallelInjectRegistry.register(model_base.LTXAV)
     def _inject_ltxv():
         from ..diffusion_models.lightricks.xdit_cfg_parallel import cfg_parallel_forward_wrapper
         return cfg_parallel_forward_wrapper
