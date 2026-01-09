@@ -13,6 +13,84 @@ sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
 
 
+# A better solution is just to type.MethodType the x, context, and pe construction,
+def pad_group_to_world_size(group, dim):
+    """
+    group: Tensor | list[Tensor] | tuple[Tensor]
+    Returns: padded_group, orig_sizes
+    """
+
+    if torch.is_tensor(group):
+        orig = group.size(dim)
+        group, _ = pad_to_world_size(group, dim=dim)
+        return group, orig
+
+    elif isinstance(group, (list, tuple)):
+        padded = []
+        origs = []
+        for g in group:
+            o = g.size(dim)
+            g, _ = pad_to_world_size(g, dim=dim)
+            padded.append(g)
+            origs.append(o)
+        return type(group)(padded), origs
+
+    else:
+        return group, None
+
+
+def pad_and_split_pe(pe, dim, sp_world_size, sp_rank):
+    out = []
+
+    for group in pe:              # pe[i]
+        new_group = []
+
+        for cos, sin, flag in group:  # pe[i][j]
+            # Pad
+            cos, _ = pad_to_world_size(cos, dim=dim)
+            sin, _ = pad_to_world_size(sin, dim=dim)
+
+            # Split (sequence parallel)
+            cos = torch.chunk(cos, sp_world_size, dim=dim)[sp_rank]
+            sin = torch.chunk(sin, sp_world_size, dim=dim)[sp_rank]
+
+            new_group.append((cos, sin, flag))
+
+        out.append(tuple(new_group))
+
+    return out
+
+
+def sp_chunk_group(group, sp_world_size, sp_rank, dim):
+    if torch.is_tensor(group):
+        return torch.chunk(group, sp_world_size, dim=dim)[sp_rank]
+
+    elif isinstance(group, (list, tuple)):
+        return type(group)(
+            torch.chunk(g, sp_world_size, dim=dim)[sp_rank]
+            for g in group
+        )
+    else:
+        return group
+
+
+def sp_gather_group(group, orig_sizes, dim):
+    if torch.is_tensor(group):
+        g = get_sp_group().all_gather(group.contiguous(), dim=dim)
+        return g.narrow(dim, 0, orig_sizes)
+
+    elif isinstance(group, (list, tuple)):
+        out = []
+        for g, o in zip(group, orig_sizes):
+            g = get_sp_group().all_gather(g.contiguous(), dim=dim)
+            g = g.narrow(dim, 0, o)
+            out.append(g)
+        return type(group)(out)
+
+    else:
+        return group
+
+
 def usp_dit_forward(
     self,
     x,
@@ -61,15 +139,13 @@ def usp_dit_forward(
     # Prepare attention mask and positional embeddings
     attention_mask = self._prepare_attention_mask(attention_mask, input_dtype)
     pe = self._prepare_positional_embeddings(pixel_coords, frame_rate, input_dtype)
-
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    x, x_orig_size = pad_to_world_size(x, dim=1)
-    context, _ = pad_to_world_size(context, dim=1)
-    pe, _ = pad_to_world_size(pe, dim=1)
+    x, x_orig = pad_group_to_world_size(x, dim=1)
+    context, _ = pad_group_to_world_size(context, dim=1)
+    pe = pad_and_split_pe(pe, dim=2, sp_world_size=sp_world_size, sp_rank=sp_rank)
 
-    x = torch.chunk(x, sp_world_size, dim=1)[sp_rank]
-    context = torch.chunk(context, sp_world_size, dim=1)[sp_rank]
-    pe = torch.chunk(pe, sp_world_size, dim=2)[sp_rank]
+    x = sp_chunk_group(x, sp_world_size, sp_rank, dim=1)
+    context = sp_chunk_group(context, sp_world_size, sp_rank, dim=1)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     # Process transformer blocks
@@ -77,10 +153,7 @@ def usp_dit_forward(
         x, context, attention_mask, timestep, pe, transformer_options=transformer_options, **merged_args
     )
 
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
-    x = get_sp_group().all_gather(x.contiguous(), dim=1)
-    x = x[:, :x_orig_size, :]
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    x = sp_gather_group(x, x_orig, dim=1)
 
     # Process output
     x = self._process_output(x, embedded_timestep, keyframe_idxs, **merged_args)
