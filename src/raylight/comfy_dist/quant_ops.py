@@ -4,12 +4,10 @@ from comfy_kitchen.tensor import TensorCoreFP8Layout, TensorCoreNVFP4Layout
 
 
 def dequantize_ray_temp_fix_fp8(qdata, params, dtype):
-    print("runinng dequant on fp8")
     return ck.dequantize_per_tensor_fp8(qdata, params.scale, dtype)
 
 
 def dequantize_ray_temp_fix_nvfp4(qdata, params, dtype):
-    print("runinng dequant on nvfp4")
     return ck.dequantize_nvfp4(qdata, params.scale, params.block_scale, dtype)
 
 
