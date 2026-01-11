@@ -8,6 +8,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 Bug on Comfy mixed precision model, if you use any `model_name_fp8mixed.safetensors`, you will get dequantized error
 
 ## UPDATE
+- LTX-2 USP
 - Kandinsky5 model
 - Fix FSDP error cause by Ray cannot pickle None type return by `comfy.supported_models_base.BASE.__getattr__`
 - TeaCache and EasyCache added thanks to [rmatif](https://github.com/rmatif/raylight/tree/easycache)
@@ -87,6 +88,7 @@ Its job is to split the model weights among GPUs.
 
 ## RTM and Known Issues
 - Scroll further down for the installation guide.
+- Model without new ComfyUI quant usually can be sharded using FSDP.
 - If there is an error about NCCL installation, just install `pip install nvidia-nccl-cu12==2.28.9`.
   Raylight use this NCCL lib instead of torch baked in NCCL.
 - If NCCL communication fails before running (e.g., watchdog timeout), set the following environment variables:
@@ -147,10 +149,15 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 
 ### NVidia
 
-1. **Turing**: Not tested. Please use FlashAttn1 instead of FlashAttn2 or Torch Attn.
-2. **Ampere**: Tested
-3. **Ada Lovelace**: Tested
-4. **Blackwell**: Tested
+1. **Volta** : Use latest Yunchang libs, check notes below.
+2. **Turing**: Same as Volta
+3. **Ampere**: Tested
+4. **Ada Lovelace**: Tested
+5. **Blackwell**: Tested
+
+**Notes:**
+- Install latest Yunchang libs to enable FLASH_EFFICIENT, copy cmd inside the `requirements_experimental.txt`,
+  don't forget to refresh your nodes and select FLASH_EFFICIENT on XFuser_attention in Ray Init Actor node.
 
 ### AMD
 
@@ -179,7 +186,7 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 | Model             | USP | FSDP | CFG |
 |-------------------|-----|------|-----|
 | Flux Dev          | ✅  | ✅   | ❌  |
-| Flux Konteks      | ✅  | ✅   | ❌  |
+| Flux Kontext      | ✅  | ✅   | ❌  |
 | Flux Krea         | ✅  | ✅   | ❌  |
 | Flux 2            | ✅  | ✅   | ❌  |
 | Flux ControlNet   | ❌  | ❌   | ❌  |
@@ -222,6 +229,12 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 | Kandinsky5 T2V    | ✅  | ❌   | ❌  |
 
 
+**LTX-2**
+| Model              | USP | FSDP | CFG |
+|--------------------|-----|------|-----|
+| LTX-2 T/I/A/ 2 V/VA| ✅  | ❌   | ❌  |
+
+
 **UNet**
 | Model  | USP | FSDP | CFG |
 |--------|-----|------|-----|
@@ -231,6 +244,10 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 **Legend:**
 - ✅ = Supported
 - ❌ = Not currently supported.
+- T = Text
+- I = Image
+- A = Audio
+- V = Video
 
 **Notes:**
 - Non standard Wan variant (Phantom, S2V, etc...) is not tested
