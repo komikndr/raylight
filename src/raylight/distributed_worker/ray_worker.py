@@ -23,7 +23,7 @@ from raylight.distributed_modules.cfg import CFGParallelInjectRegistry
 
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
-from raylight.comfy_dist.quant_ops import patch_temp_fix_fp8mixed
+from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 from ray.exceptions import RayActorError
 
 
@@ -343,7 +343,7 @@ class RayWorker:
             )
         return images
 
-    @patch_temp_fix_fp8mixed
+    @patch_temp_fix_ck_ops
     @patch_ray_tqdm
     def custom_sampler(
         self,
@@ -408,7 +408,7 @@ class RayWorker:
         gc.collect()
         return out
 
-    @patch_temp_fix_fp8mixed
+    @patch_temp_fix_ck_ops
     @patch_ray_tqdm
     def common_ksampler(
         self,
