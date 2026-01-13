@@ -142,7 +142,7 @@ def usp_dit_forward(
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     x, x_orig = pad_group_to_world_size(x, dim=1)
     context, _ = pad_group_to_world_size(context, dim=1)
-    pe = pad_and_split_pe(pe, dim=2, sp_world_size=sp_world_size, sp_rank=sp_rank)
+    pe = pad_and_split_pe(pe, dim=1, sp_world_size=sp_world_size, sp_rank=sp_rank)
 
     x = sp_chunk_group(x, sp_world_size, sp_rank, dim=1)
     context = sp_chunk_group(context, sp_world_size, sp_rank, dim=1)
