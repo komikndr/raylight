@@ -91,6 +91,24 @@ def sp_gather_group(group, orig_sizes, dim):
         return group
 
 
+def process_usp_timestep(timestep, sp_rank, sp_world_size):
+    if isinstance(timestep, (list, tuple)):
+        return type(timestep)(
+            process_usp_timestep(t, sp_rank, sp_world_size) for t in timestep
+        )
+    elif torch.is_tensor(timestep):
+        # Pad, Split
+        t, _ = pad_to_world_size(timestep, dim=1)
+        return torch.chunk(t, sp_world_size, dim=1)[sp_rank]
+    elif hasattr(timestep, "expand"):  # CompressedTimestep
+        # Expand, Pad, Split
+        t = timestep.expand()
+        t, _ = pad_to_world_size(t, dim=1)
+        return torch.chunk(t, sp_world_size, dim=1)[sp_rank]
+    else:
+        return timestep
+
+
 def usp_dit_forward(
     self,
     x,
@@ -146,6 +164,7 @@ def usp_dit_forward(
 
     x = sp_chunk_group(x, sp_world_size, sp_rank, dim=1)
     context = sp_chunk_group(context, sp_world_size, sp_rank, dim=1)
+    timestep = process_usp_timestep(timestep, sp_rank, sp_world_size)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     # Process transformer blocks

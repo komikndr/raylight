@@ -463,7 +463,6 @@ class RayModelComputeDtype:
 
     @ray_patch
     def patch(self, model, dtype):
-        m = model.clone()
         m.set_model_compute_dtype(node_helpers.string_to_torch_dtype(dtype))
         return m
 

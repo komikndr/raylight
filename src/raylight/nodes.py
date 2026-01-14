@@ -480,6 +480,9 @@ class XFuserKSamplerAdvanced:
                 "start_at_step": ("INT", {"default": 0, "min": 0, "max": 10000}),
                 "end_at_step": ("INT", {"default": 10000, "min": 0, "max": 10000}),
                 "return_with_leftover_noise": (["disable", "enable"],),
+            },
+            "optional": {
+                "sigmas": ("SIGMAS",),
             }
         }
 
@@ -504,6 +507,7 @@ class XFuserKSamplerAdvanced:
         end_at_step,
         return_with_leftover_noise,
         denoise=1.0,
+        sigmas=None,
     ):
         # Clean VRAM for preparation to load model
         gc.collect()
@@ -532,6 +536,7 @@ class XFuserKSamplerAdvanced:
                 start_step=start_at_step,
                 last_step=end_at_step,
                 force_full_denoise=force_full_denoise,
+                sigmas=sigmas
             )
             for actor in gpu_actors
         ]

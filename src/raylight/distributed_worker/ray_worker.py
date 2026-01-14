@@ -208,6 +208,10 @@ class RayWorker:
         self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
         self.is_model_loaded = True
 
+    def apply_model_sampling(self, model_sampling_patch):
+         self.model.add_object_patch("model_sampling", model_sampling_patch)
+
+
     def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype):
         if self.parallel_dict["is_fsdp"] is True:
             raise ValueError("FSDP Sharding for GGUF is not supported")
@@ -425,6 +429,7 @@ class RayWorker:
         start_step=None,
         last_step=None,
         force_full_denoise=False,
+        sigmas=None,
     ):
         latent_image = latent["samples"]
         latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
@@ -452,27 +457,49 @@ class RayWorker:
         disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
         if self.local_rank == 0:
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        
+        # Sampler resolution logic for custom sigmas
+        sampler_obj = sampler_name
+        if sigmas is not None:
+             if isinstance(sampler_name, str):
+                 sampler_obj = comfy.samplers.ksampler(sampler_name)
 
         with torch.no_grad():
-            samples = comfy.sample.sample(
-                self.model,
-                noise,
-                steps,
-                cfg,
-                sampler_name,
-                scheduler,
-                positive,
-                negative,
-                latent_image,
-                denoise=denoise,
-                disable_noise=disable_noise,
-                start_step=start_step,
-                last_step=last_step,
-                force_full_denoise=force_full_denoise,
-                noise_mask=noise_mask,
-                disable_pbar=disable_pbar,
-                seed=seed,
-            )
+            if sigmas is None:
+                samples = comfy.sample.sample(
+                    self.model,
+                    noise,
+                    steps,
+                    cfg,
+                    sampler_name,
+                    scheduler,
+                    positive,
+                    negative,
+                    latent_image,
+                    denoise=denoise,
+                    disable_noise=disable_noise,
+                    start_step=start_step,
+                    last_step=last_step,
+                    force_full_denoise=force_full_denoise,
+                    noise_mask=noise_mask,
+                    disable_pbar=disable_pbar,
+                    seed=seed,
+               )
+            else:
+                 samples = comfy.sample.sample_custom(
+                    self.model,
+                    noise,
+                    cfg,
+                    sampler_obj,
+                    sigmas,
+                    positive,
+                    negative,
+                    latent_image,
+                    noise_mask=noise_mask,
+                    disable_pbar=disable_pbar,
+                    seed=seed,
+                )
+            
             out = latent.copy()
             out["samples"] = samples
 
