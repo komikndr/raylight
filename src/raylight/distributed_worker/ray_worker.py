@@ -25,6 +25,8 @@ from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_mod
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 from ray.exceptions import RayActorError
+from contextlib import contextmanager
+import inspect
 
 
 # Developer reminder, Checking model parameter outside ray actor is very expensive (e.g Comfy main thread)
@@ -98,6 +100,16 @@ class RayWorker:
             self.ulysses_degree = self.parallel_dict["ulysses_degree"]
             self.ring_degree = self.parallel_dict["ring_degree"]
             self.cfg_degree = self.parallel_dict["cfg_degree"]
+            
+            # Cleanup previous state if any (Robustness for restarts)
+            try:
+                from xfuser.core.distributed import parallel_state
+                if parallel_state.get_world_size() > 1:
+                    parallel_state.destroy_model_parallel()
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+            except Exception as e:
+                print(f"[Raylight] Cleanup warning: {e}")
 
             init_distributed_environment(rank=self.local_rank, world_size=self.global_world_size)
             print("XDiT is enable")
@@ -210,6 +222,108 @@ class RayWorker:
 
     def apply_model_sampling(self, model_sampling_patch):
          self.model.add_object_patch("model_sampling", model_sampling_patch)
+
+    def load_unet_to_return(self, unet_path):
+        """Loads the UNET state dict and returns it. Ray will handle placing it in the object store."""
+        import comfy.utils
+        sd = comfy.utils.load_torch_file(unet_path)
+        return sd
+
+    def load_unet_from_state_dict(self, state_dict, model_options):
+        """Loads the UNET from a provided state dict (passed via shared memory)."""
+        self.overwrite_cast_dtype = None # Reset
+        
+        @contextmanager
+        def patch_torch_load_state_dict():
+            original_load = torch.nn.Module.load_state_dict
+            
+            # Check if assign is supported (torch >= 2.1)
+            sig = inspect.signature(original_load)
+            supports_assign = "assign" in sig.parameters
+
+            if not supports_assign:
+                print("[Raylight] Warning: torch version does not support assign=True in load_state_dict. Shared RAM optimization disabled.")
+                yield
+                return
+
+            def patched_load(self, state_dict, strict=True, assign=False):
+                # Force assign=True to share memory from Object Store
+                return original_load(self, state_dict, strict=strict, assign=True)
+            
+            try:
+                torch.nn.Module.load_state_dict = patched_load
+                yield
+            finally:
+                torch.nn.Module.load_state_dict = original_load
+
+        with patch_torch_load_state_dict():
+            self.model = comfy.sd.load_diffusion_model_state_dict(
+                state_dict, model_options=model_options
+            )
+        
+        if self.model is None:
+             raise RuntimeError("Failed to load model from state dict")
+
+        # ENFORCE Memory Sharing (Fix for OOM)
+        # Even if load_state_dict copied data (e.g. due to casting), we force it back to shared tensor.
+        try:
+             # Create a mapping for faster lookup
+             # ComfyUI model structure might differ slightly in naming.
+             # Typical prefixes in state_dict: "model.diffusion_model.", "diffusion_model.", or none.
+             count = 0
+             cast_count = 0
+             prefixes = ["", "model.diffusion_model.", "diffusion_model."]
+             
+             for name, param in self.model.model.named_parameters():
+                 if name in state_dict:
+                     key_found = name
+                 else:
+                     # Try to find the matching key via prefixes
+                     key_found = None
+                     for p in prefixes:
+                         candidate = p + name
+                         if candidate in state_dict:
+                             key_found = candidate
+                             break
+                 
+                 if key_found:
+                     # Check if data pointers differ (implies copy exists)
+                     if param.data_ptr() != state_dict[key_found].data_ptr():
+                         # FORCE SHARE: Replace the data tensor with the shared one
+                         if param.dtype == state_dict[key_found].dtype:
+                             param.data = state_dict[key_found]
+                             count += 1
+                         else:
+                             # Dtype mismatch: Force the parameter to use the Shared Tensor's dtype and memory
+                             # This effectively casts the model layer to the shared weight's precision (usually FP16/BF16)
+                             # This is SAFE for inference and required for Zero-Copy.
+                             param.data = state_dict[key_found]
+                             cast_count += 1
+
+             if count > 0 or cast_count > 0:
+                 print(f"[Raylight] Memory Sharing Active: {count} exact + {cast_count} casted parameters linked to Shared Object Store.")
+             else:
+                 print("[Raylight] WARNING: Memory Sharing skipped. Inspect debug logs if OOM occurs.")
+
+        except Exception as e:
+            print(f"[Raylight] Memory Optimization Error: {e}")
+
+        if self.model is None:
+             raise RuntimeError("Failed to load model from state dict")
+        
+        if self.model is None:
+             raise RuntimeError("Failed to load model from state dict")
+
+        if self.lora_list is not None:
+            self.load_lora()
+
+        self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+        self.is_model_loaded = True
+
+        # Explicitly free memory
+        import gc
+        gc.collect()
+        comfy.model_management.soft_empty_cache()
 
 
     def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype):
@@ -404,10 +518,12 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
-            self.model.detach()
-        else:
-            self.model.detach()
+        # NOTE: We intentionally skip self.model.detach() here.
+        # Standard ComfyUI behavior is to 'detach' (offload) to CPU to save VRAM.
+        # However, for Ray workers using Shared Memory (Zero-Copy), moving to CPU
+        # creates a PRIVATE copy of the weights, breaking the shared link and causing OOM.
+        # By skipping detach, we keep the weights either on GPU or linked to the Shared Object Store.
+        
         comfy.model_management.soft_empty_cache()
         gc.collect()
         return out

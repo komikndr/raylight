@@ -130,6 +130,15 @@ class RayInitializer:
                     [member.name for member in AttnType],
                     {"default": "TORCH"},
                 ),
+                "ray_object_store_gb": ("FLOAT", {
+                    "default": 0.0,
+                    "tooltip": "Ray shared memory object store size in GB. 0.0 = Auto (Use Ray default ~30% of System RAM). Increase if you see spilling to disk."}),
+            },
+            "optional": {
+                "gpu_indices": ("STRING", {
+                    "default": "",
+                    "tooltip": "Comma-separated list of GPU indices to use (e.g., '0,1'). Overrides automatic selection."
+                }),
             }
         }
 
@@ -151,9 +160,10 @@ class RayInitializer:
         FSDP: bool,
         FSDP_CPU_OFFLOAD: bool,
         XFuser_attention: int,
-        ray_object_store_gb: float = 2.0,
+        ray_object_store_gb: float = 0.0,
         ray_dashboard_address: str = "None",
-        torch_dist_address: str = "None"
+        torch_dist_address: str = "None",
+        gpu_indices: str = "",
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
@@ -220,19 +230,36 @@ class RayInitializer:
             dashboard_host, dashboard_port = "127.0.0.1", None
             enable_dashboard = False
 
-        ray_object_store_gb = int(ray_object_store_gb * 1024**3)
+        if ray_object_store_gb <= 0:
+            ray_object_store_memory = None
+            print("[Raylight] object_store_memory set to Auto (Ray default).")
+        else:
+            ray_object_store_memory = int(ray_object_store_gb * 1024**3)
+            print(f"[Raylight] object_store_memory set to {ray_object_store_gb} GB.")
+
         runtime_env_base = _RAY_RUNTIME_ENV_LOCAL
         if ray_cluster_address not in _LOCAL_CLUSTER_ADDRESSES:
             runtime_env_base = _RAY_RUNTIME_ENV_REMOTE
 
+        # GPU Pinning Logic
+        original_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
         try:
+            if gpu_indices.strip():
+                # Validate and set
+                indices = [x.strip() for x in gpu_indices.split(",") if x.strip()]
+                if len(indices) < world_size:
+                     raise ValueError(f"gpu_indices contains {len(indices)} GPUs, but {world_size} (GPU input) were requested.")
+                
+                os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(indices)
+                print(f"[Raylight] Pinning Ray Cluster to GPUs: {os.environ['CUDA_VISIBLE_DEVICES']}")
+
             # Shut down so if comfy user try another workflow it will not cause error
             ray.shutdown()
             ray.init(
                 ray_cluster_address,
                 namespace=ray_cluster_namespace,
                 runtime_env=deepcopy(runtime_env_base),
-                object_store_memory=ray_object_store_gb,
+                object_store_memory=ray_object_store_memory,
                 include_dashboard=enable_dashboard,
                 dashboard_host=dashboard_host,
                 dashboard_port=dashboard_port
@@ -243,6 +270,12 @@ class RayInitializer:
                 runtime_env=deepcopy(runtime_env_base)
             )
             raise RuntimeError(f"Ray connection failed: {e}")
+        finally:
+            # Restore original environment to avoid affecting other nodes
+            if original_visible_devices is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = original_visible_devices
+            elif "CUDA_VISIBLE_DEVICES" in os.environ and gpu_indices.strip():
+                 del os.environ["CUDA_VISIBLE_DEVICES"]
 
         ray_nccl_tester(world_size)
         ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
@@ -260,8 +293,8 @@ class RayInitializerAdvanced(RayInitializer):
                     "tooltip": "Address of Ray cluster different than torch distributed address"}),
                 "ray_cluster_namespace": ("STRING", {"default": "default"}),
                 "ray_object_store_gb": ("FLOAT", {
-                    "default": 2.0,
-                    "tooltip": "Ray global object store, default is plenty enough"}),
+                    "default": 0.0,
+                    "tooltip": "Ray shared memory object store size in GB. 0.0 = Auto (Use Ray default ~30% of System RAM). Increase if you see spilling to disk."}),
                 "ray_dashboard_address": ("STRING", {
                     "default": "None",
                     "tooltip": "Same format as torch_dist_address, you need to install ray dashboard to monitor"}),
@@ -289,6 +322,12 @@ class RayInitializerAdvanced(RayInitializer):
                     ],
                     {"default": "TORCH"},
                 ),
+            },
+            "optional": {
+                "gpu_indices": ("STRING", {
+                    "default": "",
+                    "tooltip": "Comma-separated list of GPU indices to use (e.g., '0,1'). Overrides automatic selection."
+                }),
             }
         }
 
@@ -374,12 +413,22 @@ class RayUNETLoader:
             ray.get(loaded_futures)
             loaded_futures = []
         else:
+            # RAM Optimization: Worker 0 loads to Object Store, others read from it (Zero-Copy)
+            worker0 = gpu_actors[0] # Use first available GPU actor
+            sd_ref = worker0.load_unet_to_return.remote(unet_path)
+            
             for actor in gpu_actors:
                 loaded_futures.append(
-                    actor.load_unet.remote(unet_path, model_options=model_options)
+                    actor.load_unet_from_state_dict.remote(sd_ref, model_options=model_options)
                 )
             ray.get(loaded_futures)
             loaded_futures = []
+            
+            # Eagerly free the object store reference to reclaim RAM
+            try:
+                ray.internal.free([sd_ref])
+            except Exception as e:
+                print(f"[Raylight] Optimized RAM free warning: {e}")
 
         for actor in gpu_actors:
             if parallel_dict["is_xdit"]:

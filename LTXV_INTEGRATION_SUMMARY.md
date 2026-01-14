@@ -133,3 +133,38 @@ index 810b1a6..afdc5ca 100644
   - If it encounters a `CompressedTimestep` (detected via `expand` method), it expands it to a full tensor, pads it to world size, and splits (chunks) it according to the rank.
   - Handles `torch.Tensor` objects correctly (checking `is_tensor` before duck-typing `expand`).
 - **Result**: Ensures modulation tensors (`vscale`, `vshift`) correctly match the local token count on each GPU during distributed inference.
+
+## 4. GPU Pinning via `RayInitializer`
+
+- **Feature**: Added `gpu_indices` optional input to `RayInitializer` and `RayInitializerAdvanced`.
+- **Logic**:
+  - Allows user to specify a comma-separated list of GPU indices (e.g., `"0,2"`) to dedicate to the Ray cluster.
+  - Can be used to isolate Raylight to specific GPUs on a multi-GPU node.
+  - Uses `CUDA_VISIBLE_DEVICES` temporarily during `ray.init` to enforce the constraint without permanently affecting the main ComfyUI process.
+
+## 5. RAM Optimization (Zero-Copy Model Loading)
+- **Problem**: Previously, each Ray worker loaded the model checkpoint from disk into its own process memory. With N GPUs, this caused N x ModelSize usage (e.g., 30GB for 2 GPUs for a 15GB model).
+- **Solution**: Implemented a "Load Once, Share Everywhere" strategy using Ray's Plasma Object Store.
+- **Mechanism**:
+  - `RayUNETLoader` instructs **Worker 0** to load the model state dict.
+  - Worker 0 returns the state dict, which Ray automatically puts into the shared memory Object Store on the node.
+  - `RayUNETLoader` receives a reference (`ObjectRef`) to this shared memory object.
+  - It passes this reference to all workers.
+  - All workers (including Worker 0) access the weights via zero-copy reads from the shared store.
+  - **Eager Freeing**: Immediately after usage, the Object Store reference is freed using `ray.internal.free([sd_ref])` to prevent RAM bloat.
+  - **Garbage Collection**: Explicit `gc.collect()` is triggered on workers to minimize transient memory usage.
+- **Impact**: RAM usage for model loading is now ~1x ModelSize regardless of the number of GPUs on the same node.
+
+## 6. Dynamic Object Store Sizing
+- **Feature**: Added `ray_object_store_gb` input to `RayInitializer` with a default of **0.0 (Auto)**.
+- **Adjustment**: 
+    - Setting this to `0.0` allows Ray to automatically manage the object store size (typically 30% of system RAM), preventing "Disk Spilling" errors when loading large models (>15GB) if the store was set too small (previous default was 2.0GB).
+    - Users can still manually override this with a specific GB value if needed.
+
+## 7. Advanced Memory Sharing (Experimental)
+- **Feature**: Implemented `assign=True` patching for `torch.load_state_dict` in Workers.
+- ** Mechanism**:
+    - Uses a custom context manager `patch_torch_load_state_dict` inside `RayWorker`.
+    - Forces `torch` to use `assign=True` when loading the model state dict from the shared memory object.
+    - This instructs PyTorch to initialize the model parameters as *views* of the existing shared memory tensors, rather than creating new copies.
+- **Impact**: Should dramatically reduce Runtime RAM usage essentially allowing N workers to share a single physical copy of the model weights in RAM (approx 1x Model Size total for all workers).
