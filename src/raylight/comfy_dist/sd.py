@@ -158,6 +158,7 @@ def gguf_load_diffusion_model(unet_path, model_options={}, dequant_dtype=None, p
         logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
         raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))
     model = GGUFModelPatcher.clone(model)
+    model.gguf_metadata = extra.get("metadata", {})
     return model
 
 

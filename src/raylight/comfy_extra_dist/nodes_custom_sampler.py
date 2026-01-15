@@ -239,6 +239,9 @@ class XFuserSamplerCustom:
                 "sampler": ("SAMPLER",),
                 "sigmas": ("SIGMAS",),
                 "latent_image": ("LATENT",),
+            },
+            "optional": {
+                "lora": ("RAY_LORA", {"default": None}),
             }
         }
 
@@ -260,11 +263,43 @@ class XFuserSamplerCustom:
         sampler,
         sigmas,
         latent_image,
+        lora=None,
     ):
         gc.collect()
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
+        comfy.model_management.soft_empty_cache()
         gpu_actors = ray_actors["workers"]
+
+        # **** COORDINATOR-LEVEL RELOAD ****
+        # Check which workers need reload and trigger BEFORE dispatching sampling.
+        # This ensures all workers are ready and prevents xDiT collective desync.
+        # IMPORTANT: Serialize reloads to avoid 4x RAM spike (each worker copies ~15GB from Plasma)
+        for actor in gpu_actors:
+            ray.get(actor.reload_model_if_needed.remote())  # Serial: wait for each one
+        
+        # Robustness: Ensure workers have base_ref if provided (Handling Restarts)
+        lora_list_val = None
+        
+        if "base_ref" in ray_actors:
+             ray.get([actor.set_base_ref.remote(ray_actors["base_ref"]) for actor in gpu_actors])
+        
+             # 1. Global Patching Coordination (Shared)
+             worker0 = gpu_actors[0]
+             # lora is list of dicts (INPUT_IS_LIST=False assumed)
+             target_sd_ref = ray.get(worker0.create_patched_ref.remote(lora))
+             
+             # 2. Global Reload
+             reload_futures = []
+             for actor in gpu_actors:
+                 reload_futures.append(actor.load_unet_from_state_dict.remote(target_sd_ref, model_options={}))
+             ray.get(reload_futures)
+             
+        elif lora is not None:
+             # Fallback
+             print("[XFuserSampler] Base Ref missing. Falling back to local patching.")
+             lora_list_val = lora
+        
         futures = [
             actor.custom_sampler.remote(
                 add_noise,
@@ -275,8 +310,9 @@ class XFuserSamplerCustom:
                 sampler,
                 sigmas,
                 latent_image,
+                lora_list=lora_list_val,
             )
-            for actor in gpu_actors
+            for i, actor in enumerate(gpu_actors)
         ]
         results = ray.get(futures)
         out = results[0]
@@ -306,6 +342,9 @@ class DPSamplerCustom:
                 "sampler": ("SAMPLER",),
                 "sigmas": ("SIGMAS",),
                 "latent_image": ("LATENT",),
+            },
+            "optional": {
+                "lora": ("RAY_LORA", {"default": None}),
             }
         }
 
@@ -327,6 +366,7 @@ class DPSamplerCustom:
         sampler,
         sigmas,
         latent_image,
+        lora=None,
     ):
         ray_actors = ray_actors[0]
         add_noise = add_noise[0]
@@ -336,11 +376,44 @@ class DPSamplerCustom:
         sampler = sampler[0]
         sigmas = sigmas[0]
         latent_image = latent_image[0]
+        
+        # LoRA Handling
+        current_lora = None
+        if lora is not None:
+             current_lora = lora[0]
 
         gc.collect()
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
         gpu_actors = ray_actors["workers"]
+
+        # **** COORDINATOR-LEVEL RELOAD ****
+        # Check which workers need reload and trigger BEFORE dispatching sampling.
+        # This ensures all workers are ready and prevents xDiT collective desync.
+        # IMPORTANT: Serialize reloads to avoid 4x RAM spike (each worker copies ~15GB from Plasma)
+        for actor in gpu_actors:
+            ray.get(actor.reload_model_if_needed.remote())  # Serial: wait for each one
+        
+        # Robustness: Ensure workers have base_ref if provided
+        lora_list_val = None
+        
+        if "base_ref" in ray_actors:
+             ray.get([actor.set_base_ref.remote(ray_actors["base_ref"]) for actor in gpu_actors])
+        
+             # 1. Global Patching Coordination
+             worker0 = gpu_actors[0]
+             target_sd_ref = ray.get(worker0.create_patched_ref.remote(current_lora))
+             
+             # 2. Global Reload
+             reload_futures = []
+             for actor in gpu_actors:
+                 reload_futures.append(actor.load_unet_from_state_dict.remote(target_sd_ref, model_options={}))
+             ray.get(reload_futures)
+        
+        elif current_lora is not None:
+             # Fallback
+             print("[DPSampler] Base Ref missing. Falling back to local patching.")
+             lora_list_val = current_lora
 
         futures = [
             actor.custom_sampler.remote(
@@ -352,6 +425,7 @@ class DPSamplerCustom:
                 sampler,
                 sigmas,
                 latent_image,
+                lora_list=lora_list_val,
             )
             for i, actor in enumerate(gpu_actors)
         ]

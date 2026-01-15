@@ -74,6 +74,8 @@ def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir:
     env_vars = {
         'PYTHONPATH': python_path,
         'COMFYUI_BASE_DIRECTORY': str(repo_root),
+        'RAY_enable_metrics_collection': '0',
+        'RAY_USAGE_STATS_ENABLED': '0',
     }
 
     return {
@@ -97,6 +99,8 @@ def _build_remote_runtime_env(module_dir: Path, repo_root: Path):
         'working_dir': str(repo_root),
         'env_vars': {
             'COMFYUI_BASE_DIRECTORY': '.',
+            'RAY_enable_metrics_collection': '0',
+            'RAY_USAGE_STATS_ENABLED': '0',
         },
         'excludes': excludes,
     }
@@ -280,6 +284,14 @@ class RayInitializer:
         ray_nccl_tester(world_size)
         ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
         ray_actors = ray_actor_fn()
+        
+        # Store GPU indices for later use in samplers (for partial offload matching)
+        if gpu_indices.strip():
+            ray_actors["gpu_indices"] = [int(x.strip()) for x in gpu_indices.split(",") if x.strip()]
+        else:
+            # Default: 0, 1, 2, ...
+            ray_actors["gpu_indices"] = list(range(world_size))
+        
         return ([ray_actors, ray_actor_fn],)
 
 
@@ -413,22 +425,14 @@ class RayUNETLoader:
             ray.get(loaded_futures)
             loaded_futures = []
         else:
-            # RAM Optimization: Worker 0 loads to Object Store, others read from it (Zero-Copy)
-            worker0 = gpu_actors[0] # Use first available GPU actor
-            sd_ref = worker0.load_unet_to_return.remote(unet_path)
-            
+            # Parallel Loading Mode: Trigger load_unet on all workers.
+            # RayWorker is responsible for "Lightweight Ref" logic if needed to save RAM.
             for actor in gpu_actors:
                 loaded_futures.append(
-                    actor.load_unet_from_state_dict.remote(sd_ref, model_options=model_options)
+                    actor.load_unet.remote(unet_path, model_options=model_options)
                 )
             ray.get(loaded_futures)
             loaded_futures = []
-            
-            # Eagerly free the object store reference to reclaim RAM
-            try:
-                ray.internal.free([sd_ref])
-            except Exception as e:
-                print(f"[Raylight] Optimized RAM free warning: {e}")
 
         for actor in gpu_actors:
             if parallel_dict["is_xdit"]:
@@ -532,6 +536,7 @@ class XFuserKSamplerAdvanced:
             },
             "optional": {
                 "sigmas": ("SIGMAS",),
+                "lora": ("RAY_LORA", {"default": None}),
             }
         }
 
@@ -557,6 +562,7 @@ class XFuserKSamplerAdvanced:
         return_with_leftover_noise,
         denoise=1.0,
         sigmas=None,
+        lora=None,
     ):
         # Clean VRAM for preparation to load model
         gc.collect()
@@ -570,6 +576,41 @@ class XFuserKSamplerAdvanced:
             disable_noise = True
 
         gpu_actors = ray_actors["workers"]
+
+        # **** COORDINATOR-LEVEL RELOAD ****
+        # Check which workers need reload and trigger BEFORE dispatching sampling.
+        # This ensures all workers are ready before any collective operations begin.
+        # IMPORTANT: Serialize reloads to avoid 4x RAM spike (each worker copies ~15GB from Plasma)
+        for actor in gpu_actors:
+            ray.get(actor.reload_model_if_needed.remote())  # Serial: wait for each one
+        
+        # Robustness: Ensure workers have base_ref if provided
+        lora_list_val = None
+        
+        if "base_ref" in ray_actors:
+             ray.get([actor.set_base_ref.remote(ray_actors["base_ref"]) for actor in gpu_actors])
+             
+             # --------------------------------------------------------
+             # Shared Object Storage Patching (Preferred)
+             # --------------------------------------------------------
+             worker0 = gpu_actors[0]
+             
+             # lora is already the list of dicts from RayLoRALoader
+             target_sd_ref = ray.get(worker0.create_patched_ref.remote(lora))
+             
+             reload_futures = []
+             for actor in gpu_actors:
+                 reload_futures.append(actor.load_unet_from_state_dict.remote(target_sd_ref, model_options={}))
+             ray.get(reload_futures)
+             # lora_list_val remains None (workers are already patched)
+             
+        elif lora is not None:
+             # --------------------------------------------------------
+             # Fallback: Local Patching (No Base Ref / FSDP)
+             # --------------------------------------------------------
+             # Pass the LoRA list to workers to apply locally
+             lora_list_val = lora
+
         futures = [
             actor.common_ksampler.remote(
                 noise_seed,
@@ -585,7 +626,8 @@ class XFuserKSamplerAdvanced:
                 start_step=start_at_step,
                 last_step=end_at_step,
                 force_full_denoise=force_full_denoise,
-                sigmas=sigmas
+                sigmas=sigmas,
+                lora_list=lora_list_val,
             )
             for actor in gpu_actors
         ]
@@ -624,6 +666,9 @@ class DPKSamplerAdvanced:
                 "start_at_step": ("INT", {"default": 0, "min": 0, "max": 10000}),
                 "end_at_step": ("INT", {"default": 10000, "min": 0, "max": 10000}),
                 "return_with_leftover_noise": (["disable", "enable"],),
+            },
+            "optional": {
+                "lora": ("RAY_LORA", {"default": None}),
             }
         }
 
@@ -650,6 +695,7 @@ class DPKSamplerAdvanced:
         end_at_step,
         return_with_leftover_noise,
         denoise=1.0,
+        lora=None,
     ):
 
         ray_actors = ray_actors[0]
@@ -663,8 +709,19 @@ class DPKSamplerAdvanced:
         start_at_step = start_at_step[0]
         end_at_step = end_at_step[0]
         return_with_leftover_noise = return_with_leftover_noise[0]
+        current_lora = None
+        if lora is not None:
+             current_lora = lora[0]
 
         gpu_actors = ray_actors["workers"]
+
+        # **** COORDINATOR-LEVEL RELOAD ****
+        # Check which workers need reload and trigger BEFORE dispatching sampling.
+        # This ensures all workers are ready before any collective operations begin.
+        # IMPORTANT: Serialize reloads to avoid 4x RAM spike (each worker copies ~15GB from Plasma)
+        for actor in gpu_actors:
+            ray.get(actor.reload_model_if_needed.remote())  # Serial: wait for each one
+
         parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
         if parallel_dict["is_xdit"] is True:
             raise ValueError(
@@ -689,6 +746,34 @@ class DPKSamplerAdvanced:
         if add_noise == "disable":
             disable_noise = True
 
+        # Robustness: Ensure workers have base_ref if provided
+        lora_list_val = None
+        
+        if "base_ref" in ray_actors:
+             ray.get([actor.set_base_ref.remote(ray_actors["base_ref"]) for actor in gpu_actors])
+        
+             # --------------------------------------------------------
+             # Shared Object Storage Patching (Preferred)
+             # --------------------------------------------------------
+             worker0 = gpu_actors[0]
+             
+             target_sd_ref = ray.get(worker0.create_patched_ref.remote(current_lora))
+    
+             reload_futures = []
+             for actor in gpu_actors:
+                 reload_futures.append(actor.load_unet_from_state_dict.remote(target_sd_ref, model_options={}))
+             ray.get(reload_futures)
+             # lora_list_val remains None
+             
+        elif current_lora is not None:
+             # --------------------------------------------------------
+             # Fallback: Local Patching
+             # --------------------------------------------------------
+             print("[DPKSampler] Base Ref missing. Falling back to local/legacy patching.")
+             lora_list_val = current_lora
+
+        # --------------------------------------------------------
+
         futures = [
             actor.common_ksampler.remote(
                 noise_list[i],
@@ -704,6 +789,7 @@ class DPKSamplerAdvanced:
                 start_step=start_at_step,
                 last_step=end_at_step,
                 force_full_denoise=force_full_denoise,
+                lora_list=lora_list_val,
             )
             for i, actor in enumerate(gpu_actors)
         ]
@@ -818,6 +904,38 @@ class RayVAEDecodeDistributed:
         return (image[0],)
 
 
+class RayOffloadModel:
+    """
+    Offloads the diffusion model from all Ray workers' VRAM.
+    Place this node after the sampler to free GPU memory.
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+            },
+            "optional": {
+                "latent": ("LATENT", {"default": None, "tooltip": "Passthrough for workflow chaining"}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "offload"
+    CATEGORY = "Raylight"
+
+    def offload(self, ray_actors, latent=None):
+        gpu_actors = ray_actors["workers"]
+        
+        # Offload from all workers
+        offload_futures = [actor.offload_and_clear.remote() for actor in gpu_actors]
+        ray.get(offload_futures)
+        
+        print("[RayOffloadModel] All workers offloaded.")
+        return (latent,)
+
+
 NODE_CLASS_MAPPINGS = {
     "XFuserKSamplerAdvanced": XFuserKSamplerAdvanced,
     "DPKSamplerAdvanced": DPKSamplerAdvanced,
@@ -826,7 +944,8 @@ NODE_CLASS_MAPPINGS = {
     "RayInitializer": RayInitializer,
     "RayInitializerAdvanced": RayInitializerAdvanced,
     "DPNoiseList": DPNoiseList,
-    "RayVAEDecodeDistributed": RayVAEDecodeDistributed
+    "RayVAEDecodeDistributed": RayVAEDecodeDistributed,
+    "RayOffloadModel": RayOffloadModel,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -837,5 +956,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayInitializer": "Ray Init Actor",
     "RayInitializerAdvanced": "Ray Init Actor (Advanced)",
     "DPNoiseList": "Data Parallel Noise List",
-    "RayVAEDecodeDistributed": "Distributed VAE (Ray)"
+    "RayVAEDecodeDistributed": "Distributed VAE (Ray)",
+    "RayOffloadModel": "Offload Model (Ray)",
 }
