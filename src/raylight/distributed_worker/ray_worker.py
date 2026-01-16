@@ -207,6 +207,55 @@ class RayWorker:
     def get_is_model_loaded(self):
         return self.is_model_loaded
 
+    def _handle_gguf_cache(self):
+        """Create /dev/shm cache of CUDA weights before nuking VRAM."""
+        import hashlib
+        import ray
+        import torch
+
+        # Unique ID per Node + Model (prevents cross-node /dev/shm collisions)
+        node_id = ray.get_runtime_context().get_node_id()[:8]
+        model_hash = hashlib.md5(self.current_unet_path.encode()).hexdigest()[:8] if self.current_unet_path else "unknown"
+        cache_path = f"/dev/shm/raylight_{node_id}_{model_hash}.pt"
+
+        if self.local_rank == 0 and not os.path.exists(cache_path):
+            print(f"[RayWorker 0] Locking VRAM state to SHM...")
+            state_dict = {}
+            param_count = 0
+            buf_count = 0
+            # Use .detach().clone().cpu() to break links to VRAM and create clean copies
+            for name, param in self.model.model.named_parameters():
+                if param.device.type == "cuda":
+                    state_dict[name] = param.detach().clone().cpu()
+                    param_count += 1
+            
+            for name, buf in self.model.model.named_buffers():
+                if buf.device.type == "cuda":
+                    state_dict[f"buf_{name}"] = buf.detach().clone().cpu()
+                    buf_count += 1
+
+            torch.save(state_dict, cache_path)
+            cache_size_mb = os.path.getsize(cache_path) / 1024**2
+            print(f"[RayWorker 0] Cache created: {cache_path} ({cache_size_mb:.1f} MB)")
+            print(f"[RayWorker 0] Cache contains: {param_count} params + {buf_count} buffers = {len(state_dict)} total")
+            del state_dict
+            import gc
+            gc.collect()
+        elif self.local_rank != 0:
+            print(f"[RayWorker {self.local_rank}] Waiting for cache from Worker 0...")
+        else:
+            print(f"[RayWorker 0] Cache already exists: {cache_path}")
+        
+        # CRITICAL: Barrier to ensure Worker 0 finishes cache before others proceed
+        # Workers 1-3 must wait for cache file to be fully written
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.barrier()
+            print(f"[RayWorker {self.local_rank}] Cache sync barrier passed")
+        
+        # All workers need the cache path for restore
+        self.model.cache_path = cache_path
+
     def offload_and_clear(self):
         """
         Offloads the model from VRAM and clears tracking state.
@@ -218,25 +267,29 @@ class RayWorker:
             if getattr(self, "is_gguf", False):
                 print(f"[RayWorker {self.local_rank}] GGUF Soft-Offload: Releasing VRAM but retaining System RAM mmap...")
                 
-                # Unpatch to remove VRAM copies (weights moved to GPU)
+                # === CREATE /dev/shm CACHE BEFORE UNPATCH (weights still on GPU!) ===
+                self._handle_gguf_cache()
+                
+                # NOW unpatch to remove VRAM copies
                 if hasattr(self.model, "unpatch_model"):
-                    # device_to=offload_device usually ensures we go back to CPU
                     self.model.unpatch_model(device_to=self.model.offload_device, unpatch_weights=False)
                     self.model.current_device = torch.device("cpu")
                 
-                # FAILSAFE: Manually strip any remaining GPU tensors from the model
-                # unpatch_model might miss internal buffers or non-parameter tensors
+                # FAILSAFE: Manually strip ALL GPU tensors from the model to free VRAM
+                # The cache should have been created with all params we need
                 try:
                     print(f"[RayWorker {self.local_rank}] GGUF Soft-Offload: Failsafe GPU strip...")
-                    for param in self.model.model.parameters():
+                    
+                    nuked = 0
+                    for name, param in self.model.model.named_parameters():
                         if param.device.type == "cuda":
-                            # Replace with tiny CPU tensor to free VRAM without RAM bloat
-                            # to("meta") fails due to type mismatch. to("cpu") copies data.
-                            # resetting to empty CPU tensor is the robust solution.
                             param.data = torch.empty(0, dtype=param.dtype, device="cpu")
-                    for buf in self.model.model.buffers():
+                            nuked += 1
+                    for name, buf in self.model.model.named_buffers():
                          if buf.device.type == "cuda":
                             buf.data = torch.empty(0, dtype=buf.dtype, device="cpu")
+                            nuked += 1
+                    print(f"[RayWorker {self.local_rank}] Nuked {nuked} CUDA tensors")
                 except Exception as e:
                     print(f"[RayWorker {self.local_rank}] Warning during GPU strip: {e}")
 
@@ -804,6 +857,8 @@ class RayWorker:
             print("[RayWorker] GGUF Soft-Reload: Triggering Self-Heal via model.load()...")
             # Directly call the patcher's load method to trigger Self-Heal
             self.model.load(self.device, force_patch_weights=True)
+            # Update current_device to prevent repeated reload detection
+            self.model.current_device = self.model.load_device
             print("[RayWorker] GGUF Soft-Reload: Complete.")
             return
         

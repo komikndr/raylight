@@ -1,4 +1,5 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
+import os
 import torch
 import logging
 import collections
@@ -127,16 +128,27 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
              self.current_device = device_to
              # Manually move non-quantized weights to offload device.
              # We skip quantized (GGML) weights to avoid breaking mmap.
+             from raylight.expansion.comfyui_gguf.ops import GGMLTensor
              for module in self.model.modules():
                  for name, buf in module.named_buffers(recurse=False):
-                     if buf is not None and not is_quantized(buf):
-                         module._buffers[name] = buf.to(device_to)
+                     if buf is not None and not is_quantized(buf) and not isinstance(buf, GGMLTensor):
+                         # Skip if already on target device (avoids mmap move issues)
+                         if buf.device != device_to:
+                             try:
+                                 module._buffers[name] = buf.to(device_to)
+                             except Exception:
+                                 pass  # Skip if device move fails (e.g., mmap tensor)
                  
                  for name, param in module.named_parameters(recurse=False):
-                     if param is not None and not is_quantized(param):
-                         param.data = param.data.to(device_to)
-                         if param._grad is not None:
-                             param._grad.data = param._grad.data.to(device_to)
+                     if param is not None and not is_quantized(param) and not isinstance(param.data, GGMLTensor):
+                         # Skip if already on target device (avoids mmap move issues)
+                         if param.device != device_to:
+                             try:
+                                 param.data = param.data.to(device_to)
+                                 if param._grad is not None:
+                                     param._grad.data = param._grad.data.to(device_to)
+                             except Exception:
+                                 pass  # Skip if device move fails
 
     def pin_weight_to_device(self, key):
         op_key = key.rsplit('.', 1)[0]
@@ -153,165 +165,78 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         if self.release_mmap and not self.mmap_released:
             self.named_modules_to_munmap = dict(self.model.named_modules())
 
-        # SELF-HEAL: Recover from 0-byte nuclear offload.
-        # If we previously nuked weights to save VRAM, restore them from backup now.
-        if self.backup:
-            restored_count = 0
-            restored_bytes = 0
-            objectref_count = 0
-            
-            for name, saved_dim in self.backup.items():
-                try:
-                    curr_weight = comfy.utils.get_attr(self.model, name)
-                    # Check if nuked (0-elements)
-                    if curr_weight.numel() == 0:
-                        # Restore the mmap tensor or Shared ObjectRef from backup
-                        backup_data = saved_dim.weight
-                        
-                        # Resolve Ray ObjectRef if present (for modified/shape-changed weights)
-                        if isinstance(backup_data, ray.ObjectRef):
-                            backup_data = ray.get(backup_data)
-                            objectref_count += 1
-
-                        # usage of set_attr_param ensures we replace the nuked (0-byte) tensor
-                        comfy.utils.set_attr_param(self.model, name, backup_data)
-                        restored_count += 1
-                        # Estimate size
-                        if hasattr(backup_data, "numel"):
-                            restored_bytes += backup_data.numel() * backup_data.element_size()
-                        
-                        # Release ref immediately to help GC
-                        del backup_data
-                except Exception as e:
-                    pass
-            
-            if restored_count > 0:
-                print(f"[GGUFModelPatcher] HOT LOAD (Self-Heal): Restored {restored_count} weights ({restored_bytes / 1024**2:.2f} MB) from backup. ObjectRefs resolved: {objectref_count}")
-            
-            # Force cleanup to release heap before super().load() moves to GPU
-            import gc
-            gc.collect()
-
-        # Phase 1: Pre-Load Backup (Quantized/Mmap Weights)
-        # We backup GGUF tensors HERE to preserve the mmap reference (approx 0 RAM).
-        # If we wait until post-load, they become dense GPU tensors (High RAM to backup).
-        mmap_backup_count = 0
-        mmap_backup_bytes = 0
-        for name, param in self.model.named_parameters():
-             if is_quantized(param):
-                 self.backup[name] = collections.namedtuple('Dimension', ['weight', 'inplace_update', 'shape'])(
-                    param.data, False, param.shape  # Store GGMLTensor dict/ref + shape
-                 )
-                 mmap_backup_count += 1
-                 # Estimate size (though it's mmap)
-                 mmap_backup_bytes += param.numel() * param.element_size()
+        # SELF-HEAL: Load from /dev/shm cache if available (zero-copy via mmap)
+        # Only run if we have 0-byte nuked weights that need restoration
+        cache_path = getattr(self, 'cache_path', None)
+        needs_heal = False
+        if cache_path:
+            # Quick check: do we have any 0-byte weights?
+            for name, param in self.model.named_parameters():
+                if param.numel() == 0:
+                    needs_heal = True
+                    break
         
-        if mmap_backup_count > 0:
-             print(f"[GGUFModelPatcher] Pre-Load: Preserved {mmap_backup_count} Quantized Mmap weights ({mmap_backup_bytes / 1024**2:.2f} MB).")
+        if needs_heal and os.path.exists(cache_path):
+            import torch
+            state_dict = torch.load(cache_path, mmap=True, weights_only=False)
+            restored = 0
+            skipped = 0
+            moved_to_gpu = 0
+            target_device = self.load_device
+            for name, tensor in state_dict.items():
+                try:
+                    # Handle buffer vs parameter naming (buf_ prefix from cache)
+                    if name.startswith("buf_"):
+                        actual_name = name[4:]  # Remove "buf_" prefix
+                        curr = comfy.utils.get_attr(self.model, actual_name)
+                    else:
+                        curr = comfy.utils.get_attr(self.model, name)
+                    
+                    if curr.numel() == 0:  # Only restore nuked weights
+                        # Move tensor to model's load device (GPU) before assigning
+                        # Cache stores CPU copies, but ComfyUI expects GPU tensors
+                        restored_tensor = tensor.to(target_device)
+                        
+                        # Directly assign data
+                        if hasattr(curr, 'data'):
+                            curr.data = restored_tensor
+                        else:
+                            # Fallback for non-parameter attributes
+                            if name.startswith("buf_"):
+                                comfy.utils.set_attr(self.model, name[4:], restored_tensor)
+                            else:
+                                comfy.utils.set_attr_param(self.model, name, restored_tensor)
+                        restored += 1
+                    else:
+                        skipped += 1
+                        # These weights weren't nuked (on CPU), but need to be on GPU for inference
+                        if curr.device.type != 'cuda' and target_device.type == 'cuda':
+                            if hasattr(curr, 'data'):
+                                curr.data = curr.data.to(target_device)
+                            moved_to_gpu += 1
+                        # Debug: log what's being skipped
+                        if skipped <= 5:
+                            print(f"[GGUFModelPatcher] DEBUG: Skipped '{name}' (numel={curr.numel()}, device={curr.device})")
+                except Exception as e:
+                    print(f"[GGUFModelPatcher] DEBUG: Failed to restore '{name}': {e}")
+            print(f"[GGUFModelPatcher] HOT LOAD: Restored {restored} weights, skipped {skipped} (moved {moved_to_gpu} to GPU), cache has {len(state_dict)} keys")
+            del state_dict
+            
+            # CRITICAL: Sync CUDA after restore to catch async errors early
+            torch.cuda.synchronize()
+            print(f"[GGUFModelPatcher] CUDA sync after restore - OK")
 
         # always call `patch_weight_to_device` even for lowvram
         super().load(*args, force_patch_weights=True, **kwargs)
 
-        # Phase 2: Post-Load Backup (Standard/Modified Weights)
-        # Skip if already completed for this model instance (avoids redundant work on sequential samplers)
-        if getattr(self, '_phase2_complete', False):
-            return
-        
-        # We backup standard weights HERE to capture their FINAL shape/value.
-        # We ALSO check if any Pre-Load (Mmap) weights were modified (shape change). If so, we upgrade them to RAM.
-        # CRITICAL: We use a Shared Ray Registry to deduplicate these upgrades!
-        # This allows upgrading Massive weights (15GB) without OOMing (15GB vs 60GB).
-        from raylight.distributed_worker.backup_registry import BackupRegistry
-        try:
-            registry = BackupRegistry.options(name="GGUFBackupRegistry", get_if_exists=True, lifetime="detached").remote()
-        except:
-            # Fallback if creation fails (rare), though options should handle it.
-            # Or assume it was created by RayGGUFLoader/Worker0.
-            registry = BackupRegistry.options(name="GGUFBackupRegistry", create_if_missing=True, lifetime="detached").remote()
-
-        ram_backup_count = 0
-        ram_backup_bytes = 0
-        mismatch_log_count = 0
-        
-        for name, param in self.model.named_parameters():
-             should_backup = False
-             
-             if name not in self.backup:
-                 should_backup = True
-             else:
-                 # Check for Shape Mismatch - Use stored shape metadata (no ray.get needed!)
-                 backup_entry = self.backup[name]
-                 if hasattr(backup_entry, 'shape') and backup_entry.shape is not None:
-                     saved_shape = backup_entry.shape
-                 else:
-                     # Fallback for old-style backup without shape (shouldn't happen)
-                     backup_weight = backup_entry.weight
-                     if isinstance(backup_weight, ray.ObjectRef):
-                         temp_tensor = ray.get(backup_weight)
-                         saved_shape = temp_tensor.shape
-                         del temp_tensor
-                     else:
-                         saved_shape = backup_weight.shape
-                 
-                 curr_shape = param.shape
-                 if saved_shape != curr_shape:
-                     if mismatch_log_count < 5:
-                         print(f"[GGUFModelPatcher] Backup/Runtime shape mismatch for {name}: {saved_shape} vs {curr_shape}. Upgrading to Shared RAM.")
-                         mismatch_log_count += 1
-                     should_backup = True
-             
-             if should_backup:
-                 # 1. Capture Tensor (CPU)
-                 tensor = param.detach().cpu()
-                 tensor_shape = tensor.shape  # Cache shape before potential modifications
-                 
-                 # 2. Store in Plasma (Shared)
-                 ref = ray.put(tensor)
-                 del tensor  # Immediately release local copy
-                 
-                 # 3. Deduplicate via Registry (First Writer Wins)
-                 key = f"GGUF_{name}" # Assumes single model usage per cluster for now
-                 # Wrap ref in list to prevent Ray from resolving it (deser) on the actor side
-                 final_ref_container = ray.get(registry.put_if_missing.remote(key, [ref]))
-                 final_ref = final_ref_container[0]
-                 
-                 self.backup[name] = collections.namedtuple('Dimension', ['weight', 'inplace_update', 'shape'])(
-                    final_ref, False, tensor_shape  # Store shape for fast lookup!
-                 )
-                 
-                 ram_backup_count += 1
-                 ram_backup_bytes += tensor_shape.numel() * param.element_size()
-        
-        for name, buf in self.model.named_buffers():
-             if name not in self.backup:
-                 # Buffers are usually small, but let's share them too for consistency
-                 tensor = buf.detach().cpu()
-                 tensor_shape = tensor.shape
-                 ref = ray.put(tensor)
-                 del tensor
-                 key = f"GGUF_BUFFER_{name}"
-                 final_ref_container = ray.get(registry.put_if_missing.remote(key, [ref]))
-                 final_ref = final_ref_container[0]
-                 
-                 self.backup[name] = collections.namedtuple('Dimension', ['weight', 'inplace_update', 'shape'])(
-                    final_ref, False, tensor_shape
-                 )
-                 ram_backup_count += 1
-                 ram_backup_bytes += tensor_shape.numel() * buf.element_size()
-
-        if ram_backup_count > 0:
-            print(f"[GGUFModelPatcher] Post-Load: Backed up {ram_backup_count} Standard/Modified weights to Shared RAM ({ram_backup_bytes / 1024**2:.2f} MB).")
-
-        # Verification: Ensure Backup covers complete model
-        total_params = sum(1 for _ in self.model.named_parameters()) + sum(1 for _ in self.model.named_buffers())
-        if len(self.backup) != total_params:
-            print(f"[GGUFModelPatcher] WARNING: Backup count ({len(self.backup)}) != Model params/buffers ({total_params}). Some weights might be unbacked!")
-        else:
-            # Verified
-            pass
-        
-        # Mark Phase 2 as complete to skip on subsequent samplers
-        self._phase2_complete = True
+        # Evict original GGUF mmap after first successful load to free page cache
+        if not getattr(self, '_gguf_mmap_evicted', False):
+            import gc
+            # Clear backup dict - we'll use /dev/shm cache instead
+            self.backup.clear()
+            gc.collect()
+            self._gguf_mmap_evicted = True
+            print("[GGUFModelPatcher] Evicted original GGUF mmap references")
 
         # make sure nothing stays linked to mmap after first load
         if self.release_mmap and not self.mmap_released:
