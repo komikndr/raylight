@@ -76,12 +76,14 @@ def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir:
         'COMFYUI_BASE_DIRECTORY': str(repo_root),
         'RAY_enable_metrics_collection': '0',
         'RAY_USAGE_STATS_ENABLED': '0',
+        'RAY_METRICS_EXPORT_INTERVAL_MS': '0',  # Fully disable metrics export
     }
 
     return {
         'py_modules': [str(module_dir)],
         'working_dir': str(runtime_workdir),
         'env_vars': env_vars,
+        'config': {'eager_install': False},  # Defer module install until actors spawn
     }
 
 
@@ -101,8 +103,10 @@ def _build_remote_runtime_env(module_dir: Path, repo_root: Path):
             'COMFYUI_BASE_DIRECTORY': '.',
             'RAY_enable_metrics_collection': '0',
             'RAY_USAGE_STATS_ENABLED': '0',
+            'RAY_METRICS_EXPORT_INTERVAL_MS': '0',  # Fully disable metrics export
         },
         'excludes': excludes,
+        'config': {'eager_install': False},  # Defer module install until actors spawn
     }
 
 
@@ -143,6 +147,10 @@ class RayInitializer:
                     "default": "",
                     "tooltip": "Comma-separated list of GPU indices to use (e.g., '0,1'). Overrides automatic selection."
                 }),
+                "skip_comm_test": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early."
+                }),
             }
         }
 
@@ -168,6 +176,7 @@ class RayInitializer:
         ray_dashboard_address: str = "None",
         torch_dist_address: str = "None",
         gpu_indices: str = "",
+        skip_comm_test: bool = True,
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
@@ -257,31 +266,64 @@ class RayInitializer:
                 os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(indices)
                 print(f"[Raylight] Pinning Ray Cluster to GPUs: {os.environ['CUDA_VISIBLE_DEVICES']}")
 
-            # Shut down so if comfy user try another workflow it will not cause error
-            ray.shutdown()
-            ray.init(
-                ray_cluster_address,
-                namespace=ray_cluster_namespace,
-                runtime_env=deepcopy(runtime_env_base),
-                object_store_memory=ray_object_store_memory,
-                include_dashboard=enable_dashboard,
-                dashboard_host=dashboard_host,
-                dashboard_port=dashboard_port
-            )
+            # ===== OPTIMIZATION: Cluster Reuse =====
+            # Check if Ray is already initialized with matching config to skip expensive re-init
+            is_local = ray_cluster_address in _LOCAL_CLUSTER_ADDRESSES
+            should_reuse = False
+            
+            if ray.is_initialized():
+                try:
+                    # Check if the cluster has matching GPU count
+                    existing_resources = ray.cluster_resources()
+                    existing_gpus = int(existing_resources.get('GPU', 0))
+                    if existing_gpus >= world_size:
+                        print(f"[Raylight] Reusing existing Ray cluster (GPUs available: {existing_gpus})")
+                        should_reuse = True
+                except Exception:
+                    pass
+            
+            if not should_reuse:
+                # Shut down so if comfy user try another workflow it will not cause error
+                ray.shutdown()
+                
+                # Build init kwargs - disable metrics agent for faster startup
+                init_kwargs = {
+                    'namespace': ray_cluster_namespace,
+                    'runtime_env': deepcopy(runtime_env_base),
+                    'include_dashboard': enable_dashboard,
+                    'dashboard_host': dashboard_host,
+                    'dashboard_port': dashboard_port,
+                    '_metrics_export_port': None,  # Disable metrics agent to avoid connection retries
+                }
+                
+                # Only set object_store_memory if explicitly configured (not for reused clusters)
+                if ray_object_store_memory is not None:
+                    init_kwargs['object_store_memory'] = ray_object_store_memory
+                
+                ray.init(ray_cluster_address, **init_kwargs)
+                print(f"[Raylight] Ray cluster initialized (new instance)")
+            
         except Exception as e:
             ray.shutdown()
             ray.init(
-                runtime_env=deepcopy(runtime_env_base)
+                runtime_env=deepcopy(runtime_env_base),
+                _metrics_export_port=None,
             )
             raise RuntimeError(f"Ray connection failed: {e}")
-        finally:
-            # Restore original environment to avoid affecting other nodes
-            if original_visible_devices is not None:
-                os.environ["CUDA_VISIBLE_DEVICES"] = original_visible_devices
-            elif "CUDA_VISIBLE_DEVICES" in os.environ and gpu_indices.strip():
-                 del os.environ["CUDA_VISIBLE_DEVICES"]
+        # Restore original environment to avoid affecting other nodes
+        if original_visible_devices is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = original_visible_devices
+        elif "CUDA_VISIBLE_DEVICES" in os.environ and gpu_indices.strip():
+             del os.environ["CUDA_VISIBLE_DEVICES"]
 
-        ray_nccl_tester(world_size)
+        # ===== OPTIMIZATION: Skip NCCL Test =====
+        # NCCL test spawns/kills separate actors before real workers - saves ~10-15s
+        if not skip_comm_test:
+            print("[Raylight] Running NCCL communication test...")
+            ray_nccl_tester(world_size)
+        else:
+            print("[Raylight] Skipping NCCL test (skip_comm_test=True)")
+        
         ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
         ray_actors = ray_actor_fn()
         
@@ -339,6 +381,10 @@ class RayInitializerAdvanced(RayInitializer):
                 "gpu_indices": ("STRING", {
                     "default": "",
                     "tooltip": "Comma-separated list of GPU indices to use (e.g., '0,1'). Overrides automatic selection."
+                }),
+                "skip_comm_test": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early."
                 }),
             }
         }

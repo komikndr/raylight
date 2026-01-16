@@ -219,28 +219,49 @@ class RayWorker:
         cache_path = f"/dev/shm/raylight_{node_id}_{model_hash}.pt"
 
         if self.local_rank == 0 and not os.path.exists(cache_path):
-            print(f"[RayWorker 0] Locking VRAM state to SHM...")
+            print(f"[RayWorker 0] Streaming VRAM state to SHM...")
+            
+            # Stream tensors one at a time to avoid building full state_dict in memory
+            # This prevents the ~16GB RAM spike during cache creation
             state_dict = {}
             param_count = 0
             buf_count = 0
-            # Use .detach().clone().cpu() to break links to VRAM and create clean copies
+            
             for name, param in self.model.model.named_parameters():
                 if param.device.type == "cuda":
-                    state_dict[name] = param.detach().clone().cpu()
+                    # Copy directly to CPU one tensor at a time
+                    state_dict[name] = param.detach().cpu()
                     param_count += 1
-            
+                    
             for name, buf in self.model.model.named_buffers():
                 if buf.device.type == "cuda":
-                    state_dict[f"buf_{name}"] = buf.detach().clone().cpu()
+                    state_dict[f"buf_{name}"] = buf.detach().cpu()
                     buf_count += 1
-
+            
+            # Save all at once - the CPU copies are now in state_dict
             torch.save(state_dict, cache_path)
             cache_size_mb = os.path.getsize(cache_path) / 1024**2
             print(f"[RayWorker 0] Cache created: {cache_path} ({cache_size_mb:.1f} MB)")
-            print(f"[RayWorker 0] Cache contains: {param_count} params + {buf_count} buffers = {len(state_dict)} total")
+            print(f"[RayWorker 0] Cache contains: {param_count} params + {buf_count} buffers")
+            
+            # CRITICAL: Release state_dict and force GC before eviction
             del state_dict
             import gc
             gc.collect()
+            gc.collect()  # Double collect to handle reference cycles
+            
+            # Evict original GGUF file from page cache - we'll use /dev/shm cache instead
+            if self.current_unet_path:
+                try:
+                    fd = os.open(self.current_unet_path, os.O_RDONLY)
+                    file_size = os.path.getsize(self.current_unet_path)
+                    # POSIX_FADV_DONTNEED = 4 - tells kernel to evict pages from cache
+                    os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_DONTNEED)
+                    os.close(fd)
+                    print(f"[RayWorker 0] Evicted original GGUF from page cache ({file_size / 1024**3:.1f} GB)")
+                except (OSError, AttributeError) as e:
+                    # posix_fadvise not available on all platforms (e.g., macOS)
+                    print(f"[RayWorker 0] Note: Could not evict GGUF from page cache (platform may not support it)")
         elif self.local_rank != 0:
             print(f"[RayWorker {self.local_rank}] Waiting for cache from Worker 0...")
         else:

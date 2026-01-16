@@ -225,6 +225,10 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             # CRITICAL: Sync CUDA after restore to catch async errors early
             torch.cuda.synchronize()
             print(f"[GGUFModelPatcher] CUDA sync after restore - OK")
+            
+            # Mark mmap as released to skip native mmap release (would create duplicate CPU copies)
+            self.mmap_released = True
+            self.named_modules_to_munmap = {}
 
         # always call `patch_weight_to_device` even for lowvram
         super().load(*args, force_patch_weights=True, **kwargs)
