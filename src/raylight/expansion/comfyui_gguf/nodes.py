@@ -3,6 +3,7 @@ import os
 import torch
 import logging
 import collections
+import contextlib
 
 import ray
 
@@ -178,49 +179,77 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         
         if needs_heal and os.path.exists(cache_path):
             import torch
+            import gc
+            
+            # ZERO-COPY STREAMING RESTORE
+            # Key insight: mmap from /dev/shm means pages are already in RAM (shared memory).
+            # We use pin_memory() to mark pages as DMA-able, then async copy to GPU.
+            # This avoids creating intermediate RAM copies during transfer.
+            
             state_dict = torch.load(cache_path, mmap=True, weights_only=False)
             restored = 0
             skipped = 0
             moved_to_gpu = 0
             target_device = self.load_device
-            for name, tensor in state_dict.items():
-                try:
-                    # Handle buffer vs parameter naming (buf_ prefix from cache)
-                    if name.startswith("buf_"):
-                        actual_name = name[4:]  # Remove "buf_" prefix
-                        curr = comfy.utils.get_attr(self.model, actual_name)
-                    else:
-                        curr = comfy.utils.get_attr(self.model, name)
-                    
-                    if curr.numel() == 0:  # Only restore nuked weights
-                        # Move tensor to model's load device (GPU) before assigning
-                        # Cache stores CPU copies, but ComfyUI expects GPU tensors
-                        restored_tensor = tensor.to(target_device)
-                        
-                        # Directly assign data
-                        if hasattr(curr, 'data'):
-                            curr.data = restored_tensor
+            
+            # Use dedicated CUDA stream for async DMA operations
+            # This allows parallel transfers without blocking the main thread
+            stream = torch.cuda.Stream(device=target_device) if target_device.type == 'cuda' else None
+            
+            ctx = torch.cuda.stream(stream) if stream else contextlib.nullcontext()
+            with ctx:
+                for name, tensor in state_dict.items():
+                    try:
+                        # Handle buffer vs parameter naming (buf_ prefix from cache)
+                        if name.startswith("buf_"):
+                            actual_name = name[4:]  # Remove "buf_" prefix
+                            curr = comfy.utils.get_attr(self.model, actual_name)
                         else:
-                            # Fallback for non-parameter attributes
-                            if name.startswith("buf_"):
-                                comfy.utils.set_attr(self.model, name[4:], restored_tensor)
+                            actual_name = name
+                            curr = comfy.utils.get_attr(self.model, name)
+                        
+                        if curr.numel() == 0:  # Only restore nuked weights
+                            # ZERO-COPY PATH:
+                            # 1. pin_memory() marks mmap pages as DMA-able (cheap for /dev/shm)
+                            # 2. non_blocking=True triggers async DMA to GPU
+                            # 3. No intermediate RAM copy needed
+                            if target_device.type == 'cuda':
+                                pinned = tensor.pin_memory()
+                                restored_tensor = pinned.to(target_device, non_blocking=True)
+                                del pinned  # Release pin immediately
                             else:
-                                comfy.utils.set_attr_param(self.model, name, restored_tensor)
-                        restored += 1
-                    else:
-                        skipped += 1
-                        # These weights weren't nuked (on CPU), but need to be on GPU for inference
-                        if curr.device.type != 'cuda' and target_device.type == 'cuda':
+                                restored_tensor = tensor.to(target_device)
+                            
+                            # Directly assign data
                             if hasattr(curr, 'data'):
-                                curr.data = curr.data.to(target_device)
-                            moved_to_gpu += 1
-                        # Debug: log what's being skipped
-                        if skipped <= 5:
-                            print(f"[GGUFModelPatcher] DEBUG: Skipped '{name}' (numel={curr.numel()}, device={curr.device})")
-                except Exception as e:
-                    print(f"[GGUFModelPatcher] DEBUG: Failed to restore '{name}': {e}")
-            print(f"[GGUFModelPatcher] HOT LOAD: Restored {restored} weights, skipped {skipped} (moved {moved_to_gpu} to GPU), cache has {len(state_dict)} keys")
+                                curr.data = restored_tensor
+                            else:
+                                # Fallback for non-parameter attributes
+                                comfy.utils.set_attr_param(self.model, actual_name, restored_tensor)
+                            restored += 1
+                        else:
+                            skipped += 1
+                            # These weights weren't nuked (on CPU), but need to be on GPU for inference
+                            if curr.device.type != 'cuda' and target_device.type == 'cuda':
+                                if hasattr(curr, 'data'):
+                                    # Also use async transfer for non-nuked weights
+                                    pinned = curr.data.pin_memory()
+                                    curr.data = pinned.to(target_device, non_blocking=True)
+                                    del pinned
+                                moved_to_gpu += 1
+                            # Debug: log what's being skipped (first 5 only)
+                            if skipped <= 5:
+                                print(f"[GGUFModelPatcher] DEBUG: Skipped '{name}' (numel={curr.numel()}, device={curr.device})")
+                    except Exception as e:
+                        print(f"[GGUFModelPatcher] DEBUG: Failed to restore '{name}': {e}")
+            
+            # Synchronize stream to ensure all async transfers complete
+            if stream:
+                stream.synchronize()
+            
+            print(f"[GGUFModelPatcher] ZERO-COPY HOT LOAD: Restored {restored} weights, skipped {skipped} (moved {moved_to_gpu} to GPU), cache has {len(state_dict)} keys")
             del state_dict
+            gc.collect()
             
             # CRITICAL: Sync CUDA after restore to catch async errors early
             torch.cuda.synchronize()

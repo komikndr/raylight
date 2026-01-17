@@ -374,6 +374,29 @@ class RayWorker:
             USPInjectRegistry.inject,
         )
 
+    def apply_ffn_chunking(self, num_chunks: int = 8, verbose: bool = True):
+        """
+        Apply FFN chunking to reduce peak VRAM for LTX-2 models.
+        
+        This wraps FeedForward layers with ChunkedFFN to process sequences
+        in smaller batches, reducing peak memory by ~8x.
+        """
+        if self.model is None:
+            print(f"[RayWorker {self.local_rank}] No model loaded, skipping FFN chunking.")
+            return {"ffn_found": 0, "ffn_wrapped": 0}
+        
+        from raylight.comfy_extra_dist.nodes_ltx_ffn_chunker import wrap_ffn_layers
+        
+        if verbose:
+            print(f"[RayWorker {self.local_rank}] Applying FFN chunking with {num_chunks} chunks...")
+        
+        info = wrap_ffn_layers(self.model, num_chunks, verbose)
+        
+        if verbose:
+            print(f"[RayWorker {self.local_rank}] FFN chunking complete: {info}")
+        
+        return info
+
     def load_unet(self, unet_path, model_options):
         # Smart Reload: Skip if already loaded
         if self.model is not None and getattr(self, "current_unet_path", None) == unet_path:
@@ -875,11 +898,29 @@ class RayWorker:
         # 0. GGUF SOFT-RELOAD: If model exists but is offloaded, use Self-Heal path
         # This is faster than disk reload because we use Shared RAM backup
         if self.model is not None and getattr(self, "is_gguf", False):
+            # Check if /dev/shm cache exists before attempting soft-reload
+            cache_path = getattr(self.model, 'cache_path', None)
+            has_nuked_weights = any(p.numel() == 0 for p in self.model.model.parameters())
+            
+            if has_nuked_weights and (cache_path is None or not os.path.exists(cache_path)):
+                # FALLBACK: Cache is missing but weights are nuked - need full disk reload
+                print(f"[RayWorker] GGUF Soft-Reload: Cache missing ({cache_path}). Falling back to disk reload...")
+                if hasattr(self, 'gguf_reload_params') and self.gguf_reload_params is not None:
+                    # Clear the broken model state
+                    self.model = None
+                    self.load_gguf_unet(**self.gguf_reload_params)
+                    return
+                else:
+                    raise RuntimeError("GGUF cache missing and no disk reload params available!")
+            
             print("[RayWorker] GGUF Soft-Reload: Triggering Self-Heal via model.load()...")
             # Directly call the patcher's load method to trigger Self-Heal
             self.model.load(self.device, force_patch_weights=True)
             # Update current_device to prevent repeated reload detection
             self.model.current_device = self.model.load_device
+            # CRITICAL: Refresh load_device to ensure valid CUDA context
+            # After nuclear offload, the original device reference may become stale
+            self.model.load_device = self.device
             print("[RayWorker] GGUF Soft-Reload: Complete.")
             return
         
@@ -961,13 +1002,43 @@ class RayWorker:
     def ray_vae_loader(self, vae_path):
         from ..comfy_dist.sd import decode_tiled_1d, decode_tiled_, decode_tiled_3d
         state_dict = {}
+        metadata = None
         if "pixel_space" in vae_path:
             state_dict["pixel_space_vae"] = torch.tensor(1.0)
         else:
-            state_dict = comfy.utils.load_torch_file(vae_path)
+            # Use return_metadata=True to ensure correct versioning (LTX-1 vs LTX-2)
+            res = comfy.utils.load_torch_file(vae_path, return_metadata=True)
+            if isinstance(res, tuple):
+                state_dict, metadata = res
+            else:
+                state_dict = res
+                metadata = None
 
-        vae_model = comfy.sd.VAE(sd=state_dict)
-        vae_model.throw_exception_if_invalid()
+        # Diagnostics for VAE identification
+        key_check = "decoder.up_blocks.0.res_blocks.0.conv1.conv.weight"
+        if key_check in state_dict:
+            channels = state_dict[key_check].shape[0]
+            print(f"[RayWorker {self.local_rank}] VAE Identification: {key_check} has {channels} channels.")
+            # Replicate ComfyUI logic for clarity in logs
+            version = 0
+            if channels == 512: version = 0
+            elif channels == 1024:
+                version = 1
+                if "encoder.down_blocks.1.conv.conv.bias" in state_dict: version = 2
+            print(f"[RayWorker {self.local_rank}] VAE Identification: Guessed version {version}")
+        
+        if metadata:
+            print(f"[RayWorker {self.local_rank}] VAE Identification: Metadata found, contains 'config': {'config' in metadata}")
+
+        import logging
+        original_level = logging.getLogger().getEffectiveLevel()
+        # logging.getLogger().setLevel(logging.ERROR) # Let's see the warnings for now
+        try:
+            # Pass metadata to VAE constructor to correctly handle configs
+            vae_model = comfy.sd.VAE(sd=state_dict, metadata=metadata)
+            vae_model.throw_exception_if_invalid()
+        finally:
+            logging.getLogger().setLevel(original_level)
 
         vae_model.decode_tiled_1d = types.MethodType(decode_tiled_1d, vae_model)
         vae_model.decode_tiled_ = types.MethodType(decode_tiled_, vae_model)
@@ -977,15 +1048,51 @@ class RayWorker:
             print(f"VAE loaded in {self.global_world_size} GPUs")
         self.vae_model = vae_model
 
-    @patch_ray_tqdm
+    def get_vae_temporal_compression(self):
+        if self.vae_model is None: return None
+        return self.vae_model.temporal_compression_decode()
+
+    def get_vae_spatial_compression(self):
+        if self.vae_model is None: return None
+        return self.vae_model.spacial_compression_decode()
+
     def ray_vae_decode(
         self,
+        shard_index,
         samples,
         tile_size,
         overlap=64,
         temporal_size=64,
-        temporal_overlap=8
+        temporal_overlap=8,
+        discard_latent_frames=0
     ):
+        print(f"[RayWorker {self.local_rank}] Entering ray_vae_decode (direct method call) for shard {shard_index}...")
+        
+        # Diagnostic: Check input latent statistics
+        l_min, l_max, l_mean = samples["samples"].min().item(), samples["samples"].max().item(), samples["samples"].mean().item()
+        print(f"[RayWorker {self.local_rank}] Input Latent Stats (shard {shard_index}): min={l_min:.4f}, max={l_max:.4f}, mean={l_mean:.4f}")
+        if torch.isnan(samples["samples"]).any():
+            print(f"[RayWorker {self.local_rank}] CRITICAL: Input latents for shard {shard_index} contain NaNs!")
+        
+        # Check if overwrite_cast_dtype is set (from patch_temp_fix_ck_ops)
+        if getattr(self, "overwrite_cast_dtype", None) is not None:
+            print(f"[RayWorker {self.local_rank}] Debug: overwrite_cast_dtype is set to {self.overwrite_cast_dtype}")
+        
+        # Check VAE weights for NaNs BEFORE decoding
+        if self.vae_model is not None:
+            nan_params = []
+            for name, p in self.vae_model.first_stage_model.named_parameters():
+                if torch.isnan(p).any():
+                    nan_params.append(name)
+            if nan_params:
+                print(f"[RayWorker {self.local_rank}] CRITICAL: VAE parameters contain NaNs: {nan_params[:5]}...")
+            else:
+                print(f"[RayWorker {self.local_rank}] VAE parameters verified healthy (no NaNs).")
+
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        
         if tile_size < overlap * 4:
             overlap = tile_size // 4
         if temporal_size < temporal_overlap * 2:
@@ -1002,19 +1109,65 @@ class RayWorker:
 
         compression = self.vae_model.spacial_compression_decode()
 
+        # Force Float32 Stability:
+        # Move the entire VAE first_stage_model to float32 and sync vae_dtype
+        print(f"[RayWorker {self.local_rank}] Forcing VAE first_stage_model and latents to float32 for stability...")
+        self.vae_model.first_stage_model.to(torch.float32)
+        self.vae_model.vae_dtype = torch.float32
+        
+        latents_to_decode = samples["samples"].to(torch.float32)
+        print(f"[RayWorker {self.local_rank}] latents_to_decode shape: {latents_to_decode.shape}")
+        print(f"[RayWorker {self.local_rank}] tiling: tile_t={temporal_size}, overlap_t={temporal_overlap}")
+
         images = self.vae_model.decode_tiled(
-            samples["samples"],
+            latents_to_decode,
             tile_x=tile_size // compression,
             tile_y=tile_size // compression,
             overlap=overlap // compression,
             tile_t=temporal_size,
             overlap_t=temporal_overlap,
         )
+        print(f"[RayWorker {self.local_rank}] decode_tiled complete. Shape: {images.shape}")
+        
+        if torch.isnan(images).any():
+            print(f"[RayWorker {self.local_rank}] CRITICAL: VAE output STILL contains NaNs even in float32!")
+        
         if len(images.shape) == 5:
-            images = images.reshape(
-                -1, images.shape[-3], images.shape[-2], images.shape[-1]
-            )
-        return images
+            # VAE.decode_tiled returns [B, T, H, W, C]
+            # Reshape to [B*T, H, W, C] and squeeze leading dim if B=1
+            images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+        elif len(images.shape) == 4:
+            # Already [T, H, W, C]
+            pass
+        else:
+            # Fallback for unexpected shapes
+            while len(images.shape) > 4 and images.shape[0] == 1:
+                images = images.squeeze(0)
+            if len(images.shape) == 3: # H, W, C -> 1, H, W, C
+                images = images.unsqueeze(0)
+            
+        # If we have overlap, discard the warmup frames
+        if discard_latent_frames > 0:
+            # 1 latent frame = 8 video frames
+            temporal_compression = self.vae_model.temporal_compression_decode() or 8
+            discard_video_frames = discard_latent_frames * temporal_compression
+            print(f"[RayWorker {self.local_rank}] Discarding {discard_video_frames} redundant warmup frames")
+            images = images[discard_video_frames:]
+            
+        # Move to CPU explicitly before transport to avoid Ray GPU serialization issues
+        # and print stats to troubleshoot "Black Video" issues.
+        print(f"[RayWorker {self.local_rank}] Shard {shard_index} statistics: min={images.min():.4f}, max={images.max():.4f}, mean={images.mean():.4f}")
+        
+        print(f"[RayWorker {self.local_rank}] Moving to CPU and converting to float16 for transport...")
+        images = images.cpu().to(torch.float16)
+        
+        # Proactive memory cleanup
+        print(f"[RayWorker {self.local_rank}] Shard {shard_index} complete. Cleanup and return.")
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+            
+        return (shard_index, images)
 
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
@@ -1084,6 +1237,11 @@ class RayWorker:
         disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
         if self.local_rank == 0:
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+        # CRITICAL: Ensure model device references are valid for this worker
+        # This guards against stale device references from previous contexts
+        if hasattr(work_model, 'load_device') and work_model.load_device != self.device:
+            work_model.load_device = self.device
 
         with torch.no_grad():
             samples = comfy.sample.sample_custom(
@@ -1187,6 +1345,11 @@ class RayWorker:
         if sigmas is not None:
              if isinstance(sampler_name, str):
                  sampler_obj = comfy.samplers.ksampler(sampler_name)
+
+        # CRITICAL: Ensure model device references are valid for this worker
+        # This guards against stale device references from previous contexts
+        if hasattr(work_model, 'load_device') and work_model.load_device != self.device:
+            work_model.load_device = self.device
 
         with torch.no_grad():
             if sigmas is None:

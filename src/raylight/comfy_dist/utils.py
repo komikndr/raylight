@@ -121,7 +121,7 @@ def tiled_scale_multidim(
             if pbar is not None:
                 pbar.update(1)
 
-        output[b:b + 1] = out / out_div
+        output[b:b + 1] = out / out_div.clamp(min=1e-8)
     return output
 
 

@@ -274,9 +274,8 @@ class XFuserSamplerCustom:
         # **** COORDINATOR-LEVEL RELOAD ****
         # Check which workers need reload and trigger BEFORE dispatching sampling.
         # This ensures all workers are ready and prevents xDiT collective desync.
-        # IMPORTANT: Serialize reloads to avoid 4x RAM spike (each worker copies ~15GB from Plasma)
-        for actor in gpu_actors:
-            ray.get(actor.reload_model_if_needed.remote())  # Serial: wait for each one
+        # PARALLEL: Safe with mmap-based /dev/shm cache - no RAM multiplication
+        ray.get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
         
         # Robustness: Ensure workers have base_ref if provided (Handling Restarts)
         lora_list_val = None
@@ -390,9 +389,8 @@ class DPSamplerCustom:
         # **** COORDINATOR-LEVEL RELOAD ****
         # Check which workers need reload and trigger BEFORE dispatching sampling.
         # This ensures all workers are ready and prevents xDiT collective desync.
-        # IMPORTANT: Serialize reloads to avoid 4x RAM spike (each worker copies ~15GB from Plasma)
-        for actor in gpu_actors:
-            ray.get(actor.reload_model_if_needed.remote())  # Serial: wait for each one
+        # PARALLEL: Safe with mmap-based /dev/shm cache - no RAM multiplication
+        ray.get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
         
         # Robustness: Ensure workers have base_ref if provided
         lora_list_val = None
