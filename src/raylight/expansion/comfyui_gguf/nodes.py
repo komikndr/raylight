@@ -18,7 +18,7 @@ import folder_paths
 from .ops import move_patch_to_device
 from .dequant import is_quantized, is_torch_compatible
 
-from raylight.distributed_worker.ray_worker import ensure_fresh_actors
+from raylight.distributed_worker.ray_worker import ensure_fresh_actors, evict_page_cache
 
 
 def update_folder_names_and_paths(key, targets=[]):
@@ -41,6 +41,8 @@ update_folder_names_and_paths("clip_gguf", ["text_encoders", "clip"])
 class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     patch_on_device = False
     release_mmap = False
+    unet_path = None
+    gguf_metadata = {}
 
     def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
         if key not in self.patches:
@@ -150,6 +152,10 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                                      param._grad.data = param._grad.data.to(device_to)
                              except Exception:
                                  pass  # Skip if device move fails
+            
+             # Ensure Page Cache is evicted if we are still tracking the path
+             if hasattr(self, "unet_path"):
+                 evict_page_cache(self.unet_path)
 
     def pin_weight_to_device(self, key):
         op_key = key.rsplit('.', 1)[0]
@@ -264,6 +270,9 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
 
         # Evict original GGUF mmap after first successful load to free page cache
         if not getattr(self, '_gguf_mmap_evicted', False):
+            if hasattr(self, "unet_path"):
+                evict_page_cache(self.unet_path)
+            
             import gc
             # Clear backup dict - we'll use /dev/shm cache instead
             self.backup.clear()
@@ -300,6 +309,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             n.patch_on_device = getattr(self, "patch_on_device", False)
             n.mmap_released = getattr(self, "mmap_released", False)
             n.release_mmap = getattr(self, "release_mmap", False)
+            n.unet_path = getattr(self, "unet_path", None)
             
             # CRITICAL: Share backup with clones.
             # Clones need access to the mmap tensor backups to perform repatching/restoration
@@ -335,6 +345,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         n.patch_on_device = False
         n.mmap_released = False
         n.release_mmap = False # Default to keeping mmap
+        n.unet_path = getattr(self, "unet_path", None)
         return n
 
 

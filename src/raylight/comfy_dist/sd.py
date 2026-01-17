@@ -159,6 +159,18 @@ def gguf_load_diffusion_model(unet_path, model_options={}, dequant_dtype=None, p
         raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))
     model = GGUFModelPatcher.clone(model)
     model.gguf_metadata = extra.get("metadata", {})
+    model.unet_path = unet_path
+    
+    # NUCLEAR CLEANUP: Explicitly delete state_dict and trigger GC
+    print(f"[Raylight] Loader: Nuclear cleanup of mmap state_dict...")
+    del sd
+    del extra
+    del ops
+    import gc
+    for _ in range(3):
+        gc.collect()
+    torch.cuda.empty_cache()
+    
     return model
 
 

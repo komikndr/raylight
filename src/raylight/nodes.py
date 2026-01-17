@@ -21,6 +21,7 @@ from .distributed_worker.ray_worker import (
     ensure_fresh_actors,
     ray_nccl_tester,
 )
+from .comfy_dist.utils import cancellable_get
 
 
 def _cleanup_raylight_shm_cache():
@@ -498,25 +499,25 @@ class RayUNETLoader:
 
         for actor in gpu_actors:
             loaded_futures.append(actor.set_lora_list.remote(lora))
-        ray.get(loaded_futures)
+        cancellable_get(loaded_futures)
         loaded_futures = []
 
         if parallel_dict["is_fsdp"] is True:
             worker0 = ray.get_actor("RayWorker:0")
-            ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
-            meta_model = ray.get(worker0.get_meta_model.remote())
+            cancellable_get(worker0.load_unet.remote(unet_path, model_options=model_options))
+            meta_model = cancellable_get(worker0.get_meta_model.remote())
 
             for actor in gpu_actors:
                 if actor != worker0:
                     loaded_futures.append(actor.set_meta_model.remote(meta_model))
 
-            ray.get(loaded_futures)
+            cancellable_get(loaded_futures)
             loaded_futures = []
 
             for actor in gpu_actors:
                 loaded_futures.append(actor.set_state_dict.remote())
 
-            ray.get(loaded_futures)
+            cancellable_get(loaded_futures)
             loaded_futures = []
         else:
             # Parallel Loading Mode: Trigger load_unet on all workers.
@@ -525,7 +526,7 @@ class RayUNETLoader:
                 loaded_futures.append(
                     actor.load_unet.remote(unet_path, model_options=model_options)
                 )
-            ray.get(loaded_futures)
+            cancellable_get(loaded_futures)
             loaded_futures = []
 
         for actor in gpu_actors:
@@ -535,7 +536,7 @@ class RayUNETLoader:
                 if parallel_dict["cfg_degree"] > 1:
                     patched_futures.append(actor.patch_cfg.remote())
 
-        ray.get(patched_futures)
+        cancellable_get(patched_futures)
 
         return (ray_actors,)
 
@@ -675,13 +676,13 @@ class XFuserKSamplerAdvanced:
         # Check which workers need reload and trigger BEFORE dispatching sampling.
         # This ensures all workers are ready before any collective operations begin.
         # PARALLEL: Safe with mmap-based /dev/shm cache - no RAM multiplication
-        ray.get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
+        cancellable_get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
         
         # Robustness: Ensure workers have base_ref if provided
         lora_list_val = None
         
         if "base_ref" in ray_actors:
-             ray.get([actor.set_base_ref.remote(ray_actors["base_ref"]) for actor in gpu_actors])
+             cancellable_get([actor.set_base_ref.remote(ray_actors["base_ref"]) for actor in gpu_actors])
              
              # --------------------------------------------------------
              # Shared Object Storage Patching (Preferred)
@@ -689,12 +690,12 @@ class XFuserKSamplerAdvanced:
              worker0 = gpu_actors[0]
              
              # lora is already the list of dicts from RayLoRALoader
-             target_sd_ref = ray.get(worker0.create_patched_ref.remote(lora))
+             target_sd_ref = cancellable_get(worker0.create_patched_ref.remote(lora))
              
              reload_futures = []
              for actor in gpu_actors:
                  reload_futures.append(actor.load_unet_from_state_dict.remote(target_sd_ref, model_options={}))
-             ray.get(reload_futures)
+             cancellable_get(reload_futures)
              # lora_list_val remains None (workers are already patched)
              
         elif lora is not None:
@@ -725,7 +726,7 @@ class XFuserKSamplerAdvanced:
             for actor in gpu_actors
         ]
 
-        results = ray.get(futures)
+        results = cancellable_get(futures)
         return (results[0][0],)
 
 
@@ -812,9 +813,9 @@ class DPKSamplerAdvanced:
         # Check which workers need reload and trigger BEFORE dispatching sampling.
         # This ensures all workers are ready before any collective operations begin.
         # PARALLEL: Safe with mmap-based /dev/shm cache - no RAM multiplication
-        ray.get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
+        cancellable_get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
 
-        parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+        parallel_dict = cancellable_get(gpu_actors[0].get_parallel_dict.remote())
         if parallel_dict["is_xdit"] is True:
             raise ValueError(
                 """
@@ -842,19 +843,19 @@ class DPKSamplerAdvanced:
         lora_list_val = None
         
         if "base_ref" in ray_actors:
-             ray.get([actor.set_base_ref.remote(ray_actors["base_ref"]) for actor in gpu_actors])
+             cancellable_get([actor.set_base_ref.remote(ray_actors["base_ref"]) for actor in gpu_actors])
         
              # --------------------------------------------------------
              # Shared Object Storage Patching (Preferred)
              # --------------------------------------------------------
              worker0 = gpu_actors[0]
              
-             target_sd_ref = ray.get(worker0.create_patched_ref.remote(current_lora))
+             target_sd_ref = cancellable_get(worker0.create_patched_ref.remote(current_lora))
     
              reload_futures = []
              for actor in gpu_actors:
                  reload_futures.append(actor.load_unet_from_state_dict.remote(target_sd_ref, model_options={}))
-             ray.get(reload_futures)
+             cancellable_get(reload_futures)
              # lora_list_val remains None
              
         elif current_lora is not None:
@@ -886,7 +887,7 @@ class DPKSamplerAdvanced:
             for i, actor in enumerate(gpu_actors)
         ]
 
-        results = ray.get(futures)
+        results = cancellable_get(futures)
         results = [result[0] for result in results]
         return (results,)
 
@@ -980,7 +981,7 @@ class RayVAEDecodeDistributed:
 
         # 1. Load VAE on all workers
         for actor in gpu_actors:
-            ray.get(actor.ray_vae_loader.remote(vae_path))
+            cancellable_get(actor.ray_vae_loader.remote(vae_path))
 
         # 2. Shard samples temporally
         latents = samples["samples"]
@@ -995,8 +996,8 @@ class RayVAEDecodeDistributed:
 
         # Pre-calculate total output size and compression factors early
         # Retrieve compression factors directly from the worker that just loaded the VAE
-        temporal_compression = ray.get(gpu_actors[0].get_vae_temporal_compression.remote()) or 1
-        spatial_compression = ray.get(gpu_actors[0].get_vae_spatial_compression.remote()) or 1
+        temporal_compression = cancellable_get(gpu_actors[0].get_vae_temporal_compression.remote()) or 1
+        spatial_compression = cancellable_get(gpu_actors[0].get_vae_spatial_compression.remote()) or 1
 
         # Causal VAE output formula: (Latent_T - 1) * compression + 1
         if temporal_compression > 1:
@@ -1073,13 +1074,23 @@ class RayVAEDecodeDistributed:
             
             remaining = list(futures)
             while remaining:
+                # Check ComfyUI cancel status
+                if comfy.model_management.processing_interrupted():
+                    print("[Raylight] Cancellation detected during VAE decoding! Force-canceling Ray tasks...")
+                    for ref in remaining:
+                        try:
+                            ray.cancel(ref, force=True, recursive=True)
+                        except:
+                            pass
+                    raise Exception("Raylight: VAE Decode canceled by user.")
+
                 ready, remaining = ray.wait(remaining, timeout=1.0)
                 if not ready:
                     continue
                     
                 for ray_ref in ready:
                     # Get result (index, data)
-                    shard_index, shard_data = ray.get(ray_ref)
+                    shard_index, shard_data = cancellable_get(ray_ref)
                     received_count += 1
                     print(f"[RayVAEDecode] Received shard {shard_index} ({received_count}/{futures_count}). Shape: {shard_data.shape}")
                     
@@ -1122,8 +1133,15 @@ class RayVAEDecodeDistributed:
                     
                     # Explicit cleanup of the shard reference
                     del shard_data
-                    gc.collect()
+                    # Explicitly remove from ready list too
+                    del ray_ref
+                
+                gc.collect()
 
+            # Final cleanup of all futures to drop Ray Object Store refs
+            del remaining
+            del futures
+            gc.collect()
         finally:
             if os.path.exists(mmap_path):
                 # Unlinking is safe; the file descriptor held by the tensor keeps it alive 
@@ -1160,7 +1178,7 @@ class RayOffloadModel:
         
         # Offload from all workers
         offload_futures = [actor.offload_and_clear.remote() for actor in gpu_actors]
-        ray.get(offload_futures)
+        cancellable_get(offload_futures)
         
         print("[RayOffloadModel] All workers offloaded.")
         return (latent,)

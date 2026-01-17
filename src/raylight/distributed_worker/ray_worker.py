@@ -24,6 +24,7 @@ from raylight.distributed_modules.cfg import CFGParallelInjectRegistry
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
+from raylight.comfy_dist.utils import cancellable_get
 from ray.exceptions import RayActorError
 from contextlib import contextmanager
 import inspect
@@ -38,7 +39,109 @@ import inspect
 
 
 # Comfy cli args, does not get pass through into ray actor
+def evict_page_cache(path):
+    """Tells the kernel to evict pages of the given file from the Page Cache."""
+    if not path or not os.path.exists(path):
+        return
+    
+    try:
+        if sys.platform.startswith("linux"):
+            fd = os.open(path, os.O_RDONLY)
+            file_size = os.path.getsize(path)
+            # POSIX_FADV_DONTNEED = 4 - tells kernel to evict pages from cache
+            os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_DONTNEED)
+            os.close(fd)
+            print(f"[Raylight] SUCCESS: Evicted {os.path.basename(path)} from page cache ({file_size / 1024**3:.2f} GB)")
+    except (OSError, AttributeError) as e:
+        # posix_fadvise not available on all platforms
+        print(f"[Raylight] Note: Could not evict {os.path.basename(path)} from page cache: {e}")
+
 class RayWorker:
+    def check_memory_diagnostics(self, stage="Unknown"):
+        import gc
+        import os
+        import torch
+        rss_gb = 0
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            rss_gb = process.memory_info().rss / 1024**3
+        except (ImportError, Exception):
+            # Fallback to /proc/self/status on linux if psutil is missing
+            try:
+                with open("/proc/self/status", "r") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            rss_gb = int(line.split()[1]) / 1024**2 # KB to GB
+                            break
+            except Exception:
+                pass
+        
+        print(f"[RayWorker {self.local_rank}] === Memory Diagnostics ({stage}) ===")
+        print(f"[RayWorker {self.local_rank}] RSS: {rss_gb:.2f} GB")
+        
+        # 1. VRAM Tracking
+        if torch.cuda.is_available():
+            vram_alloc = torch.cuda.memory_allocated() / 1024**3
+            vram_res = torch.cuda.memory_reserved() / 1024**3
+            print(f"[RayWorker {self.local_rank}] VRAM: {vram_alloc:.2f} GB allocated, {vram_res:.2f} GB reserved")
+
+        # 2. Detailed Mmap Info
+        mmap_total_bytes = 0
+        mmap_count = 0
+        try:
+            if os.path.exists("/proc/self/maps"):
+                with open("/proc/self/maps", "r") as f:
+                    for line in f:
+                        if ".gguf" in line:
+                            # Parse address range: "7f7f7f7f7000-7f7f7f7f8000"
+                            parts = line.split()
+                            if len(parts) > 0:
+                                addr_range = parts[0]
+                                start, end = [int(x, 16) for x in addr_range.split("-")]
+                                mmap_total_bytes += (end - start)
+                                mmap_count += 1
+                if mmap_count > 0:
+                    print(f"[RayWorker {self.local_rank}] GGUF Mmaps: {mmap_total_bytes / 1024**3:.2f} GB total across {mmap_count} segments")
+        except Exception as e:
+            print(f"[RayWorker {self.local_rank}] Error checking mmaps: {e}")
+
+        # 3. SHM Tracking
+        shm_total_bytes = 0
+        try:
+            shm_files = [f for f in os.listdir("/dev/shm") if f.startswith("raylight_")]
+            for f in shm_files:
+                shm_total_bytes += os.path.getsize(os.path.join("/dev/shm", f))
+            if shm_total_bytes > 0:
+                print(f"[RayWorker {self.local_rank}] SHM footprint: {shm_total_bytes / 1024**3:.2f} GB in /dev/shm/raylight_*")
+        except Exception:
+            pass
+
+        # 4. Heap Inspection (Large CPU Tensors)
+        ggml_count = 0
+        large_cpu_tensors = []
+        for obj in gc.get_objects():
+            try:
+                name = type(obj).__name__
+                if "GGMLTensor" in name:
+                    ggml_count += 1
+                elif torch.is_tensor(obj) and obj.device.type == "cpu":
+                    size_bytes = obj.numel() * obj.element_size()
+                    if size_bytes > 50 * 1024**2: # >50MB
+                        large_cpu_tensors.append((obj.shape, size_bytes / 1024**2, name))
+            except Exception:
+                continue
+        
+        if ggml_count > 0:
+            print(f"[RayWorker {self.local_rank}] WARNING: Found {ggml_count} GGMLTensor objects in heap!")
+        if large_cpu_tensors:
+            large_cpu_tensors.sort(key=lambda x: x[1], reverse=True)
+            print(f"[RayWorker {self.local_rank}] Top Large CPU Tensors in Heap:")
+            for shape, size_mb, type_name in large_cpu_tensors[:10]:
+                print(f"  - {type_name} {shape}: {size_mb:.1f} MB")
+        
+        print(f"[RayWorker {self.local_rank}] === End Diagnostics ===")
+
     def __init__(self, local_rank, device_id, parallel_dict):
         self.model = None
         self.vae_model = None
@@ -252,16 +355,7 @@ class RayWorker:
             
             # Evict original GGUF file from page cache - we'll use /dev/shm cache instead
             if self.current_unet_path:
-                try:
-                    fd = os.open(self.current_unet_path, os.O_RDONLY)
-                    file_size = os.path.getsize(self.current_unet_path)
-                    # POSIX_FADV_DONTNEED = 4 - tells kernel to evict pages from cache
-                    os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_DONTNEED)
-                    os.close(fd)
-                    print(f"[RayWorker 0] Evicted original GGUF from page cache ({file_size / 1024**3:.1f} GB)")
-                except (OSError, AttributeError) as e:
-                    # posix_fadvise not available on all platforms (e.g., macOS)
-                    print(f"[RayWorker 0] Note: Could not evict GGUF from page cache (platform may not support it)")
+                evict_page_cache(self.current_unet_path)
         elif self.local_rank != 0:
             print(f"[RayWorker {self.local_rank}] Waiting for cache from Worker 0...")
         else:
@@ -337,6 +431,8 @@ class RayWorker:
             
             gc.collect()
             gc.collect()
+            torch.cuda.empty_cache()
+            print(f"[RayWorker {self.local_rank}] Offload complete.")
 
             # Manually deregister from ComfyUI's cache to prevent it from holding refs
             try:
@@ -837,6 +933,29 @@ class RayWorker:
              
         self.is_model_loaded = True
 
+        # NEW: FORCED immediate VRAM load and Page Cache eviction
+        # We bypass reload_model_if_needed() checks to ensure GGUFModelPatcher.load()
+        # executes, clears its backup, and calls evict_page_cache().
+        print(f"[RayWorker {self.local_rank}] Loader: FORCING immediate VRAM load and eviction...")
+        if hasattr(self.model, "load"):
+            self.model.load(self.device, force_patch_weights=True)
+            self.model.current_device = self.device
+        
+        # CRITICAL: Clear legacy backup dict to release mmap tensor references.
+        # Raylight uses /dev/shm caching for reload, not the backup dict.
+        if hasattr(self.model, "backup"):
+            self.model.backup.clear()
+        
+        # Aggressive GC
+        import gc
+        for _ in range(3):
+            gc.collect()
+        comfy.model_management.soft_empty_cache()
+        
+        # Diagnostics
+        self.check_memory_diagnostics("Post-GGUF-Load")
+
+
     def get_base_ref(self):
         # Return as list to prevent Ray from auto-resolving the ObjectRef when returned
         return [getattr(self, "base_sd_ref", None)]
@@ -862,22 +981,8 @@ class RayWorker:
                 self.load_lora()
              self.is_model_loaded = True
              return
-
-        if reload_params is not None:
-             print("[RayWorker] GGUF Optimization: Using Parallel Disk Loading (Mmap)...")
-             self.load_gguf_unet(**reload_params)
-             
-             if self.lora_list is not None:
-                self.load_lora()
-             self.is_model_loaded = True
-             return
         else:
              raise ValueError("[RayWorker] Cannot RELOAD GGUF: Missing reload params for parallel loading.")
-        
-        if self.lora_list is not None:
-            self.load_lora()
-        
-        self.is_model_loaded = True 
 
     def reload_model_if_needed(self):
         """Auto-reloads the model if it was offloaded."""
@@ -921,7 +1026,14 @@ class RayWorker:
             # CRITICAL: Refresh load_device to ensure valid CUDA context
             # After nuclear offload, the original device reference may become stale
             self.model.load_device = self.device
+            
+            # CRITICAL: Clear legacy backup dict to release mmap tensor references.
+            # model.load() repopulates backup - we must clear it again.
+            if hasattr(self.model, "backup"):
+                self.model.backup.clear()
+            
             print("[RayWorker] GGUF Soft-Reload: Complete.")
+
             return
         
         # 1. SPECIAL CASE: GGUF Full Disk Reload (mmap) - when model was fully cleared
@@ -1164,8 +1276,10 @@ class RayWorker:
         # Proactive memory cleanup
         print(f"[RayWorker {self.local_rank}] Shard {shard_index} complete. Cleanup and return.")
         import gc
-        gc.collect()
+        for _ in range(2):
+            gc.collect()
         torch.cuda.empty_cache()
+        self.check_memory_diagnostics("Post-VAE-Decode")
             
         return (shard_index, images)
 
@@ -1486,7 +1600,7 @@ def make_ray_actor_fn(
         ray_actors["workers"] = gpu_actors
 
         for actor in ray_actors["workers"]:
-            ray.get(actor.__ray_ready__.remote())
+            cancellable_get(actor.__ray_ready__.remote())
         return ray_actors
 
     return _init_ray_actor
@@ -1499,7 +1613,7 @@ def ensure_fresh_actors(ray_actors_init):
 
     needs_restart = False
     try:
-        is_loaded = ray.get(gpu_actors[0].get_is_model_loaded.remote())
+        is_loaded = cancellable_get(gpu_actors[0].get_is_model_loaded.remote())
         if is_loaded:
             needs_restart = True
     except RayActorError:
@@ -1510,12 +1624,12 @@ def ensure_fresh_actors(ray_actors_init):
     if needs_restart:
         for actor in gpu_actors:
             try:
-                ray.get(actor.kill.remote())
+                cancellable_get(actor.kill.remote())
             except Exception:
                 pass  # ignore already dead
         ray_actors = ray_actor_fn()
         gpu_actors = ray_actors["workers"]
 
-    parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+    parallel_dict = cancellable_get(gpu_actors[0].get_parallel_dict.remote())
 
     return ray_actors, gpu_actors, parallel_dict
