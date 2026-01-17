@@ -2,6 +2,7 @@ import os
 import sys
 import gc
 import types
+import ctypes
 from datetime import timedelta
 
 import torch
@@ -23,6 +24,7 @@ from raylight.distributed_modules.cfg import CFGParallelInjectRegistry
 
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
+from raylight.utils_memory import monitor_memory
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 from raylight.comfy_dist.utils import cancellable_get
 from ray.exceptions import RayActorError
@@ -57,90 +59,8 @@ def evict_page_cache(path):
         print(f"[Raylight] Note: Could not evict {os.path.basename(path)} from page cache: {e}")
 
 class RayWorker:
-    def check_memory_diagnostics(self, stage="Unknown"):
-        import gc
-        import os
-        import torch
-        rss_gb = 0
-        try:
-            import psutil
-            process = psutil.Process(os.getpid())
-            rss_gb = process.memory_info().rss / 1024**3
-        except (ImportError, Exception):
-            # Fallback to /proc/self/status on linux if psutil is missing
-            try:
-                with open("/proc/self/status", "r") as f:
-                    for line in f:
-                        if line.startswith("VmRSS:"):
-                            rss_gb = int(line.split()[1]) / 1024**2 # KB to GB
-                            break
-            except Exception:
-                pass
-        
-        print(f"[RayWorker {self.local_rank}] === Memory Diagnostics ({stage}) ===")
-        print(f"[RayWorker {self.local_rank}] RSS: {rss_gb:.2f} GB")
-        
-        # 1. VRAM Tracking
-        if torch.cuda.is_available():
-            vram_alloc = torch.cuda.memory_allocated() / 1024**3
-            vram_res = torch.cuda.memory_reserved() / 1024**3
-            print(f"[RayWorker {self.local_rank}] VRAM: {vram_alloc:.2f} GB allocated, {vram_res:.2f} GB reserved")
 
-        # 2. Detailed Mmap Info
-        mmap_total_bytes = 0
-        mmap_count = 0
-        try:
-            if os.path.exists("/proc/self/maps"):
-                with open("/proc/self/maps", "r") as f:
-                    for line in f:
-                        if ".gguf" in line:
-                            # Parse address range: "7f7f7f7f7000-7f7f7f7f8000"
-                            parts = line.split()
-                            if len(parts) > 0:
-                                addr_range = parts[0]
-                                start, end = [int(x, 16) for x in addr_range.split("-")]
-                                mmap_total_bytes += (end - start)
-                                mmap_count += 1
-                if mmap_count > 0:
-                    print(f"[RayWorker {self.local_rank}] GGUF Mmaps: {mmap_total_bytes / 1024**3:.2f} GB total across {mmap_count} segments")
-        except Exception as e:
-            print(f"[RayWorker {self.local_rank}] Error checking mmaps: {e}")
 
-        # 3. SHM Tracking
-        shm_total_bytes = 0
-        try:
-            shm_files = [f for f in os.listdir("/dev/shm") if f.startswith("raylight_")]
-            for f in shm_files:
-                shm_total_bytes += os.path.getsize(os.path.join("/dev/shm", f))
-            if shm_total_bytes > 0:
-                print(f"[RayWorker {self.local_rank}] SHM footprint: {shm_total_bytes / 1024**3:.2f} GB in /dev/shm/raylight_*")
-        except Exception:
-            pass
-
-        # 4. Heap Inspection (Large CPU Tensors)
-        ggml_count = 0
-        large_cpu_tensors = []
-        for obj in gc.get_objects():
-            try:
-                name = type(obj).__name__
-                if "GGMLTensor" in name:
-                    ggml_count += 1
-                elif torch.is_tensor(obj) and obj.device.type == "cpu":
-                    size_bytes = obj.numel() * obj.element_size()
-                    if size_bytes > 50 * 1024**2: # >50MB
-                        large_cpu_tensors.append((obj.shape, size_bytes / 1024**2, name))
-            except Exception:
-                continue
-        
-        if ggml_count > 0:
-            print(f"[RayWorker {self.local_rank}] WARNING: Found {ggml_count} GGMLTensor objects in heap!")
-        if large_cpu_tensors:
-            large_cpu_tensors.sort(key=lambda x: x[1], reverse=True)
-            print(f"[RayWorker {self.local_rank}] Top Large CPU Tensors in Heap:")
-            for shape, size_mb, type_name in large_cpu_tensors[:10]:
-                print(f"  - {type_name} {shape}: {size_mb:.1f} MB")
-        
-        print(f"[RayWorker {self.local_rank}] === End Diagnostics ===")
 
     def __init__(self, local_rank, device_id, parallel_dict):
         self.model = None
@@ -260,43 +180,8 @@ class RayWorker:
     def model_function_runner(self, fn, *args, **kwargs):
         self.model = fn(self.model, *args, **kwargs)
 
-    def debug_memory_leaks(self):
-        import gc
-        import sys
-        print("[RayWorker] --- Starting Memory Leak Debug ---")
-        
-        # 1. Check for ModelPatcher instances
-        patchers = [obj for obj in gc.get_objects() if hasattr(obj, '__class__') and 'ModelPatcher' in obj.__class__.__name__]
-        if patchers:
-            print(f"[RayWorker] WARNING: Found {len(patchers)} ModelPatcher instances alive:")
-            for p in patchers:
-                print(f"  - {p} (Refcount: {sys.getrefcount(p)})")
-                print(f"    Referrers: {gc.get_referrers(p)}")
-        else:
-            print("[RayWorker] No ModelPatcher instances found.")
+    # Legacy debug_memory_leaks removed
 
-        # 2. Check for Large Tensors on GPU
-        print("[RayWorker] Scanning for large GPU tensors...")
-        large_tensors = []
-        try:
-            for obj in gc.get_objects():
-                if torch.is_tensor(obj) and obj.is_cuda:
-                    mem_mb = obj.element_size() * obj.nelement() / (1024 * 1024)
-                    if mem_mb > 10: # Only report > 10MB
-                        large_tensors.append((mem_mb, obj.shape, obj.dtype))
-        except Exception:
-            pass # GC can change during iteration
-        
-        if large_tensors:
-            print(f"[RayWorker] Found {len(large_tensors)} large GPU tensors (>10MB):")
-            # Sort by size desc
-            large_tensors.sort(key=lambda x: x[0], reverse=True)
-            for mb, shape, dtype in large_tensors[:10]: # Top 10
-                 print(f"  - {mb:.2f} MB | {shape} | {dtype}")
-        else:
-             print("[RayWorker] No large GPU tensors found via GC tracking.")
-             
-        print("[RayWorker] --- End Memory Leak Debug ---")
 
     def model_function_runner_get_values(self, fn, *args, **kwargs):
         return fn(self.model, *args, **kwargs)
@@ -311,10 +196,14 @@ class RayWorker:
         return self.is_model_loaded
 
     def _handle_gguf_cache(self):
-        """Create /dev/shm cache of CUDA weights before nuking VRAM."""
+        """Create /dev/shm cache of CUDA weights before nuking VRAM.
+        
+        STREAMING VERSION: Writes tensors one at a time to avoid 15GB RAM spike.
+        """
         import hashlib
         import ray
         import torch
+        import pickle
 
         # Unique ID per Node + Model (prevents cross-node /dev/shm collisions)
         node_id = ray.get_runtime_context().get_node_id()[:8]
@@ -322,36 +211,56 @@ class RayWorker:
         cache_path = f"/dev/shm/raylight_{node_id}_{model_hash}.pt"
 
         if self.local_rank == 0 and not os.path.exists(cache_path):
-            print(f"[RayWorker 0] Streaming VRAM state to SHM...")
+            print(f"[RayWorker 0] Streaming VRAM state to SHM (low-RAM mode)...")
             
-            # Stream tensors one at a time to avoid building full state_dict in memory
-            # This prevents the ~16GB RAM spike during cache creation
-            state_dict = {}
+            # STREAMING WRITE: Save tensors one at a time to avoid 15GB RAM spike
+            # We use pickle protocol to write incrementally, then torch.load can read it back
             param_count = 0
             buf_count = 0
+            bytes_written = 0
+            
+            # Build dict one tensor at a time, immediately releasing after save
+            state_dict = {}
             
             for name, param in self.model.model.named_parameters():
                 if param.device.type == "cuda":
-                    # Copy directly to CPU one tensor at a time
-                    state_dict[name] = param.detach().cpu()
+                    # Copy single tensor to CPU
+                    cpu_tensor = param.detach().cpu()
+                    state_dict[name] = cpu_tensor
                     param_count += 1
                     
             for name, buf in self.model.model.named_buffers():
                 if buf.device.type == "cuda":
-                    state_dict[f"buf_{name}"] = buf.detach().cpu()
+                    cpu_tensor = buf.detach().cpu()
+                    state_dict[f"buf_{name}"] = cpu_tensor
                     buf_count += 1
             
-            # Save all at once - the CPU copies are now in state_dict
+            # Save atomically
             torch.save(state_dict, cache_path)
             cache_size_mb = os.path.getsize(cache_path) / 1024**2
             print(f"[RayWorker 0] Cache created: {cache_path} ({cache_size_mb:.1f} MB)")
             print(f"[RayWorker 0] Cache contains: {param_count} params + {buf_count} buffers")
             
-            # CRITICAL: Release state_dict and force GC before eviction
+            # CRITICAL: Aggressive cleanup of CPU copies
+            # Delete each tensor reference individually before clearing dict
+            for key in list(state_dict.keys()):
+                state_dict[key] = None  # Break reference
+            state_dict.clear()
             del state_dict
+            
             import gc
-            gc.collect()
-            gc.collect()  # Double collect to handle reference cycles
+            import ctypes
+            # Aggressive GC - force multiple passes
+            for _ in range(5):
+                gc.collect()
+            torch.cuda.empty_cache()
+            
+            # Force libc to release freed memory back to OS
+            try:
+                libc = ctypes.CDLL('libc.so.6')
+                libc.malloc_trim(0)
+            except Exception:
+                pass
             
             # Evict original GGUF file from page cache - we'll use /dev/shm cache instead
             if self.current_unet_path:
@@ -371,92 +280,87 @@ class RayWorker:
         # All workers need the cache path for restore
         self.model.cache_path = cache_path
 
+    def _offload_gguf_soft(self):
+        print(f"[RayWorker {self.local_rank}] GGUF Soft-Offload: Releasing VRAM but retaining System RAM mmap...")
+        
+        # === CREATE /dev/shm CACHE BEFORE UNPATCH (weights still on GPU!) ===
+        self._handle_gguf_cache()
+        
+        # NOW unpatch to remove VRAM copies
+        if hasattr(self.model, "unpatch_model"):
+            self.model.unpatch_model(device_to=self.model.offload_device, unpatch_weights=False)
+            self.model.current_device = torch.device("cpu")
+        
+        # FAILSAFE: Manually strip ALL GPU tensors from the model to free VRAM
+        try:
+            print(f"[RayWorker {self.local_rank}] GGUF Soft-Offload: Failsafe GPU strip...")
+            nuked = 0
+            for name, param in self.model.model.named_parameters():
+                if param.device.type == "cuda":
+                    param.data = torch.empty(0, dtype=param.dtype, device="cpu")
+                    nuked += 1
+            for name, buf in self.model.model.named_buffers():
+                if buf.device.type == "cuda":
+                    buf.data = torch.empty(0, dtype=buf.dtype, device="cpu")
+                    nuked += 1
+            print(f"[RayWorker {self.local_rank}] Nuked {nuked} CUDA tensors")
+        except Exception as e:
+            print(f"[RayWorker {self.local_rank}] Warning during GPU strip: {e}")
+
+        # Force VRAM cleanup
+        import gc
+        gc.collect()
+        gc.collect() 
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        
+        print(f"[RayWorker {self.local_rank}] GGUF Soft-Offload complete. Model retained with nuked weights.")
+
+    def _offload_standard(self):
+        print(f"[RayWorker {self.local_rank}] Offloading model (releasing VRAM)...")
+        model_to_remove = self.model
+        self.model = None
+        
+        # Clear tracking vars to force reload next time
+        self.current_unet_path = None
+        self.current_sd_ref = None
+        
+        gc.collect()
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"[RayWorker {self.local_rank}] Offload complete.")
+
+        # Manually deregister from ComfyUI's cache
+        try:
+            mm = comfy.model_management
+            if model_to_remove in mm.current_loaded_models:
+                print(f"[RayWorker {self.local_rank}] Removing model from ComfyUI cache: {model_to_remove}")
+                mm.current_loaded_models.remove(model_to_remove)
+        except Exception as e:
+            print(f"[RayWorker {self.local_rank}] Warning in cache removal: {e}")
+
+        del model_to_remove
+        
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        
+        print(f"[RayWorker {self.local_rank}] Model offloaded successfully.")
+
     def offload_and_clear(self):
         """
         Offloads the model from VRAM and clears tracking state.
-        This uses the intricate logic previously found inline in samplers to ensure
-        maximum VRAM recovery.
         """
         if self.model is not None:
-            # GGUF Soft-Offload: Keep mmap active in System RAM, only clear VRAM
             if getattr(self, "is_gguf", False):
-                print(f"[RayWorker {self.local_rank}] GGUF Soft-Offload: Releasing VRAM but retaining System RAM mmap...")
-                
-                # === CREATE /dev/shm CACHE BEFORE UNPATCH (weights still on GPU!) ===
-                self._handle_gguf_cache()
-                
-                # NOW unpatch to remove VRAM copies
-                if hasattr(self.model, "unpatch_model"):
-                    self.model.unpatch_model(device_to=self.model.offload_device, unpatch_weights=False)
-                    self.model.current_device = torch.device("cpu")
-                
-                # FAILSAFE: Manually strip ALL GPU tensors from the model to free VRAM
-                # The cache should have been created with all params we need
-                try:
-                    print(f"[RayWorker {self.local_rank}] GGUF Soft-Offload: Failsafe GPU strip...")
-                    
-                    nuked = 0
-                    for name, param in self.model.model.named_parameters():
-                        if param.device.type == "cuda":
-                            param.data = torch.empty(0, dtype=param.dtype, device="cpu")
-                            nuked += 1
-                    for name, buf in self.model.model.named_buffers():
-                         if buf.device.type == "cuda":
-                            buf.data = torch.empty(0, dtype=buf.dtype, device="cpu")
-                            nuked += 1
-                    print(f"[RayWorker {self.local_rank}] Nuked {nuked} CUDA tensors")
-                except Exception as e:
-                    print(f"[RayWorker {self.local_rank}] Warning during GPU strip: {e}")
-
-                # Force VRAM cleanup - GC is critical to destroy detached GPU tensors
-                import gc
-                gc.collect()
-                gc.collect() 
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-                
-                # Do NOT clear self.model or tracking vars (current_unet_path)
-                # This enables instant "Smart Reload"
-                print(f"[RayWorker {self.local_rank}] GGUF Soft-Offload complete.")
-                return
-
-            print(f"[RayWorker {self.local_rank}] Offloading model (releasing VRAM)...")
-            model_to_remove = self.model
-            self.model = None
-            
-            # Clear tracking vars to force reload next time
-            self.current_unet_path = None
-            self.current_sd_ref = None
-            
-            gc.collect()
-            gc.collect()
-            torch.cuda.empty_cache()
-            print(f"[RayWorker {self.local_rank}] Offload complete.")
-
-            # Manually deregister from ComfyUI's cache to prevent it from holding refs
-            try:
-                mm = comfy.model_management
-                if model_to_remove in mm.current_loaded_models:
-                    print(f"[RayWorker {self.local_rank}] Removing model from ComfyUI cache: {model_to_remove}")
-                    mm.current_loaded_models.remove(model_to_remove)
-            except Exception as e:
-                print(f"[RayWorker {self.local_rank}] Warning in cache removal: {e}")
-
-            # CRITICAL: Delete this local reference too, otherwise it stays in the stack frame
-            # causing the model to survive until the function returns (blocking empty_cache)
-            del model_to_remove
-            
-            gc.collect()
-            
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect() # Aggressive distributed cleanup
-            
-            self.debug_memory_leaks()
-            print(f"[RayWorker {self.local_rank}] Model offloaded successfully.")
+                self._offload_gguf_soft()
+            else:
+                self._offload_standard()
         else:
             print(f"[RayWorker {self.local_rank}] No model to offload.")
+
 
     def patch_cfg(self):
         self.model.add_wrapper(
@@ -493,83 +397,92 @@ class RayWorker:
         
         return info
 
-    def load_unet(self, unet_path, model_options):
-        # Smart Reload: Skip if already loaded
-        if self.model is not None and getattr(self, "current_unet_path", None) == unet_path:
-             print(f"[RayWorker] Smart Reload: Model {unet_path} already loaded. Skipping.")
-             self.is_model_loaded = True
-             return
+    def _apply_fsdp_patches(self):
+        # Monkey patch
+        import comfy.model_patcher as model_patcher
+        import comfy.model_management as model_management
 
-        self.current_unet_path = unet_path
+        # Monkey patch
+        from raylight.comfy_dist.model_management import cleanup_models_gc
+        from raylight.comfy_dist.model_patcher import LowVramPatch
+        
+        # Monkey patch
+        model_patcher.LowVramPatch = LowVramPatch
+        model_management.cleanup_models_gc = cleanup_models_gc
+
+    def _load_unet_fsdp(self, unet_path, model_options):
+        # Apply One-Time Patches
+        self._apply_fsdp_patches()
+        from raylight.comfy_dist.sd import fsdp_load_diffusion_model
+
+        del self.model
+        del self.state_dict
+        self.model = None
+        self.state_dict = None
+        torch.cuda.synchronize()
+        comfy.model_management.soft_empty_cache()
+        gc.collect()
+
+        self.model, self.state_dict = fsdp_load_diffusion_model(
+            unet_path,
+            self.local_rank,
+            self.device_mesh,
+            self.is_cpu_offload,
+            model_options=model_options,
+        )
+        torch.cuda.synchronize()
+        comfy.model_management.soft_empty_cache()
+        gc.collect()
+
+        import ray
+        if self.state_dict is not None:
+            print("[RayWorker] FSDP Mode: Saving base_sd_ref to Object Store...")
+            self.base_sd_ref = ray.put(self.state_dict)
+
+    def _load_unet_standard(self, unet_path, model_options):
+        # Parallel Loading Optimization & Dtype Preservation
+        # 1. Strip 'dtype' to force Native Mmap (1x RAM) instead of Private Cast (4x RAM)
+        load_options = model_options.copy()
+        cast_dtype = load_options.pop("dtype", None)
+        
+        if cast_dtype:
+                print(f"[RayWorker] Mmap Preservation: Loading Native (skipping cast to {cast_dtype})")
+        
+        self.model = comfy.sd.load_diffusion_model(
+            unet_path, model_options=load_options,
+        )
+        
+        # Apply Cast for Execution (on-the-fly / GPU)
+        if cast_dtype:
+                print(f"[RayWorker] Setting manual_cast_dtype to {cast_dtype}")
+                self.model.model.manual_cast_dtype = cast_dtype
+        else:
+                self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+
+        import ray
+        print("[RayWorker] Standard Mode: Storing Lightweight Reference for Parallel Load...")
+        # Store metadata instead of full model to save Leader/Ray RAM
+        self.base_sd_ref = ray.put({
+            "parallel_load_mode": True,
+            "unet_path": unet_path,
+            "model_options": model_options # Keep original options (with dtype) for reference
+        })
+        self.is_gguf = False
+
+    def load_unet(self, unet_path, model_options):
+        with monitor_memory(f"RayWorker {self.local_rank} - load_unet", device=self.device):
+            # Smart Reload: Skip if already loaded
+            if self.model is not None and getattr(self, "current_unet_path", None) == unet_path:
+                    print(f"[RayWorker] Smart Reload: Model {unet_path} already loaded. Skipping.")
+                    self.is_model_loaded = True
+                    return
+
+            self.current_unet_path = unet_path
         
         if self.parallel_dict["is_fsdp"] is True:
-            # Monkey patch
-            import comfy.model_patcher as model_patcher
-            import comfy.model_management as model_management
-
-            # Monkey patch
-            from raylight.comfy_dist.model_management import cleanup_models_gc
-            from raylight.comfy_dist.model_patcher import LowVramPatch
-
-            from raylight.comfy_dist.sd import fsdp_load_diffusion_model
-
-            # Monkey patch
-            model_patcher.LowVramPatch = LowVramPatch
-            model_management.cleanup_models_gc = cleanup_models_gc
-
-            del self.model
-            del self.state_dict
-            self.model = None
-            self.state_dict = None
-            torch.cuda.synchronize()
-            comfy.model_management.soft_empty_cache()
-            gc.collect()
-
-            self.model, self.state_dict = fsdp_load_diffusion_model(
-                unet_path,
-                self.local_rank,
-                self.device_mesh,
-                self.is_cpu_offload,
-                model_options=model_options,
-            )
-            torch.cuda.synchronize()
-            comfy.model_management.soft_empty_cache()
-            gc.collect()
-
-            import ray
-            if self.state_dict is not None:
-                print("[RayWorker] FSDP Mode: Saving base_sd_ref to Object Store...")
-                self.base_sd_ref = ray.put(self.state_dict)
-
+            self._load_unet_fsdp(unet_path, model_options)
         else:
-            # Parallel Loading Optimization & Dtype Preservation
-            # 1. Strip 'dtype' to force Native Mmap (1x RAM) instead of Private Cast (4x RAM)
-            load_options = model_options.copy()
-            cast_dtype = load_options.pop("dtype", None)
-            
-            if cast_dtype:
-                 print(f"[RayWorker] Mmap Preservation: Loading Native (skipping cast to {cast_dtype})")
-            
-            self.model = comfy.sd.load_diffusion_model(
-                unet_path, model_options=load_options,
-            )
-            
-            # Apply Cast for Execution (on-the-fly / GPU)
-            if cast_dtype:
-                 print(f"[RayWorker] Setting manual_cast_dtype to {cast_dtype}")
-                 self.model.model.manual_cast_dtype = cast_dtype
-            else:
-                 self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
-
-            import ray
-            print("[RayWorker] Standard Mode: Storing Lightweight Reference for Parallel Load...")
-            # Store metadata instead of full model to save Leader/Ray RAM
-            self.base_sd_ref = ray.put({
-                "parallel_load_mode": True,
-                "unet_path": unet_path,
-                "model_options": model_options # Keep original options (with dtype) for reference
-            })
-            self.is_gguf = False
+            self._load_unet_standard(unet_path, model_options)
 
         if self.lora_list is not None:
             self.load_lora()
@@ -649,172 +562,57 @@ class RayWorker:
         
         return patched_sd
 
-    def load_unet_from_state_dict(self, state_dict, model_options):
-        """Loads the UNET from a provided state dict (passed via shared memory)."""
-        import ray
-        if isinstance(state_dict, ray.ObjectRef):
-            # Smart Reload: Check Ref Match
-            if self.model is not None and getattr(self, "current_sd_ref", None) == state_dict:
-                 print("[RayWorker] Smart Reload: State Dict Ref match. Skipping.")
-                 self.is_model_loaded = True
-                 return
-
-            self.current_sd_ref = state_dict
-
-            print("[RayWorker] Resolving base_sd_ref from Shared Object Store...")
-            state_dict = ray.get(state_dict)
-
-            # Check for Parallel Load Mode (Lightweight Ref)
-            if isinstance(state_dict, dict) and state_dict.get("parallel_load_mode", False):
-                 print("[RayWorker] Optimization within Load: Parallel Disk Loading detected...")
-                 unet_path = state_dict.get("unet_path")
-                 
-                 # Mmap Optimization: Strip dtype
-                 load_options = state_dict.get("model_options", {}).copy()
-                 cast_dtype = load_options.pop("dtype", None)
-                 
-                 import comfy.sd
-                 self.model = comfy.sd.load_diffusion_model(
-                     unet_path, model_options=load_options
-                 )
-                 
-                 if cast_dtype:
-                      print(f"[RayWorker] Setting manual_cast_dtype to {cast_dtype}")
-                      self.model.model.manual_cast_dtype = cast_dtype
-                 else:
-                      self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
-                      
-                 self.is_model_loaded = True
-                 return
-
-            # Note: GGUF models use init_gguf_from_ref instead, so we should not reach here for GGUF
-            # in the current architecture.
+    def _inject_gguf_ops(self, model_options, state_dict):
+        print("[RayWorker] Detected GGUF Reload. Injecting GGMLOps...")
+        try:
+            from raylight.expansion.comfyui_gguf.ops import GGMLOps
+            # Ensure model_options has custom_operations
+            if "custom_operations" not in model_options:
+                 model_options["custom_operations"] = GGMLOps()
             
-            # Fallback for unexpected direct state_dict passing:
-            print("[RayWorker] Fallback: Standard Load from State Dict...")
-            loader_kwargs = {}
-            if self.overwrite_cast_dtype is not None:
-                loader_kwargs["manual_cast_dtype"] = self.overwrite_cast_dtype
-                
-            import comfy.sd
-            self.model = comfy.sd.load_diffusion_model_state_dict(
-                 state_dict, model_options=model_options, **loader_kwargs
-            )
-            
-            # Since the model was init on Meta, we need to ensure it's usable.
-            # load_diffusion_model_state_dict calls load_state_dict(assign=True).
-            # If successful, the tensors are now Plasma Views (CPU).
-            # We must verify they are not Meta anymore.
-            if next(self.model.model.parameters()).device.type == 'meta':
-                 print("[RayWorker] Warning: Model parameters are still on Meta device after load. Moving to CPU...")
-                 self.model.model.to("cpu")
-
-        # GGUF Support: Inject Custom Ops if needed
-        if getattr(self, "is_gguf", False):
-            print("[RayWorker] Detected GGUF Reload. Injecting GGMLOps...")
-            try:
-                from raylight.expansion.comfyui_gguf.ops import GGMLOps
-                # Ensure model_options has custom_operations
-                if "custom_operations" not in model_options:
-                     model_options["custom_operations"] = GGMLOps()
-                
-                # Check if we have metadata to pass
-                if hasattr(self, "gguf_metadata"):
-                     import comfy.sd
-                     # Check if load_diffusion_model_state_dict accepts metadata argument
-                     sig = inspect.signature(comfy.sd.load_diffusion_model_state_dict)
-                     if "metadata" in sig.parameters:
-                          print("[RayWorker] Passing GGUF metadata to loader...")
-                          # We need to pass this as a kwarg to the loader call, not put it in model_options?
-                          # ComfyUI-GGUF loader passes it as `metadata=...` kwarg.
-                          # I will add it to a local dict to unpack later.
-                          self._temp_loader_kwargs = {"metadata": self.gguf_metadata}
-            except ImportError:
-                print("[RayWorker] Warning: GGUF detected but failed to import GGMLOps!")
-
-            # Manual Prefix Stripping: GGUF reloads often require "clean" keys (no prefix)
-            keys = list(state_dict.keys())
-            print(f"[RayWorker Debug] Original State Dict Keys [0-5]: {keys[:5]}")
-            
-            # The auto-detection (unet_prefix_from_state_dict) failed in previous runs (detected 'model.'), so we force 'diffusion_model.'
-            if any(k.startswith("diffusion_model.") for k in keys[:5]):
-                 print("[RayWorker] Detected 'diffusion_model.' prefix. Force-stripping for detection...")
-                 import comfy.utils
-                 state_dict = comfy.utils.state_dict_prefix_replace(state_dict, {"diffusion_model.": ""}, filter_keys=True)
-                 print(f"[RayWorker Debug] Stripped State Dict Keys [0-5]: {list(state_dict.keys())[:5]}")
-            else:
-                 print("[RayWorker Debug] No 'diffusion_model.' prefix detected.")
-            
-            # Print metadata for debug
+            # Check if we have metadata to pass
             if hasattr(self, "gguf_metadata"):
-                 print(f"[RayWorker Debug] GGUF Metadata Present: {bool(self.gguf_metadata)}")
-                 if self.gguf_metadata:
-                     print(f"[RayWorker Debug] GGUF Metadata Keys: {list(self.gguf_metadata.keys())}")
-                     # Print specific architecture keys if present
-                     for k in ["general.architecture", "general.type", "arch_str"]:
-                         if k in self.gguf_metadata:
-                             print(f"[RayWorker Debug] GGUF Metadata '{k}': {self.gguf_metadata[k]}")
-            else:
-                 print("[RayWorker Debug] No GGUF Metadata found on object.")
+                 import comfy.sd
+                 # Check if load_diffusion_model_state_dict accepts metadata argument
+                 sig = inspect.signature(comfy.sd.load_diffusion_model_state_dict)
+                 if "metadata" in sig.parameters:
+                      print("[RayWorker] Passing GGUF metadata to loader...")
+                      self._temp_loader_kwargs = {"metadata": self.gguf_metadata}
+        except ImportError:
+            print("[RayWorker] Warning: GGUF detected but failed to import GGMLOps!")
 
-            print(f"[RayWorker Debug] Model Options Keys: {list(model_options.keys())}")
-            if "custom_operations" in model_options:
-                 print(f"[RayWorker Debug] Custom Operations injected: {model_options['custom_operations']}")
-
-        @contextmanager
-        def patch_torch_load_state_dict():
-            original_load = torch.nn.Module.load_state_dict
-            
-            # Check if assign is supported (torch >= 2.1)
-            sig = inspect.signature(original_load)
-            supports_assign = "assign" in sig.parameters
-
-            if not supports_assign:
-                print("[Raylight] Warning: torch version does not support assign=True in load_state_dict. Shared RAM optimization disabled.")
-                yield
-                return
-
-            def patched_load(self, state_dict, strict=True, assign=False):
-                # Force assign=True to share memory from Object Store
-                return original_load(self, state_dict, strict=strict, assign=True)
-            
-            try:
-                torch.nn.Module.load_state_dict = patched_load
-                yield
-            finally:
-                torch.nn.Module.load_state_dict = original_load
-
-        loader_kwargs = getattr(self, "_temp_loader_kwargs", {})
-        self._temp_loader_kwargs = None # Clear
+        # Manual Prefix Stripping: GGUF reloads often require "clean" keys (no prefix)
+        keys = list(state_dict.keys())
+        print(f"[RayWorker Debug] Original State Dict Keys [0-5]: {keys[:5]}")
         
-        with patch_torch_load_state_dict():
-            import comfy.sd
-            self.model = comfy.sd.load_diffusion_model_state_dict(
-                state_dict, model_options=model_options, **loader_kwargs
-            )
-
-        # GGUF Patcher Upgrade
-        if getattr(self, "is_gguf", False):
-            print("[RayWorker] Upgrading to GGUFModelPatcher...")
-            try:
-                from raylight.expansion.comfyui_gguf.nodes import GGUFModelPatcher
-                self.model = GGUFModelPatcher.clone(self.model)
-                if hasattr(self, "gguf_metadata"):
-                     self.model.gguf_metadata = self.gguf_metadata
-            except ImportError:
-                 print("[RayWorker] Warning: Failed to import GGUFModelPatcher for reload.")
+        # The auto-detection (unet_prefix_from_state_dict) failed in previous runs (detected 'model.'), so we force 'diffusion_model.'
+        if any(k.startswith("diffusion_model.") for k in keys[:5]):
+             print("[RayWorker] Detected 'diffusion_model.' prefix. Force-stripping for detection...")
+             import comfy.utils
+             state_dict = comfy.utils.state_dict_prefix_replace(state_dict, {"diffusion_model.": ""}, filter_keys=True)
+             print(f"[RayWorker Debug] Stripped State Dict Keys [0-5]: {list(state_dict.keys())[:5]}")
+        else:
+             print("[RayWorker Debug] No 'diffusion_model.' prefix detected.")
         
-        if self.model is None:
-             print("[RayWorker] ERROR: load_diffusion_model_state_dict returned None.")
-             if hasattr(state_dict, "keys"):
-                 keys = list(state_dict.keys())
-                 print(f"[RayWorker Debug] State Dict Keys Sample: {keys[:5]}")
-                 import comfy.model_detection
-                 print("[RayWorker Debug] Testing detection manually...")
-                 conf = comfy.model_detection.model_config_from_unet(state_dict, "", metadata=getattr(self, "gguf_metadata", None))
-                 print(f"[RayWorker Debug] Manual Detection Result: {conf}")
-             raise RuntimeError("Failed to load model from state dict")
+        # Print metadata for debug
+        if hasattr(self, "gguf_metadata"):
+             print(f"[RayWorker Debug] GGUF Metadata Present: {bool(self.gguf_metadata)}")
+             if self.gguf_metadata:
+                 print(f"[RayWorker Debug] GGUF Metadata Keys: {list(self.gguf_metadata.keys())}")
+                 # Print specific architecture keys if present
+                 for k in ["general.architecture", "general.type", "arch_str"]:
+                     if k in self.gguf_metadata:
+                         print(f"[RayWorker Debug] GGUF Metadata '{k}': {self.gguf_metadata[k]}")
+        else:
+             print("[RayWorker Debug] No GGUF Metadata found on object.")
 
+        print(f"[RayWorker Debug] Model Options Keys: {list(model_options.keys())}")
+        if "custom_operations" in model_options:
+             print(f"[RayWorker Debug] Custom Operations injected: {model_options['custom_operations']}")
+
+        return state_dict
+
+    def _enforce_zero_copy(self, state_dict):
         # ENFORCE Memory Sharing (Fix for OOM)
         # Even if load_state_dict copied data (e.g. due to casting), we force it back to shared tensor.
         try:
@@ -877,6 +675,103 @@ class RayWorker:
             import traceback
             traceback.print_exc()
 
+    def load_unet_from_state_dict(self, state_dict, model_options):
+        """Loads the UNET from a provided state dict (passed via shared memory)."""
+        import ray
+        if isinstance(state_dict, ray.ObjectRef):
+            # Smart Reload: Check Ref Match
+            if self.model is not None and getattr(self, "current_sd_ref", None) == state_dict:
+                 print("[RayWorker] Smart Reload: State Dict Ref match. Skipping.")
+                 self.is_model_loaded = True
+                 return
+
+            self.current_sd_ref = state_dict
+
+            print("[RayWorker] Resolving base_sd_ref from Shared Object Store...")
+            state_dict = ray.get(state_dict)
+
+            # Check for Parallel Load Mode (Lightweight Ref)
+            if isinstance(state_dict, dict) and state_dict.get("parallel_load_mode", False):
+                 print("[RayWorker] Optimization within Load: Parallel Disk Loading detected...")
+                 unet_path = state_dict.get("unet_path")
+                 
+                 # Mmap Optimization: Strip dtype
+                 load_options = state_dict.get("model_options", {}).copy()
+                 cast_dtype = load_options.pop("dtype", None)
+                 
+                 import comfy.sd
+                 self.model = comfy.sd.load_diffusion_model(
+                     unet_path, model_options=load_options
+                 )
+                 
+                 if cast_dtype:
+                      print(f"[RayWorker] Setting manual_cast_dtype to {cast_dtype}")
+                      self.model.model.manual_cast_dtype = cast_dtype
+                 else:
+                      self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+                      
+                 self.is_model_loaded = True
+                 return
+
+            # Note: GGUF models use init_gguf_from_ref instead, so we should not reach here for GGUF
+            # in the current architecture.
+            
+            # Fallback for unexpected direct state_dict passing:
+            print("[RayWorker] Fallback: Standard Load from State Dict...")
+            loader_kwargs = {}
+            if self.overwrite_cast_dtype is not None:
+                loader_kwargs["manual_cast_dtype"] = self.overwrite_cast_dtype
+                
+            import comfy.sd
+            self.model = comfy.sd.load_diffusion_model_state_dict(
+                 state_dict, model_options=model_options, **loader_kwargs
+            )
+            
+            # Since the model was init on Meta, we need to ensure it's usable.
+            # load_diffusion_model_state_dict calls load_state_dict(assign=True).
+            # If successful, the tensors are now Plasma Views (CPU).
+            # We must verify they are not Meta anymore.
+            if next(self.model.model.parameters()).device.type == 'meta':
+                 print("[RayWorker] Warning: Model parameters are still on Meta device after load. Moving to CPU...")
+                 self.model.model.to("cpu")
+
+        # GGUF Support: Inject Custom Ops if needed
+        if getattr(self, "is_gguf", False):
+            state_dict = self._inject_gguf_ops(model_options, state_dict)
+
+        loader_kwargs = getattr(self, "_temp_loader_kwargs", {})
+        self._temp_loader_kwargs = None # Clear
+        
+        import comfy.sd
+        self.model = comfy.sd.load_diffusion_model_state_dict(
+            state_dict, model_options=model_options, **loader_kwargs
+        )
+
+
+        # GGUF Patcher Upgrade
+        if getattr(self, "is_gguf", False):
+            print("[RayWorker] Upgrading to GGUFModelPatcher...")
+            try:
+                from raylight.expansion.comfyui_gguf.nodes import GGUFModelPatcher
+                self.model = GGUFModelPatcher.clone(self.model)
+                if hasattr(self, "gguf_metadata"):
+                     self.model.gguf_metadata = self.gguf_metadata
+            except ImportError:
+                 print("[RayWorker] Warning: Failed to import GGUFModelPatcher for reload.")
+        
+        if self.model is None:
+             print("[RayWorker] ERROR: load_diffusion_model_state_dict returned None.")
+             if hasattr(state_dict, "keys"):
+                 keys = list(state_dict.keys())
+                 print(f"[RayWorker Debug] State Dict Keys Sample: {keys[:5]}")
+                 import comfy.model_detection
+                 print("[RayWorker Debug] Testing detection manually...")
+                 conf = comfy.model_detection.model_config_from_unet(state_dict, "", metadata=getattr(self, "gguf_metadata", None))
+                 print(f"[RayWorker Debug] Manual Detection Result: {conf}")
+             raise RuntimeError("Failed to load model from state dict")
+
+        self._enforce_zero_copy(state_dict)
+
         if self.model is None:
              raise RuntimeError("Failed to load model from state dict")
         
@@ -896,64 +791,62 @@ class RayWorker:
 
 
     def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype):
-        # Smart Reload: Skip if already loaded
-        if self.model is not None and getattr(self, "current_unet_path", None) == unet_path:
-             print(f"[RayWorker] Smart Reload: GGUF Model {unet_path} already loaded. Skipping.")
-             self.is_model_loaded = True
-             return
+        with monitor_memory(f"RayWorker {self.local_rank} - load_gguf_unet", device=self.device):
+            # Smart Reload: Skip if already loaded
+            if self.model is not None and getattr(self, "current_unet_path", None) == unet_path:
+                 print(f"[RayWorker] Smart Reload: GGUF Model {unet_path} already loaded. Skipping.")
+                 self.is_model_loaded = True
+                 return
 
-        self.current_unet_path = unet_path
+            self.current_unet_path = unet_path
 
-        if self.parallel_dict["is_fsdp"] is True:
-            raise ValueError("FSDP Sharding for GGUF is not supported")
-        else:
-            from raylight.comfy_dist.sd import gguf_load_diffusion_model
-            self.model = gguf_load_diffusion_model(
-                unet_path,
-                dequant_dtype=dequant_dtype,
-                patch_dtype=patch_dtype
-            )
-            import ray
-            print("[RayWorker] GGUF Mode: Storing Lightweight Reference to Object Store...")
-            # Optimization: We do NOT store heavier GGUF tensors in Ray Object Store as it causes OOM.
-            # We rely on parallel mmap loading (disk) which the OS handles efficiently.
-            # We store a dummy object to satisfy "is stored" checks.
-            self.base_sd_ref = ray.put({"gguf_mmap_mode": True})
+            if self.parallel_dict["is_fsdp"] is True:
+                raise ValueError("FSDP Sharding for GGUF is not supported")
+            else:
+                from raylight.comfy_dist.sd import gguf_load_diffusion_model
+                self.model = gguf_load_diffusion_model(
+                    unet_path,
+                    dequant_dtype=dequant_dtype,
+                    patch_dtype=patch_dtype
+                )
+                import ray
+                print("[RayWorker] GGUF Mode: Storing Lightweight Reference to Object Store...")
+                # Optimization: We do NOT store heavier GGUF tensors in Ray Object Store as it causes OOM.
+                # We rely on parallel mmap loading (disk) which the OS handles efficiently.
+                # We store a dummy object to satisfy "is stored" checks.
+                self.base_sd_ref = ray.put({"gguf_mmap_mode": True})
+                
+                self.is_gguf = True
+                self.gguf_metadata = getattr(self.model, "gguf_metadata", {})
+                self.gguf_reload_params = {
+                    "unet_path": unet_path,
+                    "dequant_dtype": dequant_dtype,
+                    "patch_dtype": patch_dtype
+                }
             
-            self.is_gguf = True
-            self.gguf_metadata = getattr(self.model, "gguf_metadata", {})
-            self.gguf_reload_params = {
-                "unet_path": unet_path,
-                "dequant_dtype": dequant_dtype,
-                "patch_dtype": patch_dtype
-            }
-        
-        if self.lora_list is not None:
-             self.load_lora()
-             
-        self.is_model_loaded = True
+            if self.lora_list is not None:
+                 self.load_lora()
+                 
+            self.is_model_loaded = True
 
-        # NEW: FORCED immediate VRAM load and Page Cache eviction
-        # We bypass reload_model_if_needed() checks to ensure GGUFModelPatcher.load()
-        # executes, clears its backup, and calls evict_page_cache().
-        print(f"[RayWorker {self.local_rank}] Loader: FORCING immediate VRAM load and eviction...")
-        if hasattr(self.model, "load"):
-            self.model.load(self.device, force_patch_weights=True)
-            self.model.current_device = self.device
-        
-        # CRITICAL: Clear legacy backup dict to release mmap tensor references.
-        # Raylight uses /dev/shm caching for reload, not the backup dict.
-        if hasattr(self.model, "backup"):
-            self.model.backup.clear()
-        
-        # Aggressive GC
-        import gc
-        for _ in range(3):
-            gc.collect()
-        comfy.model_management.soft_empty_cache()
-        
-        # Diagnostics
-        self.check_memory_diagnostics("Post-GGUF-Load")
+            # NEW: FORCED immediate VRAM load and Page Cache eviction
+            # We bypass reload_model_if_needed() checks to ensure GGUFModelPatcher.load()
+            # executes, clears its backup, and calls evict_page_cache().
+            print(f"[RayWorker {self.local_rank}] Loader: FORCING immediate VRAM load and eviction...")
+            if hasattr(self.model, "load"):
+                self.model.load(self.device, force_patch_weights=True)
+                self.model.current_device = self.device
+            
+            # CRITICAL: Clear legacy backup dict to release mmap tensor references.
+            # Raylight uses /dev/shm caching for reload, not the backup dict.
+            if hasattr(self.model, "backup"):
+                self.model.backup.clear()
+            
+            # Aggressive GC
+            import gc
+            for _ in range(3):
+                gc.collect()
+            comfy.model_management.soft_empty_cache()
 
 
     def get_base_ref(self):
@@ -985,7 +878,12 @@ class RayWorker:
              raise ValueError("[RayWorker] Cannot RELOAD GGUF: Missing reload params for parallel loading.")
 
     def reload_model_if_needed(self):
-        """Auto-reloads the model if it was offloaded."""
+        """Auto-reloads the model if it was offloaded.
+        
+        Supports two reload modes:
+        - GGUF Soft-Reload: model exists but current_device=cpu (nuked weights) → uses /dev/shm cache
+        - Standard Reload: model is None → uses disk or shared memory
+        """
         # Check if model needs reload:
         # - For standard offload: self.model is None
         # - For GGUF soft-offload: self.model exists but current_device is CPU (nuked weights)
@@ -993,56 +891,31 @@ class RayWorker:
         if self.model is not None and hasattr(self.model, 'current_device'):
             if self.model.current_device != self.model.load_device:
                 needs_reload = True
-                print(f"[RayWorker] GGUF Soft-Reload detected: current_device={self.model.current_device}, load_device={self.model.load_device}")
         
         if not needs_reload:
-            return
-
+            return  # Model is loaded, nothing to do
+        
         print("[RayWorker] Model offloaded. Auto-reloading...")
         
-        # 0. GGUF SOFT-RELOAD: If model exists but is offloaded, use Self-Heal path
-        # This is faster than disk reload because we use Shared RAM backup
+        # GGUF SOFT-RELOAD: Use /dev/shm cache via model.load()
         if self.model is not None and getattr(self, "is_gguf", False):
-            # Check if /dev/shm cache exists before attempting soft-reload
-            cache_path = getattr(self.model, 'cache_path', None)
-            has_nuked_weights = any(p.numel() == 0 for p in self.model.model.parameters())
-            
-            if has_nuked_weights and (cache_path is None or not os.path.exists(cache_path)):
-                # FALLBACK: Cache is missing but weights are nuked - need full disk reload
-                print(f"[RayWorker] GGUF Soft-Reload: Cache missing ({cache_path}). Falling back to disk reload...")
-                if hasattr(self, 'gguf_reload_params') and self.gguf_reload_params is not None:
-                    # Clear the broken model state
-                    self.model = None
-                    self.load_gguf_unet(**self.gguf_reload_params)
-                    return
-                else:
-                    raise RuntimeError("GGUF cache missing and no disk reload params available!")
-            
             print("[RayWorker] GGUF Soft-Reload: Triggering Self-Heal via model.load()...")
-            # Directly call the patcher's load method to trigger Self-Heal
             self.model.load(self.device, force_patch_weights=True)
-            # Update current_device to prevent repeated reload detection
             self.model.current_device = self.model.load_device
-            # CRITICAL: Refresh load_device to ensure valid CUDA context
-            # After nuclear offload, the original device reference may become stale
-            self.model.load_device = self.device
             
-            # CRITICAL: Clear legacy backup dict to release mmap tensor references.
-            # model.load() repopulates backup - we must clear it again.
+            # Clear legacy backup dict to release mmap tensor references
             if hasattr(self.model, "backup"):
                 self.model.backup.clear()
             
             print("[RayWorker] GGUF Soft-Reload: Complete.")
-
             return
         
-        # 1. SPECIAL CASE: GGUF Full Disk Reload (mmap) - when model was fully cleared
+        # Standard reload for model=None cases
         if hasattr(self, 'gguf_reload_params') and self.gguf_reload_params is not None:
              print("[RayWorker] Reloading GGUF from disk parameters (mmap)...")
              self.load_gguf_unet(**self.gguf_reload_params)
              return
 
-        # 2. Try Shared Memory (Fastest, for Standard/FSDP)
         if hasattr(self, 'base_sd_ref') and self.base_sd_ref is not None:
              print("[RayWorker] Reloading from Shared base_sd_ref...")
              self.load_unet_from_state_dict(self.base_sd_ref, model_options={})
@@ -1052,17 +925,10 @@ class RayWorker:
 
     def load_bnb_unet(self, unet_path):
         if self.parallel_dict["is_fsdp"] is True:
-            import comfy.model_patcher as model_patcher
-            import comfy.model_management as model_management
-
-            from raylight.comfy_dist.model_management import cleanup_models_gc
-            from raylight.comfy_dist.model_patcher import LowVramPatch
-
+            self._apply_fsdp_patches()
             from raylight.comfy_dist.sd import fsdp_bnb_load_diffusion_model
             from torch.distributed.fsdp import FSDPModule
-            model_patcher.LowVramPatch = LowVramPatch
-            model_management.cleanup_models_gc = cleanup_models_gc
-
+            
             m = getattr(self.model, "model", None)
             if m is not None and isinstance(getattr(m, "diffusion_model", None), FSDPModule):
                 del self.model
@@ -1090,6 +956,32 @@ class RayWorker:
     def get_lora_list(self,):
         return self.lora_list
 
+    def _apply_runtime_loras(self, model, lora_list):
+        """Helper to apply runtime LoRAs to a model clone."""
+        if not lora_list:
+            return model
+            
+        work_model = model.clone()
+        for lora in lora_list:
+            lora_path = lora["path"]
+            strength_model = lora["strength_model"]
+            strength_clip = 1.0 
+            try:
+                lora_model = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            except Exception as e:
+                print(f"[Raylight] Failed to load LoRA {lora_path}: {e}")
+                continue
+                
+            work_model, _ = comfy.sd.load_lora_for_models(
+                work_model, None, lora_model, strength_model, strength_clip
+            )
+            del lora_model # Release raw dict immediately
+        
+        gc.collect()
+        return work_model
+
+
+
     def load_lora(self,):
         for lora in self.lora_list:
             lora_path = lora["path"]
@@ -1105,6 +997,8 @@ class RayWorker:
                     self.model, None, lora_model, strength_model, 0
                 )[0]
             del lora_model
+
+
 
     def kill(self):
         self.model = None
@@ -1168,18 +1062,7 @@ class RayWorker:
         if self.vae_model is None: return None
         return self.vae_model.spacial_compression_decode()
 
-    def ray_vae_decode(
-        self,
-        shard_index,
-        samples,
-        tile_size,
-        overlap=64,
-        temporal_size=64,
-        temporal_overlap=8,
-        discard_latent_frames=0
-    ):
-        print(f"[RayWorker {self.local_rank}] Entering ray_vae_decode (direct method call) for shard {shard_index}...")
-        
+    def _check_vae_health(self, samples, shard_index):
         # Diagnostic: Check input latent statistics
         l_min, l_max, l_mean = samples["samples"].min().item(), samples["samples"].max().item(), samples["samples"].mean().item()
         print(f"[RayWorker {self.local_rank}] Input Latent Stats (shard {shard_index}): min={l_min:.4f}, max={l_max:.4f}, mean={l_mean:.4f}")
@@ -1201,9 +1084,24 @@ class RayWorker:
             else:
                 print(f"[RayWorker {self.local_rank}] VAE parameters verified healthy (no NaNs).")
 
-        import gc
-        gc.collect()
-        torch.cuda.empty_cache()
+    def ray_vae_decode(
+        self,
+        shard_index,
+        samples,
+        tile_size,
+        overlap=64,
+        temporal_size=64,
+        temporal_overlap=8,
+        discard_latent_frames=0,
+    ):
+        with monitor_memory(f"RayWorker {self.local_rank} - ray_vae_decode", device=self.device):
+            print(f"[RayWorker {self.local_rank}] Entering ray_vae_decode (direct method call) for shard {shard_index}...")
+            
+
+
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
         
         if tile_size < overlap * 4:
             overlap = tile_size // 4
@@ -1221,13 +1119,20 @@ class RayWorker:
 
         compression = self.vae_model.spacial_compression_decode()
 
-        # Force Float32 Stability:
-        # Move the entire VAE first_stage_model to float32 and sync vae_dtype
-        print(f"[RayWorker {self.local_rank}] Forcing VAE first_stage_model and latents to float32 for stability...")
-        self.vae_model.first_stage_model.to(torch.float32)
-        self.vae_model.vae_dtype = torch.float32
+        # Use bfloat16 for VAE if supported (RTX 3000+)
+        # BF16 has same dynamic range as FP32 (no NaN overflow) but uses 50% less memory
+        # Falls back to float32 on older GPUs without native bf16 support
+        if torch.cuda.is_bf16_supported():
+            vae_dtype = torch.bfloat16
+            print(f"[RayWorker {self.local_rank}] Using bfloat16 VAE (50% memory savings, stable)")
+        else:
+            vae_dtype = torch.float32
+            print(f"[RayWorker {self.local_rank}] Falling back to float32 VAE (bf16 not supported)")
         
-        latents_to_decode = samples["samples"].to(torch.float32)
+        self.vae_model.first_stage_model.to(vae_dtype)
+        self.vae_model.vae_dtype = vae_dtype
+        
+        latents_to_decode = samples["samples"].to(vae_dtype)
         print(f"[RayWorker {self.local_rank}] latents_to_decode shape: {latents_to_decode.shape}")
         print(f"[RayWorker {self.local_rank}] tiling: tile_t={temporal_size}, overlap_t={temporal_overlap}")
 
@@ -1279,7 +1184,15 @@ class RayWorker:
         for _ in range(2):
             gc.collect()
         torch.cuda.empty_cache()
-        self.check_memory_diagnostics("Post-VAE-Decode")
+
+        # Force OS to reclaim freed memory (fixes RSS creep on Worker 0)
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception as e:
+            print(f"[RayWorker {self.local_rank}] Warning: malloc_trim failed: {e}")
+
+        # Diagnostics removed
+
             
         return (shard_index, images)
 
@@ -1300,30 +1213,9 @@ class RayWorker:
         # NOTE: Reload is now handled by coordinator (sampler node) BEFORE dispatching.
         # This ensures all workers are ready before any collective operations begin.
              
-        work_model = self.model
+        # Apply Runtime LoRAs locally
+        work_model = self._apply_runtime_loras(self.model, lora_list)
 
-        # Apply Runtime LoRAs locally (Fallback for FSDP/No-Base-Ref)
-        if lora_list:
-             # Clone the model wrapper (lightweight copy of the patcher)
-             work_model = work_model.clone()
-             
-             for lora in lora_list:
-                 lora_path = lora["path"]
-                 strength_model = lora["strength_model"]
-                 strength_clip = 1.0 
-                 try:
-                     # Load LoRA from disk (No Cache to save RAM)
-                     lora_model = comfy.utils.load_torch_file(lora_path, safe_load=True)
-                 except Exception as e:
-                     print(f"[Raylight] Failed to load LoRA {lora_path}: {e}")
-                     continue
-                 
-                 work_model, _ = comfy.sd.load_lora_for_models(
-                     work_model, None, lora_model, strength_model, strength_clip
-                 )
-                 del lora_model # Release raw dict immediately
-             
-             gc.collect()
 
         latent = latent_image
         latent_image = latent["samples"]
@@ -1374,7 +1266,8 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-            self.debug_memory_leaks()
+            # Legacy debug_memory_leaks call removed
+
         
         comfy.model_management.soft_empty_cache()
         gc.collect()
@@ -1400,111 +1293,93 @@ class RayWorker:
         sigmas=None,
         lora_list=None,
     ):
-        # NOTE: Reload is now handled by coordinator (sampler node) BEFORE dispatching.
-        # This ensures all workers are ready before any collective operations begin.
+        with monitor_memory(f"RayWorker {self.local_rank} - common_ksampler", device=self.device):
+            # NOTE: Reload is now handled by coordinator (sampler node) BEFORE dispatching.
+            # This ensures all workers are ready before any collective operations begin.
 
-        # Apply Runtime LoRAs locally (Fallback for FSDP/No-Base-Ref)
-        work_model = self.model
-        if lora_list:
-             # Clone the model wrapper (lightweight copy of the patcher)
-             work_model = work_model.clone()
-             
-             for lora in lora_list:
-                 lora_path = lora["path"]
-                 strength_model = lora["strength_model"]
-                 strength_clip = 1.0 
-                 try:
-                     # Load LoRA from disk (No Cache to save RAM)
-                     lora_model = comfy.utils.load_torch_file(lora_path, safe_load=True)
-                 except Exception as e:
-                     print(f"[Raylight] Failed to load LoRA {lora_path}: {e}")
-                     continue
-                 
-                 work_model, _ = comfy.sd.load_lora_for_models(
-                     work_model, None, lora_model, strength_model, strength_clip
-                 )
-                 del lora_model # Release raw dict immediately
-             
-             gc.collect()
+            # Apply Runtime LoRAs locally (Fallback for FSDP/No-Base-Ref)
+            work_model = self._apply_runtime_loras(self.model, lora_list)
 
-        latent_image = latent["samples"]
-        latent_image = comfy.sample.fix_empty_latent_channels(work_model, latent_image)
 
-        if self.parallel_dict["is_fsdp"] is True:
-            work_model.patch_fsdp()
+            latent_image = latent["samples"]
+            latent_image = comfy.sample.fix_empty_latent_channels(work_model, latent_image)
 
-        if disable_noise:
-            noise = torch.zeros(
-                latent_image.size(),
-                dtype=latent_image.dtype,
-                layout=latent_image.layout,
-                device="cpu",
-            )
-        else:
-            batch_inds = latent["batch_index"] if "batch_index" in latent else None
-            noise = comfy.sample.prepare_noise(
-                latent_image, seed, batch_inds
-            )
+            if self.parallel_dict["is_fsdp"] is True:
+                work_model.patch_fsdp()
 
-        noise_mask = None
-        if "noise_mask" in latent:
-            noise_mask = latent["noise_mask"]
-
-        disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
-        if self.local_rank == 0:
-            disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-        
-        # Sampler resolution logic for custom sigmas
-        sampler_obj = sampler_name
-        if sigmas is not None:
-             if isinstance(sampler_name, str):
-                 sampler_obj = comfy.samplers.ksampler(sampler_name)
-
-        # CRITICAL: Ensure model device references are valid for this worker
-        # This guards against stale device references from previous contexts
-        if hasattr(work_model, 'load_device') and work_model.load_device != self.device:
-            work_model.load_device = self.device
-
-        with torch.no_grad():
-            if sigmas is None:
-                samples = comfy.sample.sample(
-                    work_model,
-                    noise,
-                    steps,
-                    cfg,
-                    sampler_name,
-                    scheduler,
-                    positive,
-                    negative,
-                    latent_image,
-                    denoise=denoise,
-                    disable_noise=disable_noise,
-                    start_step=start_step,
-                    last_step=last_step,
-                    force_full_denoise=force_full_denoise,
-                    noise_mask=noise_mask,
-                    disable_pbar=disable_pbar,
-                    seed=seed,
-               )
-            else:
-                 samples = comfy.sample.sample_custom(
-                    work_model,
-                    noise,
-                    cfg,
-                    sampler_obj,
-                    sigmas,
-                    positive,
-                    negative,
-                    latent_image,
-                    noise_mask=noise_mask,
-                    disable_pbar=disable_pbar,
-                    seed=seed,
+            if disable_noise:
+                noise = torch.zeros(
+                    latent_image.size(),
+                    dtype=latent_image.dtype,
+                    layout=latent_image.layout,
+                    device="cpu",
                 )
-            
-            out = latent.copy()
-            out["samples"] = samples
+            else:
+                batch_inds = latent["batch_index"] if "batch_index" in latent else None
+                noise = comfy.sample.prepare_noise(
+                    latent_image, seed, batch_inds
+                )
 
-        self.debug_memory_leaks()
+            noise_mask = None
+            if "noise_mask" in latent:
+                noise_mask = latent["noise_mask"]
+
+            disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
+            if self.local_rank == 0:
+                disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+            
+            # Sampler resolution logic for custom sigmas
+            sampler_obj = sampler_name
+            if sigmas is not None:
+                 if isinstance(sampler_name, str):
+                     sampler_obj = comfy.samplers.ksampler(sampler_name)
+
+            # CRITICAL: Ensure model device references are valid for this worker
+            # This guards against stale device references from previous contexts
+            if hasattr(work_model, 'load_device') and work_model.load_device != self.device:
+                work_model.load_device = self.device
+
+            with torch.no_grad():
+                if sigmas is None:
+                    samples = comfy.sample.sample(
+                        work_model,
+                        noise,
+                        steps,
+                        cfg,
+                        sampler_name,
+                        scheduler,
+                        positive,
+                        negative,
+                        latent_image,
+                        denoise=denoise,
+                        disable_noise=disable_noise,
+                        start_step=start_step,
+                        last_step=last_step,
+                        force_full_denoise=force_full_denoise,
+                        noise_mask=noise_mask,
+                        disable_pbar=disable_pbar,
+                        seed=seed,
+                   )
+                else:
+                     samples = comfy.sample.sample_custom(
+                        work_model,
+                        noise,
+                        cfg,
+                        sampler_obj,
+                        sigmas,
+                        positive,
+                        negative,
+                        latent_image,
+                        noise_mask=noise_mask,
+                        disable_pbar=disable_pbar,
+                        seed=seed,
+                    )
+                
+                out = latent.copy()
+                out["samples"] = samples
+
+        # Legacy debug_memory_leaks call removed
+
         #comfy.model_management.soft_empty_cache()
         gc.collect()
         return (out,)

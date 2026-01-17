@@ -22,6 +22,7 @@ from .distributed_worker.ray_worker import (
     ray_nccl_tester,
 )
 from .comfy_dist.utils import cancellable_get
+from .utils_memory import monitor_memory
 
 
 def _cleanup_raylight_shm_cache():
@@ -224,166 +225,167 @@ class RayInitializer:
         gpu_indices: str = "",
         skip_comm_test: bool = True,
     ):
-        # THIS IS PYTORCH DIST ADDRESS
-        # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
-        # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
-        if torch_dist_address != "None":
-            torch_host, torch_port = torch_dist_address.rsplit(":", 1)
-            os.environ.setdefault("MASTER_ADDR", torch_host)
-            os.environ.setdefault("MASTER_PORT", torch_port)
-        else:
-            torch_host, torch_port = "127.0.0.1", "29500"
-            os.environ.setdefault("MASTER_ADDR", torch_host)
-            os.environ.setdefault("MASTER_PORT", torch_port)
+        with monitor_memory("RayInitializer.spawn_actor"):
+            # THIS IS PYTORCH DIST ADDRESS
+            # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
+            # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
+            if torch_dist_address != "None":
+                torch_host, torch_port = torch_dist_address.rsplit(":", 1)
+                os.environ.setdefault("MASTER_ADDR", torch_host)
+                os.environ.setdefault("MASTER_PORT", torch_port)
+            else:
+                torch_host, torch_port = "127.0.0.1", "29500"
+                os.environ.setdefault("MASTER_ADDR", torch_host)
+                os.environ.setdefault("MASTER_PORT", torch_port)
 
-        # HF Tokenizer warning when forking
-        os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        self.parallel_dict: dict[str, Any] = dict()
-        _monkey()
+            # HF Tokenizer warning when forking
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
+            self.parallel_dict: dict[str, Any] = dict()
+            _monkey()
 
-        world_size = GPU
-        max_world_size = torch.cuda.device_count()
-        if world_size > max_world_size:
-            raise ValueError("Too many gpus")
-        if world_size == 0:
-            raise ValueError("Num of cuda/cudalike device is 0")
-        if world_size < ulysses_degree * ring_degree * cfg_degree:
-            raise ValueError(
-                f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} x {ring_degree=} x {cfg_degree=}"
-            )
-        if cfg_degree > 2:
-            raise ValueError(
-                "CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2"
-            )
+            world_size = GPU
+            max_world_size = torch.cuda.device_count()
+            if world_size > max_world_size:
+                raise ValueError("Too many gpus")
+            if world_size == 0:
+                raise ValueError("Num of cuda/cudalike device is 0")
+            if world_size < ulysses_degree * ring_degree * cfg_degree:
+                raise ValueError(
+                    f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} x {ring_degree=} x {cfg_degree=}"
+                )
+            if cfg_degree > 2:
+                raise ValueError(
+                    "CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2"
+                )
 
-        self.parallel_dict["is_xdit"] = False
-        self.parallel_dict["is_fsdp"] = False
-        self.parallel_dict["sync_ulysses"] = False
-        self.parallel_dict["global_world_size"] = world_size
+            self.parallel_dict["is_xdit"] = False
+            self.parallel_dict["is_fsdp"] = False
+            self.parallel_dict["sync_ulysses"] = False
+            self.parallel_dict["global_world_size"] = world_size
 
-        if (
-            ulysses_degree > 0
-            or ring_degree > 0
-            or cfg_degree > 0
-        ):
-            if ulysses_degree * ring_degree * cfg_degree == 0:
-                raise ValueError(f"""ERROR, parallel product of {ulysses_degree=} x {ring_degree=} x {cfg_degree=} is 0.
-                 Please make sure to set any parallel degree to be greater than 0,
-                 or switch into DPKSampler and set 0 to all parallel degree""")
-            self.parallel_dict["attention"] = XFuser_attention
-            self.parallel_dict["is_xdit"] = True
-            self.parallel_dict["ulysses_degree"] = ulysses_degree
-            self.parallel_dict["ring_degree"] = ring_degree
-            self.parallel_dict["cfg_degree"] = cfg_degree
-            self.parallel_dict["sync_ulysses"] = sync_ulysses
+            if (
+                ulysses_degree > 0
+                or ring_degree > 0
+                or cfg_degree > 0
+            ):
+                if ulysses_degree * ring_degree * cfg_degree == 0:
+                    raise ValueError(f"""ERROR, parallel product of {ulysses_degree=} x {ring_degree=} x {cfg_degree=} is 0.
+                     Please make sure to set any parallel degree to be greater than 0,
+                     or switch into DPKSampler and set 0 to all parallel degree""")
+                self.parallel_dict["attention"] = XFuser_attention
+                self.parallel_dict["is_xdit"] = True
+                self.parallel_dict["ulysses_degree"] = ulysses_degree
+                self.parallel_dict["ring_degree"] = ring_degree
+                self.parallel_dict["cfg_degree"] = cfg_degree
+                self.parallel_dict["sync_ulysses"] = sync_ulysses
 
-        if FSDP:
-            self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
-            self.parallel_dict["is_fsdp"] = True
+            if FSDP:
+                self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
+                self.parallel_dict["is_fsdp"] = True
 
-        if ray_dashboard_address != "None":
-            dashboard_host, dashboard_port = ray_dashboard_address.rsplit(":", 1)
-            dashboard_port = int(dashboard_port)
-            enable_dashboard = True
-        else:
-            dashboard_host, dashboard_port = "127.0.0.1", None
-            enable_dashboard = False
+            if ray_dashboard_address != "None":
+                dashboard_host, dashboard_port = ray_dashboard_address.rsplit(":", 1)
+                dashboard_port = int(dashboard_port)
+                enable_dashboard = True
+            else:
+                dashboard_host, dashboard_port = "127.0.0.1", None
+                enable_dashboard = False
 
-        if ray_object_store_gb <= 0:
-            ray_object_store_memory = None
-            print("[Raylight] object_store_memory set to Auto (Ray default).")
-        else:
-            ray_object_store_memory = int(ray_object_store_gb * 1024**3)
-            print(f"[Raylight] object_store_memory set to {ray_object_store_gb} GB.")
+            if ray_object_store_gb <= 0:
+                ray_object_store_memory = None
+                print("[Raylight] object_store_memory set to Auto (Ray default).")
+            else:
+                ray_object_store_memory = int(ray_object_store_gb * 1024**3)
+                print(f"[Raylight] object_store_memory set to {ray_object_store_gb} GB.")
 
-        runtime_env_base = _RAY_RUNTIME_ENV_LOCAL
-        if ray_cluster_address not in _LOCAL_CLUSTER_ADDRESSES:
-            runtime_env_base = _RAY_RUNTIME_ENV_REMOTE
+            runtime_env_base = _RAY_RUNTIME_ENV_LOCAL
+            if ray_cluster_address not in _LOCAL_CLUSTER_ADDRESSES:
+                runtime_env_base = _RAY_RUNTIME_ENV_REMOTE
 
-        # GPU Pinning Logic
-        original_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-        try:
-            if gpu_indices.strip():
-                # Validate and set
-                indices = [x.strip() for x in gpu_indices.split(",") if x.strip()]
-                if len(indices) < world_size:
-                     raise ValueError(f"gpu_indices contains {len(indices)} GPUs, but {world_size} (GPU input) were requested.")
+            # GPU Pinning Logic
+            original_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+            try:
+                if gpu_indices.strip():
+                    # Validate and set
+                    indices = [x.strip() for x in gpu_indices.split(",") if x.strip()]
+                    if len(indices) < world_size:
+                         raise ValueError(f"gpu_indices contains {len(indices)} GPUs, but {world_size} (GPU input) were requested.")
+                    
+                    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(indices)
+                    print(f"[Raylight] Pinning Ray Cluster to GPUs: {os.environ['CUDA_VISIBLE_DEVICES']}")
+
+                # ===== OPTIMIZATION: Cluster Reuse =====
+                # Check if Ray is already initialized with matching config to skip expensive re-init
+                is_local = ray_cluster_address in _LOCAL_CLUSTER_ADDRESSES
+                should_reuse = False
                 
-                os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(indices)
-                print(f"[Raylight] Pinning Ray Cluster to GPUs: {os.environ['CUDA_VISIBLE_DEVICES']}")
-
-            # ===== OPTIMIZATION: Cluster Reuse =====
-            # Check if Ray is already initialized with matching config to skip expensive re-init
-            is_local = ray_cluster_address in _LOCAL_CLUSTER_ADDRESSES
-            should_reuse = False
-            
-            if ray.is_initialized():
-                try:
-                    # Check if the cluster has matching GPU count
-                    existing_resources = ray.cluster_resources()
-                    existing_gpus = int(existing_resources.get('GPU', 0))
-                    if existing_gpus >= world_size:
-                        print(f"[Raylight] Reusing existing Ray cluster (GPUs available: {existing_gpus})")
-                        should_reuse = True
-                except Exception:
-                    pass
-            
-            if not should_reuse:
-                # Shut down so if comfy user try another workflow it will not cause error
+                if ray.is_initialized():
+                    try:
+                        # Check if the cluster has matching GPU count
+                        existing_resources = ray.cluster_resources()
+                        existing_gpus = int(existing_resources.get('GPU', 0))
+                        if existing_gpus >= world_size:
+                            print(f"[Raylight] Reusing existing Ray cluster (GPUs available: {existing_gpus})")
+                            should_reuse = True
+                    except Exception:
+                        pass
+                
+                if not should_reuse:
+                    # Shut down so if comfy user try another workflow it will not cause error
+                    ray.shutdown()
+                    
+                    # Clean up stale /dev/shm cache files from previous sessions
+                    _cleanup_raylight_shm_cache()
+                    
+                    # Build init kwargs - disable metrics agent for faster startup
+                    init_kwargs = {
+                        'namespace': ray_cluster_namespace,
+                        'runtime_env': deepcopy(runtime_env_base),
+                        'include_dashboard': enable_dashboard,
+                        'dashboard_host': dashboard_host,
+                        'dashboard_port': dashboard_port,
+                        '_metrics_export_port': None,  # Disable metrics agent to avoid connection retries
+                    }
+                    
+                    # Only set object_store_memory if explicitly configured (not for reused clusters)
+                    if ray_object_store_memory is not None:
+                        init_kwargs['object_store_memory'] = ray_object_store_memory
+                    
+                    ray.init(ray_cluster_address, **init_kwargs)
+                    print(f"[Raylight] Ray cluster initialized (new instance)")
+                
+            except Exception as e:
                 ray.shutdown()
-                
-                # Clean up stale /dev/shm cache files from previous sessions
-                _cleanup_raylight_shm_cache()
-                
-                # Build init kwargs - disable metrics agent for faster startup
-                init_kwargs = {
-                    'namespace': ray_cluster_namespace,
-                    'runtime_env': deepcopy(runtime_env_base),
-                    'include_dashboard': enable_dashboard,
-                    'dashboard_host': dashboard_host,
-                    'dashboard_port': dashboard_port,
-                    '_metrics_export_port': None,  # Disable metrics agent to avoid connection retries
-                }
-                
-                # Only set object_store_memory if explicitly configured (not for reused clusters)
-                if ray_object_store_memory is not None:
-                    init_kwargs['object_store_memory'] = ray_object_store_memory
-                
-                ray.init(ray_cluster_address, **init_kwargs)
-                print(f"[Raylight] Ray cluster initialized (new instance)")
-            
-        except Exception as e:
-            ray.shutdown()
-            ray.init(
-                runtime_env=deepcopy(runtime_env_base),
-                _metrics_export_port=None,
-            )
-            raise RuntimeError(f"Ray connection failed: {e}")
-        # Restore original environment to avoid affecting other nodes
-        if original_visible_devices is not None:
-            os.environ["CUDA_VISIBLE_DEVICES"] = original_visible_devices
-        elif "CUDA_VISIBLE_DEVICES" in os.environ and gpu_indices.strip():
-             del os.environ["CUDA_VISIBLE_DEVICES"]
+                ray.init(
+                    runtime_env=deepcopy(runtime_env_base),
+                    _metrics_export_port=None,
+                )
+                raise RuntimeError(f"Ray connection failed: {e}")
+            # Restore original environment to avoid affecting other nodes
+            if original_visible_devices is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = original_visible_devices
+            elif "CUDA_VISIBLE_DEVICES" in os.environ and gpu_indices.strip():
+                 del os.environ["CUDA_VISIBLE_DEVICES"]
 
-        # ===== OPTIMIZATION: Skip NCCL Test =====
-        # NCCL test spawns/kills separate actors before real workers - saves ~10-15s
-        if not skip_comm_test:
-            print("[Raylight] Running NCCL communication test...")
-            ray_nccl_tester(world_size)
-        else:
-            print("[Raylight] Skipping NCCL test (skip_comm_test=True)")
-        
-        ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
-        ray_actors = ray_actor_fn()
-        
-        # Store GPU indices for later use in samplers (for partial offload matching)
-        if gpu_indices.strip():
-            ray_actors["gpu_indices"] = [int(x.strip()) for x in gpu_indices.split(",") if x.strip()]
-        else:
-            # Default: 0, 1, 2, ...
-            ray_actors["gpu_indices"] = list(range(world_size))
-        
-        return ([ray_actors, ray_actor_fn],)
+            # ===== OPTIMIZATION: Skip NCCL Test =====
+            # NCCL test spawns/kills separate actors before real workers - saves ~10-15s
+            if not skip_comm_test:
+                print("[Raylight] Running NCCL communication test...")
+                ray_nccl_tester(world_size)
+            else:
+                print("[Raylight] Skipping NCCL test (skip_comm_test=True)")
+            
+            ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
+            ray_actors = ray_actor_fn()
+            
+            # Store GPU indices for later use in samplers (for partial offload matching)
+            if gpu_indices.strip():
+                ray_actors["gpu_indices"] = [int(x.strip()) for x in gpu_indices.split(",") if x.strip()]
+            else:
+                # Default: 0, 1, 2, ...
+                ray_actors["gpu_indices"] = list(range(world_size))
+            
+            return ([ray_actors, ray_actor_fn],)
 
 
 class RayInitializerAdvanced(RayInitializer):
@@ -477,7 +479,8 @@ class RayUNETLoader:
     CATEGORY = "Raylight"
 
     def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, lora=None):
-        ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
+        with monitor_memory("RayUNETLoader.load_ray_unet"):
+            ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
 
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
@@ -631,7 +634,6 @@ class XFuserKSamplerAdvanced:
             },
             "optional": {
                 "sigmas": ("SIGMAS",),
-                "lora": ("RAY_LORA", {"default": None}),
             }
         }
 
@@ -657,12 +659,12 @@ class XFuserKSamplerAdvanced:
         return_with_leftover_noise,
         denoise=1.0,
         sigmas=None,
-        lora=None,
     ):
-        # Clean VRAM for preparation to load model
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
+        with monitor_memory("XFuserKSampler.ray_sample"):
+            # Clean VRAM for preparation to load model
+            gc.collect()
+            comfy.model_management.unload_all_models()
+            comfy.model_management.soft_empty_cache()
         force_full_denoise = True
         if return_with_leftover_noise == "enable":
             force_full_denoise = False
@@ -671,39 +673,6 @@ class XFuserKSamplerAdvanced:
             disable_noise = True
 
         gpu_actors = ray_actors["workers"]
-
-        # **** COORDINATOR-LEVEL RELOAD ****
-        # Check which workers need reload and trigger BEFORE dispatching sampling.
-        # This ensures all workers are ready before any collective operations begin.
-        # PARALLEL: Safe with mmap-based /dev/shm cache - no RAM multiplication
-        cancellable_get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
-        
-        # Robustness: Ensure workers have base_ref if provided
-        lora_list_val = None
-        
-        if "base_ref" in ray_actors:
-             cancellable_get([actor.set_base_ref.remote(ray_actors["base_ref"]) for actor in gpu_actors])
-             
-             # --------------------------------------------------------
-             # Shared Object Storage Patching (Preferred)
-             # --------------------------------------------------------
-             worker0 = gpu_actors[0]
-             
-             # lora is already the list of dicts from RayLoRALoader
-             target_sd_ref = cancellable_get(worker0.create_patched_ref.remote(lora))
-             
-             reload_futures = []
-             for actor in gpu_actors:
-                 reload_futures.append(actor.load_unet_from_state_dict.remote(target_sd_ref, model_options={}))
-             cancellable_get(reload_futures)
-             # lora_list_val remains None (workers are already patched)
-             
-        elif lora is not None:
-             # --------------------------------------------------------
-             # Fallback: Local Patching (No Base Ref / FSDP)
-             # --------------------------------------------------------
-             # Pass the LoRA list to workers to apply locally
-             lora_list_val = lora
 
         futures = [
             actor.common_ksampler.remote(
@@ -721,7 +690,6 @@ class XFuserKSamplerAdvanced:
                 last_step=end_at_step,
                 force_full_denoise=force_full_denoise,
                 sigmas=sigmas,
-                lora_list=lora_list_val,
             )
             for actor in gpu_actors
         ]
@@ -760,9 +728,6 @@ class DPKSamplerAdvanced:
                 "start_at_step": ("INT", {"default": 0, "min": 0, "max": 10000}),
                 "end_at_step": ("INT", {"default": 10000, "min": 0, "max": 10000}),
                 "return_with_leftover_noise": (["disable", "enable"],),
-            },
-            "optional": {
-                "lora": ("RAY_LORA", {"default": None}),
             }
         }
 
@@ -789,7 +754,6 @@ class DPKSamplerAdvanced:
         end_at_step,
         return_with_leftover_noise,
         denoise=1.0,
-        lora=None,
     ):
 
         ray_actors = ray_actors[0]
@@ -803,17 +767,8 @@ class DPKSamplerAdvanced:
         start_at_step = start_at_step[0]
         end_at_step = end_at_step[0]
         return_with_leftover_noise = return_with_leftover_noise[0]
-        current_lora = None
-        if lora is not None:
-             current_lora = lora[0]
 
         gpu_actors = ray_actors["workers"]
-
-        # **** COORDINATOR-LEVEL RELOAD ****
-        # Check which workers need reload and trigger BEFORE dispatching sampling.
-        # This ensures all workers are ready before any collective operations begin.
-        # PARALLEL: Safe with mmap-based /dev/shm cache - no RAM multiplication
-        cancellable_get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
 
         parallel_dict = cancellable_get(gpu_actors[0].get_parallel_dict.remote())
         if parallel_dict["is_xdit"] is True:
@@ -839,34 +794,6 @@ class DPKSamplerAdvanced:
         if add_noise == "disable":
             disable_noise = True
 
-        # Robustness: Ensure workers have base_ref if provided
-        lora_list_val = None
-        
-        if "base_ref" in ray_actors:
-             cancellable_get([actor.set_base_ref.remote(ray_actors["base_ref"]) for actor in gpu_actors])
-        
-             # --------------------------------------------------------
-             # Shared Object Storage Patching (Preferred)
-             # --------------------------------------------------------
-             worker0 = gpu_actors[0]
-             
-             target_sd_ref = cancellable_get(worker0.create_patched_ref.remote(current_lora))
-    
-             reload_futures = []
-             for actor in gpu_actors:
-                 reload_futures.append(actor.load_unet_from_state_dict.remote(target_sd_ref, model_options={}))
-             cancellable_get(reload_futures)
-             # lora_list_val remains None
-             
-        elif current_lora is not None:
-             # --------------------------------------------------------
-             # Fallback: Local Patching
-             # --------------------------------------------------------
-             print("[DPKSampler] Base Ref missing. Falling back to local/legacy patching.")
-             lora_list_val = current_lora
-
-        # --------------------------------------------------------
-
         futures = [
             actor.common_ksampler.remote(
                 noise_list[i],
@@ -882,7 +809,6 @@ class DPKSamplerAdvanced:
                 start_step=start_at_step,
                 last_step=end_at_step,
                 force_full_denoise=force_full_denoise,
-                lora_list=lora_list_val,
             )
             for i, actor in enumerate(gpu_actors)
         ]

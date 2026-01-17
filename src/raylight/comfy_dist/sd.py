@@ -167,9 +167,16 @@ def gguf_load_diffusion_model(unet_path, model_options={}, dequant_dtype=None, p
     del extra
     del ops
     import gc
-    for _ in range(3):
+    import ctypes
+    for _ in range(5):
         gc.collect()
     torch.cuda.empty_cache()
+    
+    # Force libc to release freed memory back to OS
+    try:
+        ctypes.CDLL('libc.so.6').malloc_trim(0)
+    except Exception:
+        pass
     
     return model
 

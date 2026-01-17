@@ -101,16 +101,9 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         # Restore backups (putting GGMLTensors back in place)
         # CRITICAL: We pass device_to=None to super() to prevent it from moving the restored weights.
         
-        # FIX: Preserve backup across unpatching.
-        # ComfyUI ModelPatcher clears self.backup after unpatching.
-        # But for GGUF Soft-Offload, we need these backups (mmap tensors) to survive
-        # so we can recover from the "nuclear" 0-byte failsafe offload.
-        preserved_backup = self.backup.copy()
-        
+        # NOTE: We no longer preserve backup across unpatching.
+        # Recovery is now done via /dev/shm cache, not backup dict (which causes memory leaks).
         super().unpatch_model(device_to=None, unpatch_weights=unpatch_weights)
-
-        # Restore the backup so we can reload/patch again later
-        self.backup = preserved_backup
 
         # Explicitly clear any lingering modifications to ensure VRAM release
         if unpatch_weights:
@@ -215,16 +208,12 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                             curr = comfy.utils.get_attr(self.model, name)
                         
                         if curr.numel() == 0:  # Only restore nuked weights
-                            # ZERO-COPY PATH:
-                            # 1. pin_memory() marks mmap pages as DMA-able (cheap for /dev/shm)
-                            # 2. non_blocking=True triggers async DMA to GPU
-                            # 3. No intermediate RAM copy needed
-                            if target_device.type == 'cuda':
-                                pinned = tensor.pin_memory()
-                                restored_tensor = pinned.to(target_device, non_blocking=True)
-                                del pinned  # Release pin immediately
-                            else:
-                                restored_tensor = tensor.to(target_device)
+                            # TRUE ZERO-COPY PATH (no RAM allocation):
+                            # For mmap'd tensors from /dev/shm, the data is already in shared memory.
+                            # Using .to(device, non_blocking=True) directly allows CUDA to DMA from
+                            # the mmap'd pages without allocating pinned RAM copies.
+                            # pin_memory() was INCORRECTLY used before - it allocates NEW pinned RAM.
+                            restored_tensor = tensor.to(target_device, non_blocking=True)
                             
                             # Directly assign data
                             if hasattr(curr, 'data'):
@@ -238,10 +227,8 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                             # These weights weren't nuked (on CPU), but need to be on GPU for inference
                             if curr.device.type != 'cuda' and target_device.type == 'cuda':
                                 if hasattr(curr, 'data'):
-                                    # Also use async transfer for non-nuked weights
-                                    pinned = curr.data.pin_memory()
-                                    curr.data = pinned.to(target_device, non_blocking=True)
-                                    del pinned
+                                    # Direct async transfer - no pin_memory() to avoid RAM copies
+                                    curr.data = curr.data.to(target_device, non_blocking=True)
                                 moved_to_gpu += 1
                             # Debug: log what's being skipped (first 5 only)
                             if skipped <= 5:
@@ -253,13 +240,29 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             if stream:
                 stream.synchronize()
             
-            print(f"[GGUFModelPatcher] ZERO-COPY HOT LOAD: Restored {restored} weights, skipped {skipped} (moved {moved_to_gpu} to GPU), cache has {len(state_dict)} keys")
+            print(f"[GGUFModelPatcher] ZERO-COPY FAST LOAD: Restored {restored} weights, skipped {skipped} (moved {moved_to_gpu} to GPU), cache has {len(state_dict)} keys")
+            
+            # CRITICAL: Aggressive cleanup to release mmap references
+            # Break all tensor references before deleting dict
+            for key in list(state_dict.keys()):
+                state_dict[key] = None
+            state_dict.clear()
             del state_dict
-            gc.collect()
+            
+            # Force multiple GC passes to release mmap pages
+            for _ in range(5):
+                gc.collect()
             
             # CRITICAL: Sync CUDA after restore to catch async errors early
             torch.cuda.synchronize()
             print(f"[GGUFModelPatcher] CUDA sync after restore - OK")
+            
+            # Force libc to release freed memory back to OS
+            try:
+                import ctypes
+                ctypes.CDLL('libc.so.6').malloc_trim(0)
+            except Exception:
+                pass
             
             # Mark mmap as released to skip native mmap release (would create duplicate CPU copies)
             self.mmap_released = True
@@ -272,13 +275,48 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         if not getattr(self, '_gguf_mmap_evicted', False):
             if hasattr(self, "unet_path"):
                 evict_page_cache(self.unet_path)
-            
-            import gc
-            # Clear backup dict - we'll use /dev/shm cache instead
-            self.backup.clear()
-            gc.collect()
             self._gguf_mmap_evicted = True
             print("[GGUFModelPatcher] Evicted original GGUF mmap references")
+        
+        # CRITICAL: Clear backup dict EVERY load, not just first load.
+        # super().load() calls patch_weight_to_device which repopulates backup.
+        # Without clearing, mmap tensor refs accumulate across hot reloads.
+        import gc
+        from raylight.expansion.comfyui_gguf.ops import GGMLTensor
+        self.backup.clear()
+        
+        # NUCLEAR CLEANUP: Release ALL large CPU tensor storage after weights are on GPU.
+        # This runs on EVERY load (cold or hot) because:
+        # - Cold load: mmap tensors need cleanup after VRAM load
+        # - Hot reload: /dev/shm cache is the only RAM copy we need
+        # We iterate through the heap to find and nuke ALL large CPU tensors.
+        nuked_cpu_tensors = 0
+        nuked_bytes = 0
+        MIN_SIZE_BYTES = 10 * 1024 * 1024  # 10MB threshold
+        
+        for obj in gc.get_objects():
+            try:
+                # Check if it's any tensor subclass (including GGMLTensor) on CPU
+                if torch.is_tensor(obj) and obj.device.type == 'cpu':
+                    size_bytes = obj.numel() * obj.element_size()
+                    if size_bytes > MIN_SIZE_BYTES:
+                        # Replace the storage with empty to release RAM
+                        obj.set_(torch.empty(0, dtype=obj.dtype, device='cpu').storage())
+                        nuked_cpu_tensors += 1
+                        nuked_bytes += size_bytes
+            except Exception:
+                continue
+        if nuked_cpu_tensors > 0:
+            print(f"[GGUFModelPatcher] Nuked {nuked_cpu_tensors} large CPU tensors ({nuked_bytes / 1024**3:.2f} GB) - weights are on GPU")
+        
+        gc.collect()
+        
+        # Force libc to release freed memory back to OS
+        try:
+            import ctypes
+            ctypes.CDLL('libc.so.6').malloc_trim(0)
+        except Exception:
+            pass
 
         # make sure nothing stays linked to mmap after first load
         if self.release_mmap and not self.mmap_released:
@@ -311,12 +349,12 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             n.release_mmap = getattr(self, "release_mmap", False)
             n.unet_path = getattr(self, "unet_path", None)
             
-            # CRITICAL: Share backup with clones.
-            # Clones need access to the mmap tensor backups to perform repatching/restoration
-            # especially if the main model has been "nuked" to 0-byte tensors.
-            # Use copy() to avoid reference issues if the original dict is cleared/replaced.
-            n.backup = self.backup.copy()
-            print(f"[GGUFModelPatcher] Cloned backup (len={len(n.backup) if n.backup else 0}).")
+            # CRITICAL FIX: Do NOT copy backup to clones.
+            # Copying backup creates additional references to mmap'd tensors, preventing release.
+            # Clones can reload from /dev/shm cache if they need weights.
+            n.backup = {}
+            n.cache_path = getattr(self, 'cache_path', None)  # Share cache path for reload
+            print(f"[GGUFModelPatcher] Cloned with empty backup (cache_path={n.cache_path is not None}).")
             
             return n
         
@@ -337,8 +375,10 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         for k, v in self.patches.items():
             n.patches[k] = v[:] # Shallow copy of list
             
-        n.backup = self.backup.copy()
-        print(f"[GGUFModelPatcher] Upgraded clone backup (len={len(n.backup) if n.backup else 0}).")
+        # CRITICAL FIX: Do NOT copy backup - prevents mmap reference accumulation
+        n.backup = {}
+        n.cache_path = getattr(self, 'cache_path', None)  # Share cache path for reload
+        print(f"[GGUFModelPatcher] Upgraded clone with empty backup (cache_path={n.cache_path is not None}).")
         n.object_patches = self.object_patches.copy()
         
         # GGUF defaults
