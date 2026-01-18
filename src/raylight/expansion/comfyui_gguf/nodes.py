@@ -15,7 +15,7 @@ import comfy.model_patcher
 import comfy.model_management
 import folder_paths
 
-from .ops import move_patch_to_device
+from .ops import move_patch_to_device, GGMLTensor
 from .dequant import is_quantized, is_torch_compatible
 
 from raylight.distributed_worker.ray_worker import ensure_fresh_actors, evict_page_cache
@@ -114,11 +114,37 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         
         # Move patches themselves back to offload device if they were on GPU
         # This fixes "model_to_remove" equivalent for patch weights (LoRAs)
+        # ComfyUI patch format: (strength, v, strength_model, offset, function)
+        # where v can be a tensor, tuple, list, or WeightAdapterBase
         for key, patch_list in self.patches.items():
-            for i, (patch_weight, patch_type) in enumerate(patch_list):
-                 if isinstance(patch_weight, torch.Tensor) and patch_weight.device != self.offload_device:
-                      # Move LoRA weights back to CPU/offload to free VRAM
-                      patch_list[i] = (patch_weight.to(self.offload_device), patch_type)
+            for i, patch in enumerate(patch_list):
+                if len(patch) >= 2:
+                    v = patch[1]  # The actual patch value is at index 1
+                    # Handle different patch value types
+                    if isinstance(v, torch.Tensor) and v.device != self.offload_device:
+                        # Move LoRA weights back to CPU/offload to free VRAM
+                        new_patch = list(patch)
+                        new_patch[1] = v.to(self.offload_device)
+                        patch_list[i] = tuple(new_patch)
+                    elif isinstance(v, (tuple, list)) and len(v) > 0:
+                        # Handle tuple/list values like ("diff", (tensor,)) format
+                        # Check if the first element is a patch_type string
+                        if isinstance(v[0], str) and len(v) > 1:
+                            inner_v = v[1]
+                            if isinstance(inner_v, tuple) and len(inner_v) > 0:
+                                if isinstance(inner_v[0], torch.Tensor) and inner_v[0].device != self.offload_device:
+                                    new_inner = list(inner_v)
+                                    new_inner[0] = inner_v[0].to(self.offload_device)
+                                    new_v = (v[0], tuple(new_inner)) + tuple(v[2:]) if len(v) > 2 else (v[0], tuple(new_inner))
+                                    new_patch = list(patch)
+                                    new_patch[1] = new_v
+                                    patch_list[i] = tuple(new_patch)
+                        elif torch.is_tensor(v[0]) and v[0].device != self.offload_device:
+                            # Direct tensor tuple like (tensor,)
+                            new_v = tuple(t.to(self.offload_device) if torch.is_tensor(t) and t.device != self.offload_device else t for t in v)
+                            new_patch = list(patch)
+                            new_patch[1] = new_v
+                            patch_list[i] = tuple(new_patch)
 
         if device_to is not None:
              self.current_device = device_to
@@ -248,7 +274,30 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                                 obj = pickle.load(f)
                                 if obj is None:  # End marker
                                     break
-                                name, tensor = obj
+                                
+                                # Handle both old (2-tuple) and new (3-tuple) formats for backward compatibility
+                                if len(obj) == 3:
+                                    name, tensor, metadata = obj
+                                else:
+                                    name, tensor = obj
+                                    metadata = None
+
+                                # Reconstruct GGMLTensor if metadata exists
+                                if metadata:
+                                    # Create new GGMLTensor with restored metadata
+                                    # patches=[] ensures we start with clean base weights (fixing double-patch issue)
+                                    tensor = GGMLTensor(
+                                        tensor, 
+                                        tensor_type=metadata["tensor_type"],
+                                        tensor_shape=metadata["tensor_shape"],
+                                        patches=metadata.get("patches", [])
+                                    )
+
+                                # DEBUG: Inspect restored tensor
+                                if tensor_count < 3:
+                                    t_type = getattr(tensor, 'tensor_type', 'NO_ATTR')
+                                    print(f"[GGUF Reload DEBUG] Restoring '{name}': class={tensor.__class__.__name__}, dtype={tensor.dtype}, shape={tensor.shape}, tensor_type={t_type}")
+                                
                                 restore_tensor(name, tensor)
                                 tensor_count += 1
                                 del tensor  # Immediately release
@@ -307,7 +356,6 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         # super().load() calls patch_weight_to_device which repopulates backup.
         # Without clearing, mmap tensor refs accumulate across hot reloads.
         import gc
-        from raylight.expansion.comfyui_gguf.ops import GGMLTensor
         self.backup.clear()
         
         # NUCLEAR CLEANUP: Release ALL large CPU tensor storage after weights are on GPU.
@@ -521,6 +569,14 @@ class RayGGUFLoader:
                     )
             ray.get(loaded_futures)
             loaded_futures = []
+
+            # 4. Synchronized Eviction
+            # Now that ALL workers have loaded (mapped) the file, we can safely evict the page cache.
+            # We use a barrier inside the worker to ensure perfect sync.
+            print("[Raylight] All workers loaded. Triggering synchronized Page Cache Eviction...")
+            evict_futures = [actor.barrier_and_evict.remote(unet_path) for actor in gpu_actors]
+            ray.get(evict_futures)
+
 
         for actor in gpu_actors:
             if parallel_dict["is_xdit"]:

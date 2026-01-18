@@ -11,6 +11,7 @@ import torch
 import comfy
 import folder_paths
 import tempfile
+import uuid
 from yunchang.kernels import AttnType
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
@@ -198,6 +199,10 @@ class RayInitializer:
                     "default": True,
                     "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early."
                 }),
+                "pack_qkv": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable combined QKV all-to-all optimization. Only works for self-attention models. Disable for cross-attention (LTXV, SD3, etc.)."
+                }),
             }
         }
 
@@ -224,6 +229,7 @@ class RayInitializer:
         torch_dist_address: str = "None",
         gpu_indices: str = "",
         skip_comm_test: bool = True,
+        pack_qkv: bool = True,
     ):
         with monitor_memory("RayInitializer.spawn_actor"):
             # THIS IS PYTORCH DIST ADDRESS
@@ -278,6 +284,7 @@ class RayInitializer:
                 self.parallel_dict["ring_degree"] = ring_degree
                 self.parallel_dict["cfg_degree"] = cfg_degree
                 self.parallel_dict["sync_ulysses"] = sync_ulysses
+                self.parallel_dict["pack_qkv"] = pack_qkv
 
             if FSDP:
                 self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
@@ -436,6 +443,10 @@ class RayInitializerAdvanced(RayInitializer):
                 "skip_comm_test": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early."
+                }),
+                "pack_qkv": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable combined QKV all-to-all optimization. Only works for self-attention models. Disable for cross-attention (LTXV, SD3, etc.)."
                 }),
             }
         }
@@ -897,6 +908,10 @@ class RayVAEDecodeDistributed:
                         "tooltip": "Only used for video VAEs: Amount of frames to overlap.",
                     },
                 ),
+                "release_vae": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Release VAE from worker RAM after decode. Recommended True to free ~2GB per worker. Set False if you need the VAE for multiple decodes."
+                }),
             }
         }
 
@@ -905,7 +920,7 @@ class RayVAEDecodeDistributed:
 
     CATEGORY = "Raylight"
 
-    def ray_decode(self, ray_actors, vae_name, samples, tile_size, vae_dtype="auto", overlap=64, temporal_size=64, temporal_overlap=8):
+    def ray_decode(self, ray_actors, vae_name, samples, tile_size, vae_dtype="auto", overlap=64, temporal_size=64, temporal_overlap=8, release_vae=True):
         gpu_actors = ray_actors["workers"]
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
 
@@ -936,71 +951,88 @@ class RayVAEDecodeDistributed:
         else:
             total_output_frames = total_frames
             overlap_latent_frames = 0
-        
-        # NOTE: Do NOT pre-divide temporal parameters by compression factor.
-        # Original ComfyUI's decode_tiled passes tile_t and overlap_t directly to decode_tiled_3d,
-        # which handles scaling internally via tiled_scale_multidim's index_formulas.
-        # Pre-dividing was causing excessive internal tiling cuts, leading to jitter.
-        
-        frames_per_shard = (total_frames + num_workers - 1) // num_workers
-        
-        futures = []
-        for i, actor in enumerate(gpu_actors):
-            start = i * frames_per_shard
-            end = min((i + 1) * frames_per_shard, total_frames)
             
-            if start >= total_frames:
-                continue # No work for this worker
-                
-            # context_start: Provide 1 frame of context to ensure continuity
-            context_start = max(0, start - 1)
-            # actual_end: Each shard must produce frames up to the START of the next shard.
-            # To do this, it needs to see one latent frame beyond its nominal end (overlapping with next worker's start).
-            actual_end = min(end + (1 if i < num_workers - 1 else 0), total_frames)
-            
-            shard_samples = {
-                "samples": latents[:, :, context_start:actual_end].clone()
-            }
-            
-            # Pass how many latent frames to discard from the beginning of the result
-            discard_latent_frames = start - context_start
-            print(f"[RayVAEDecode] Shard {i}: Latents {context_start} to {end} (discard {discard_latent_frames} frames)")
-            
-            futures.append(actor.ray_vae_decode.remote(
-                i, # shard_index
-                shard_samples,
-                tile_size,
-                overlap=overlap,
-                temporal_size=temporal_size,  # Pass raw value, decode_tiled handles scaling
-                temporal_overlap=temporal_overlap,  # Pass raw value, decode_tiled handles scaling
-                discard_latent_frames=discard_latent_frames,
-                vae_dtype=vae_dtype
-            ))
-
-        print(f"[RayVAEDecode] Dispatched {len(futures)} shards. Pre-allocating streaming buffer...")
+        # Calculate Master Output Shape (B, T, H, W, C)
+        # We assume Batch=1 for video usually, but we handle standard (B, T, H, W, C) structure 
+        # or (T, H, W, C) if squeezed. ComfyUI usually expects (TotalFrames, H, W, 3) for video batch.
+        H_out = latents.shape[3] * spatial_compression
+        W_out = latents.shape[4] * spatial_compression
+        # Final shape: (TotalFrames, Height, Width, 3)
+        master_shape = (total_output_frames, H_out, W_out, 3)
         
-        # 3. Streaming results using ray.util.as_completed
+        # 3. Create Shared Memory File (Pre-allocation)
+        mmap_path = f"/dev/shm/raylight_vae_out_{uuid.uuid4().hex}.bin"
+        num_elements = 1
+        for dim in master_shape: num_elements *= dim
+        file_size_bytes = num_elements * 4 # float32 = 4 bytes
         
-        B, C, T, H, W = latents.shape
-        # total_output_frames already calculated above
-        out_h = H * spatial_compression
-        out_w = W * spatial_compression
-        master_shape = (total_output_frames, out_h, out_w, 3) 
-        # Actually VAE output is often [F, C, H, W] then permuted to [F, H, W, C].
-        # Let's check a sample shard to be sure of the shape.
-        # Most VAEs return [B, C, T, H, W] which we reshape to [B*T, H, W, C] in worker.
+        print(f"[RayVAEDecode] Pre-allocating shared output buffer: {mmap_path} ({file_size_bytes/1024**3:.2f} GB)")
+        print(f"[RayVAEDecode] Output Shape: {master_shape}")
         
-        # Temporary file for mmap'd storage. Use /dev/shm if available for speed.
-        mmap_dir = "/dev/shm" if os.path.exists("/dev/shm") else tempfile.gettempdir()
-        mmap_path = os.path.join(mmap_dir, f"ray_vae_{os.getpid()}.bin")
-        
-        full_image = None
-        
+        full_image = None # Initialize outside try block for finally access
         try:
+            with open(mmap_path, "wb") as f:
+                f.seek(file_size_bytes - 1)
+                f.write(b"\0")
+                
+            # Create the tensor wrapper immediately
+            full_image = torch.from_file(mmap_path, shared=True, size=num_elements, dtype=torch.float32).reshape(master_shape)
+            
+            # 4. Dispatch Workers
+            # NOTE: Do NOT pre-divide temporal parameters by compression factor.
+            # Original ComfyUI's decode_tiled passes tile_t and overlap_t directly to decode_tiled_3d.
+            
+            frames_per_shard = (total_frames + num_workers - 1) // num_workers
+            
+            futures = []
+            for i, actor in enumerate(gpu_actors):
+                start = i * frames_per_shard
+                end = min((i + 1) * frames_per_shard, total_frames)
+                
+                if start >= total_frames:
+                    continue # No work for this worker
+                    
+                # context_start: Provide 1 frame of context to ensure continuity
+                context_start = max(0, start - 1)
+                # actual_end: Each shard must produce frames up to the START of the next shard.
+                actual_end = min(end + (1 if i < num_workers - 1 else 0), total_frames)
+                
+                shard_samples = {
+                    "samples": latents[:, :, context_start:actual_end].clone()
+                }
+                
+                # Pass how many latent frames to discard from the beginning of the result
+                discard_latent_frames = start - context_start
+                
+                # Calculate Output Offset due to temporal compression
+                # shard index 'start' corresponds to video frame:
+                start_video_frame = start * temporal_compression
+                if temporal_compression == 1:
+                     start_video_frame = start
+                
+                print(f"[RayVAEDecode] Shard {i}: Latents {context_start} to {end} (discard {discard_latent_frames}) -> Video Frame {start_video_frame}")
+                
+                futures.append(actor.ray_vae_decode.remote(
+                    i, # shard_index
+                    shard_samples,
+                    tile_size,
+                    overlap=overlap,
+                    temporal_size=temporal_size,  # Pass raw value, decode_tiled handles scaling
+                    temporal_overlap=temporal_overlap,  # Pass raw value, decode_tiled handles scaling
+                    discard_latent_frames=discard_latent_frames,
+                    vae_dtype=vae_dtype,
+                    mmap_path=mmap_path,     # DIRECT WRITING
+                    mmap_shape=master_shape, # DIRECT WRITING
+                    output_offset=start_video_frame # DIRECT WRITING
+                ))
+    
+            print(f"[RayVAEDecode] Dispatched {len(futures)} shards. Direct-to-disk mode enabled.")
+            
+            # 5. Gather Results (Stats Only)
+            remaining = list(futures)
             futures_count = len(futures)
             received_count = 0
             
-            remaining = list(futures)
             while remaining:
                 # Check ComfyUI cancel status
                 if comfy.model_management.processing_interrupted():
@@ -1012,72 +1044,85 @@ class RayVAEDecodeDistributed:
                             pass
                     raise Exception("Raylight: VAE Decode canceled by user.")
 
-                ready, remaining = ray.wait(remaining, timeout=1.0)
+                ready, remaining = ray.wait(remaining, num_returns=1, timeout=1.0)
                 if not ready:
                     continue
                     
                 for ray_ref in ready:
-                    # Get result (index, data)
-                    shard_index, shard_data = cancellable_get(ray_ref)
+                    shard_index, result = cancellable_get(ray_ref)
                     received_count += 1
-                    print(f"[RayVAEDecode] Received shard {shard_index} ({received_count}/{futures_count}). Shape: {shard_data.shape}")
                     
-                    if full_image is None:
-                        # Initialize mmap based on first shard's spatial dims/channels
-                        # We use the pre-calculated total_output_frames
-                        master_shape = (total_output_frames,) + shard_data.shape[1:]
-                        num_elements = 1
-                        for dim in master_shape: num_elements *= dim
-                        file_size_bytes = num_elements * 4 # float32
+                    if isinstance(result, dict) and result.get("mmap", False):
+                        # Direct write success
+                        shape = result["shape"]
+                        stats = result["stats"]
+                        print(f"[RayVAEDecode] Shard {shard_index} wrote {shape} to mmap. Stats: {stats}")
+                    else:
+                        # Fallback (Legacy / Failure fallback)
+                        shard_data = result
+                        print(f"[RayVAEDecode] Shard {shard_index} returned tensor {shard_data.shape} (Fallback path)")
                         
-                        with open(mmap_path, "wb") as f:
-                            f.seek(file_size_bytes - 1)
-                            f.write(b"\0")
-                        
-                        full_image = torch.from_file(mmap_path, shared=True, size=num_elements, dtype=torch.float32).reshape(master_shape)
-                    
-                    # Calculate video frame offset for this shard
-                    # shard_index 'i' corresponds to latent start 'i * frames_per_shard'
-                    # which maps to video frame '(i * frames_per_shard) * temporal_compression'
-                    start_latent = shard_index * frames_per_shard
-                    start_video_frame = start_latent * temporal_compression
-                    s_len = shard_data.shape[0]
-                    
-                    # Safety check for slice range
-                    end_video_frame = start_video_frame + s_len
-                    if end_video_frame > total_output_frames:
-                        # This should only happen if workers produced more frames than expected 
-                        # due to padding. We truncate to fit the buffer.
-                        s_len = max(0, total_output_frames - start_video_frame)
-                        shard_data = shard_data[:s_len]
+                        # Write to mmap manually
+                        start = shard_index * frames_per_shard
+                        start_video_frame = start * temporal_compression
+                        s_len = shard_data.shape[0]
                         end_video_frame = start_video_frame + s_len
+                        
+                        # Handle truncation if needed
+                        if end_video_frame > total_output_frames:
+                            s_len = max(0, total_output_frames - start_video_frame)
+                            shard_data = shard_data[:s_len]
+                            end_video_frame = start_video_frame + s_len
+                        
+                        if s_len > 0:
+                            full_image[start_video_frame:end_video_frame] = shard_data.to(torch.float32)
 
-                    if s_len > 0:
-                        # Direct write to mmap buffer
-                        cast_data = shard_data.to(torch.float32)
-                        print(f"[RayVAEDecode] Shard {shard_index} statistics in coordinator: min={cast_data.min():.4f}, max={cast_data.max():.4f}, mean={cast_data.mean():.4f}")
-                        full_image[start_video_frame : end_video_frame] = cast_data
-                        del cast_data
-                    
-                    # Explicit cleanup of the shard reference
-                    del shard_data
-                    # Explicitly remove from ready list too
-                    del ray_ref
-                
+                        del shard_data
+
                 gc.collect()
 
-            # Final cleanup of all futures to drop Ray Object Store refs
             del remaining
-            del futures
-            gc.collect()
-        finally:
-            if os.path.exists(mmap_path):
-                # Unlinking is safe; the file descriptor held by the tensor keeps it alive 
-                # until the tensor is garbage collected in the main ComfyUI loop.
-                try: os.unlink(mmap_path) 
-                except: pass
+            del futures # Ensure all futures are deleted to release Ray object store references
 
-        return (full_image,)
+            # Add batch dimension if needed to match ComfyUI expectation (1, T, H, W, C)?
+            # Usually images are just a list of frames. Tensor shape (T, H, W, C).
+            # ComfyUI "IMAGE" type is (BATCH, H, W, C). For video, BATCH = Frames.
+            # So (T, H, W, 3) is correct.
+            
+            # 6. Cleanup shared file?
+            # If we delete the file now, full_image relies on valid fd/mapping.
+            # Since torch.from_file uses Mmap, we should keep the file until we don't need it?
+            # Or reliance on unlinked file logic (Linux only).
+            # To be safe and cross-platform compatible, we should ideally keep it.
+            # BUT we want to ensure it gets cleaned up.
+            # We can register it with a cleaner or rely on /tmp cleaners.
+            # For now, let's unlink it. On Linux, unlinking an open file keeps it alive for the process.
+            # Torch likely holds the fd.
+            try:
+                os.unlink(mmap_path)
+                print(f"[RayVAEDecode] Unlinked temp mmap file: {mmap_path}")
+            except Exception as e:
+                print(f"[RayVAEDecode] Warning: Could not unlink mmap file: {e}")
+
+            # 7. Release VAE from workers to free RAM for downstream operations (e.g., AudioVAE)
+            if release_vae:
+                print("[RayVAEDecode] Releasing VAE from workers to free RAM...")
+                release_futures = [actor.ray_vae_release.remote() for actor in gpu_actors]
+                cancellable_get(release_futures)
+                print("[RayVAEDecode] VAE released from all workers.")
+                
+                # Local GC as well
+                gc.collect()
+
+            return (full_image,)
+            
+        except Exception as e:
+            # Cleanup on failure
+            if os.path.exists(mmap_path):
+                try: 
+                    os.unlink(mmap_path) 
+                except: pass
+            raise e
 
 
 class RayOffloadModel:

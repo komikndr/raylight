@@ -40,6 +40,7 @@ import inspect
 # If called from ray actor within. dist.barrier() become the sync.
 
 
+
 # Comfy cli args, does not get pass through into ray actor
 def evict_page_cache(path):
     """Tells the kernel to evict pages of the given file from the Page Cache."""
@@ -57,6 +58,27 @@ def evict_page_cache(path):
     except (OSError, AttributeError) as e:
         # posix_fadvise not available on all platforms
         print(f"[Raylight] Note: Could not evict {os.path.basename(path)} from page cache: {e}")
+
+def _check_mmap_leak(path):
+    """Checks /proc/self/maps to see if the file is still mapped."""
+    if not sys.platform.startswith("linux"):
+        return False
+    
+    try:
+        with open("/proc/self/maps", "r") as f:
+            maps = f.read()
+            
+        if path in maps:
+            # Count occurrences
+            count = maps.count(path)
+            print(f"[Raylight] WARNING: GGUF file is still mapped {count} times in memory: {path}")
+            return True
+        else:
+            print(f"[Raylight] SUCCESS: GGUF file is NOT mapped in memory (Clean Release): {path}")
+            return False
+    except Exception as e:
+        print(f"[Raylight] Failed to check maps: {e}")
+        return False
 
 class RayWorker:
 
@@ -120,6 +142,7 @@ class RayWorker:
             )
             xfuser_attn.set_attn_type(self.parallel_dict["attention"])
             xfuser_attn.set_sync_ulysses(self.parallel_dict["sync_ulysses"])
+            xfuser_attn.set_pack_qkv(self.parallel_dict.get("pack_qkv", False))
 
             self.cp_degree = self.parallel_dict["ulysses_degree"] * parallel_dict["ring_degree"]
             self.cfg_degree = self.parallel_dict["cfg_degree"]
@@ -208,7 +231,7 @@ class RayWorker:
         # Unique ID per Node + Model (prevents cross-node /dev/shm collisions)
         node_id = ray.get_runtime_context().get_node_id()[:8]
         model_hash = hashlib.md5(self.current_unet_path.encode()).hexdigest()[:8] if self.current_unet_path else "unknown"
-        cache_path = f"/dev/shm/raylight_{node_id}_{model_hash}.pt"
+        cache_path = f"/dev/shm/raylight_{node_id}_{model_hash}_v2.pt"
 
         if self.local_rank == 0 and not os.path.exists(cache_path):
             print(f"[RayWorker 0] Streaming VRAM state to SHM (true streaming mode)...")
@@ -239,12 +262,32 @@ class RayWorker:
                 # Stream parameters one at a time (NO gc.collect during loop - major speedup)
                 for name, param in self.model.model.named_parameters():
                     if param.device.type == "cuda":
-                        # Copy single tensor to CPU and write immediately
+                        # Copy single tensor to CPU
                         cpu_tensor = param.detach().cpu()
-                        tensor_index[name] = (f.tell() - data_start, str(cpu_tensor.dtype), tuple(cpu_tensor.shape))
-                        pickler.dump((name, cpu_tensor))
+                        
+                        # Fix for UnpicklingError & Metadata Loss:
+                        # 1. Cast to plain torch.Tensor to ensure pickle compatibility
+                        # 2. Extract GGML metadata manually
+                        # 3. Clear patches to ensure we cache BASE weights (prevent double-patching)
+                        metadata = None
+                        if hasattr(cpu_tensor, "tensor_type") or hasattr(param, "tensor_type"):
+                            # Prefer param attrs if cpu_tensor lost them
+                            t_type = getattr(cpu_tensor, "tensor_type", getattr(param, "tensor_type", None))
+                            t_shape = getattr(cpu_tensor, "tensor_shape", getattr(param, "tensor_shape", None))
+                            metadata = {
+                                "tensor_type": t_type,
+                                "tensor_shape": t_shape,
+                                "patches": [] # Explicitly clear patches for clean base weights
+                            }
+                        
+                        plain_tensor = cpu_tensor.as_subclass(torch.Tensor)
+                        
+                        tensor_index[name] = (f.tell() - data_start, str(plain_tensor.dtype), tuple(plain_tensor.shape))
+                        pickler.dump((name, plain_tensor, metadata))
+                        pickler.clear_memo()
                         param_count += 1
                         del cpu_tensor
+                        del plain_tensor
                 
                 # Stream buffers one at a time  
                 for name, buf in self.model.model.named_buffers():
@@ -252,12 +295,14 @@ class RayWorker:
                         cpu_tensor = buf.detach().cpu()
                         key = f"buf_{name}"
                         tensor_index[key] = (f.tell() - data_start, str(cpu_tensor.dtype), tuple(cpu_tensor.shape))
-                        pickler.dump((key, cpu_tensor))
+                        pickler.dump((key, cpu_tensor, None)) # None metadata for buffers
+                        pickler.clear_memo()
                         buf_count += 1
                         del cpu_tensor
                 
                 # Write end marker
                 pickler.dump(None)
+                pickler.clear_memo()
                 bytes_written = f.tell()
             
             cache_size_mb = bytes_written / 1024**2
@@ -854,11 +899,32 @@ class RayWorker:
             if hasattr(self.model, "backup"):
                 self.model.backup.clear()
             
+            # CRITICAL: Clear legacy backup dict to release mmap tensor references.
+            # Raylight uses /dev/shm caching for reload, not the backup dict.
+            if hasattr(self.model, "backup"):
+                self.model.backup.clear()
+            
             # Aggressive GC
             import gc
             for _ in range(3):
                 gc.collect()
             comfy.model_management.soft_empty_cache()
+            
+            # Verify clean release
+            _check_mmap_leak(unet_path)
+            
+            # NOTE: We do NOT evict here anymore to avoid deadlocks.
+            # Eviction is now handled explicitly by the Loader node via barrier_and_evict()
+            # after all workers have finished loading.
+
+    def barrier_and_evict(self, path):
+         """Synchronizes all workers and then evicts page cache."""
+         print(f"[RayWorker {self.local_rank}] Waiting at barrier for synchronized eviction...")
+         if dist.is_initialized():
+             dist.barrier()
+         
+         evict_page_cache(path)
+         return True
 
 
     def get_base_ref(self):
@@ -1066,6 +1132,29 @@ class RayWorker:
             print(f"VAE loaded in {self.global_world_size} GPUs")
         self.vae_model = vae_model
 
+    def ray_vae_release(self):
+        """Explicitly release VAE model from memory to free RAM for other operations."""
+        if self.vae_model is not None:
+            print(f"[RayWorker {self.local_rank}] Releasing VAE model from RAM...")
+            del self.vae_model
+            self.vae_model = None
+            
+            # Aggressive cleanup
+            import gc
+            for _ in range(3):
+                gc.collect()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            
+            # Force OS to reclaim freed memory
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
+            
+            print(f"[RayWorker {self.local_rank}] VAE released.")
+        return True
+
     def get_vae_temporal_compression(self):
         if self.vae_model is None: return None
         return self.vae_model.temporal_compression_decode()
@@ -1106,11 +1195,13 @@ class RayWorker:
         temporal_overlap=8,
         discard_latent_frames=0,
         vae_dtype="auto",
+        mmap_path=None,
+        mmap_shape=None,
+        output_offset=0,
     ):
         with monitor_memory(f"RayWorker {self.local_rank} - ray_vae_decode", device=self.device):
             print(f"[RayWorker {self.local_rank}] Entering ray_vae_decode (direct method call) for shard {shard_index}...")
             
-
 
             import gc
             gc.collect()
@@ -1195,28 +1286,68 @@ class RayWorker:
             
         # Move to CPU explicitly before transport to avoid Ray GPU serialization issues
         # and print stats to troubleshoot "Black Video" issues.
-        print(f"[RayWorker {self.local_rank}] Shard {shard_index} statistics: min={images.min():.4f}, max={images.max():.4f}, mean={images.mean():.4f}")
+        stats_min, stats_max, stats_mean = images.min().item(), images.max().item(), images.mean().item()
+        print(f"[RayWorker {self.local_rank}] Shard {shard_index} statistics: min={stats_min:.4f}, max={stats_max:.4f}, mean={stats_mean:.4f}")
         
-        print(f"[RayWorker {self.local_rank}] Moving to CPU and converting to float16 for transport...")
-        images = images.cpu().to(torch.float16)
+        if mmap_path and mmap_shape:
+            # Direct write to shared memory optimization
+            print(f"[RayWorker {self.local_rank}] Writing directly to shared mmap: {mmap_path} (offset={output_offset})...")
+            
+            # Open shared mmap
+            num_elements = 1
+            for dim in mmap_shape: num_elements *= dim
+            
+            # We assume float32 output
+            out_buffer = torch.from_file(mmap_path, shared=True, size=num_elements, dtype=torch.float32).reshape(mmap_shape)
+            
+            # Write slice
+            write_len = images.shape[0]
+            if output_offset + write_len > out_buffer.shape[0]:
+                 # Safety clip
+                 write_len = out_buffer.shape[0] - output_offset
+                 images = images[:write_len]
+
+            # Write (auto-cast to float32 if needed)
+            out_buffer[output_offset : output_offset + write_len] = images.to(torch.float32).cpu()
+            
+            # Return stats only
+            result_payload = {
+                "mmap": True,
+                "shape": images.shape,
+                "stats": (stats_min, stats_max, stats_mean)
+            }
+            del out_buffer
+            
+        else:
+            # Fallback: serializing large tensor over Ray Object Store (high RAM usage)
+            print(f"[RayWorker {self.local_rank}] Moving to CPU and converting to float16 for transport...")
+            images = images.cpu().to(torch.float16)
+            result_payload = images
+
+        # Proactive memory cleanup - release decoded images tensor
+        del images
+        del latents_to_decode
         
-        # Proactive memory cleanup
+        # Release VAE from GPU VRAM (keep in CPU RAM for potential reuse within same prompt)
+        # This is critical to avoid VRAM accumulation across shards
+        if self.vae_model is not None and hasattr(self.vae_model, 'first_stage_model'):
+            self.vae_model.first_stage_model.to('cpu')
+        
         print(f"[RayWorker {self.local_rank}] Shard {shard_index} complete. Cleanup and return.")
         import gc
-        for _ in range(2):
+        for _ in range(3):
             gc.collect()
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
         # Force OS to reclaim freed memory (fixes RSS creep on Worker 0)
         try:
             ctypes.CDLL("libc.so.6").malloc_trim(0)
         except Exception as e:
             print(f"[RayWorker {self.local_rank}] Warning: malloc_trim failed: {e}")
-
-        # Diagnostics removed
-
             
-        return (shard_index, images)
+        return (shard_index, result_payload)
 
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
@@ -1495,9 +1626,12 @@ def make_ray_actor_fn(
                 )
             )
         ray_actors["workers"] = gpu_actors
-
-        for actor in ray_actors["workers"]:
-            cancellable_get(actor.__ray_ready__.remote())
+        
+        # Parallel initialization check (faster startup)
+        # Instead of waiting sequentially, we fire all check tasks and wait for them in parallel
+        ready_refs = [actor.__ray_ready__.remote() for actor in ray_actors["workers"]]
+        cancellable_get(ready_refs)
+        
         return ray_actors
 
     return _init_ray_actor

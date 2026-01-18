@@ -204,6 +204,11 @@ class GGMLLayer(torch.nn.Module):
         for patches, key in getattr(tensor, "patches", []):
             patch_list += move_patch_to_device(patches, device)
 
+        # DEBUG: Inspect tensor type before dequant
+        if not hasattr(self, "_logged_debug"):
+            print(f"[GGUF Forward DEBUG] Layer {self.__class__.__name__} processing weight: class={tensor.__class__.__name__}, dtype={tensor.dtype}, shape={tensor.shape}, tensor_type={getattr(tensor, 'tensor_type', 'NO_ATTR')}")
+            self._logged_debug = True
+
         # dequantize tensor while patches load
         weight = dequantize_tensor(tensor, dtype, self.dequant_dtype)
 
