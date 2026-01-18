@@ -179,75 +179,100 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         if needs_heal and os.path.exists(cache_path):
             import torch
             import gc
+            import pickle
             
             # ZERO-COPY STREAMING RESTORE
             # Key insight: mmap from /dev/shm means pages are already in RAM (shared memory).
-            # We use pin_memory() to mark pages as DMA-able, then async copy to GPU.
-            # This avoids creating intermediate RAM copies during transfer.
+            # Supports both old format (torch.save state_dict) and new streaming format.
             
-            state_dict = torch.load(cache_path, mmap=True, weights_only=False)
+            # Detect format: new streaming format starts with a header dict with "streaming" key
+            state_dict = None
+            is_streaming_format = False
+            
+            try:
+                with open(cache_path, 'rb') as f:
+                    first_obj = pickle.load(f)
+                    if isinstance(first_obj, dict) and first_obj.get("streaming", False):
+                        is_streaming_format = True
+                    else:
+                        # Old format - reload with torch.load for mmap support
+                        state_dict = torch.load(cache_path, mmap=True, weights_only=False)
+            except Exception as e:
+                # Fallback to old format
+                state_dict = torch.load(cache_path, mmap=True, weights_only=False)
+            
             restored = 0
             skipped = 0
             moved_to_gpu = 0
             target_device = self.load_device
             
             # Use dedicated CUDA stream for async DMA operations
-            # This allows parallel transfers without blocking the main thread
             stream = torch.cuda.Stream(device=target_device) if target_device.type == 'cuda' else None
-            
             ctx = torch.cuda.stream(stream) if stream else contextlib.nullcontext()
-            with ctx:
-                for name, tensor in state_dict.items():
-                    try:
-                        # Handle buffer vs parameter naming (buf_ prefix from cache)
-                        if name.startswith("buf_"):
-                            actual_name = name[4:]  # Remove "buf_" prefix
-                            curr = comfy.utils.get_attr(self.model, actual_name)
+            
+            def restore_tensor(name, tensor):
+                """Helper to restore a single tensor."""
+                nonlocal restored, skipped, moved_to_gpu
+                try:
+                    if name.startswith("buf_"):
+                        actual_name = name[4:]
+                        curr = comfy.utils.get_attr(self.model, actual_name)
+                    else:
+                        actual_name = name
+                        curr = comfy.utils.get_attr(self.model, name)
+                    
+                    if curr.numel() == 0:  # Only restore nuked weights
+                        restored_tensor = tensor.to(target_device, non_blocking=True)
+                        if hasattr(curr, 'data'):
+                            curr.data = restored_tensor
                         else:
-                            actual_name = name
-                            curr = comfy.utils.get_attr(self.model, name)
-                        
-                        if curr.numel() == 0:  # Only restore nuked weights
-                            # TRUE ZERO-COPY PATH (no RAM allocation):
-                            # For mmap'd tensors from /dev/shm, the data is already in shared memory.
-                            # Using .to(device, non_blocking=True) directly allows CUDA to DMA from
-                            # the mmap'd pages without allocating pinned RAM copies.
-                            # pin_memory() was INCORRECTLY used before - it allocates NEW pinned RAM.
-                            restored_tensor = tensor.to(target_device, non_blocking=True)
-                            
-                            # Directly assign data
+                            comfy.utils.set_attr_param(self.model, actual_name, restored_tensor)
+                        restored += 1
+                    else:
+                        skipped += 1
+                        if curr.device.type != 'cuda' and target_device.type == 'cuda':
                             if hasattr(curr, 'data'):
-                                curr.data = restored_tensor
-                            else:
-                                # Fallback for non-parameter attributes
-                                comfy.utils.set_attr_param(self.model, actual_name, restored_tensor)
-                            restored += 1
-                        else:
-                            skipped += 1
-                            # These weights weren't nuked (on CPU), but need to be on GPU for inference
-                            if curr.device.type != 'cuda' and target_device.type == 'cuda':
-                                if hasattr(curr, 'data'):
-                                    # Direct async transfer - no pin_memory() to avoid RAM copies
-                                    curr.data = curr.data.to(target_device, non_blocking=True)
-                                moved_to_gpu += 1
-                            # Debug: log what's being skipped (first 5 only)
-                            if skipped <= 5:
-                                print(f"[GGUFModelPatcher] DEBUG: Skipped '{name}' (numel={curr.numel()}, device={curr.device})")
-                    except Exception as e:
-                        print(f"[GGUFModelPatcher] DEBUG: Failed to restore '{name}': {e}")
+                                curr.data = curr.data.to(target_device, non_blocking=True)
+                            moved_to_gpu += 1
+                except Exception as e:
+                    print(f"[GGUFModelPatcher] DEBUG: Failed to restore '{name}': {e}")
+            
+            with ctx:
+                if is_streaming_format:
+                    # NEW STREAMING FORMAT: Read tensors one at a time
+                    with open(cache_path, 'rb') as f:
+                        pickle.load(f)  # Skip header
+                        tensor_count = 0
+                        while True:
+                            try:
+                                obj = pickle.load(f)
+                                if obj is None:  # End marker
+                                    break
+                                name, tensor = obj
+                                restore_tensor(name, tensor)
+                                tensor_count += 1
+                                del tensor  # Immediately release
+                            except EOFError:
+                                break
+                    cache_key_count = tensor_count
+                else:
+                    # OLD FORMAT: state_dict already loaded
+                    for name, tensor in state_dict.items():
+                        restore_tensor(name, tensor)
+                    cache_key_count = len(state_dict)
             
             # Synchronize stream to ensure all async transfers complete
             if stream:
                 stream.synchronize()
             
-            print(f"[GGUFModelPatcher] ZERO-COPY FAST LOAD: Restored {restored} weights, skipped {skipped} (moved {moved_to_gpu} to GPU), cache has {len(state_dict)} keys")
+            print(f"[GGUFModelPatcher] ZERO-COPY FAST LOAD: Restored {restored} weights, skipped {skipped} (moved {moved_to_gpu} to GPU), cache has {cache_key_count} keys")
             
-            # CRITICAL: Aggressive cleanup to release mmap references
-            # Break all tensor references before deleting dict
-            for key in list(state_dict.keys()):
-                state_dict[key] = None
-            state_dict.clear()
-            del state_dict
+            # CRITICAL: Cleanup mmap references (only for old format that loaded state_dict)
+            if state_dict is not None:
+                for key in list(state_dict.keys()):
+                    state_dict[key] = None
+                state_dict.clear()
+                del state_dict
             
             # Force multiple GC passes to release mmap pages
             for _ in range(5):

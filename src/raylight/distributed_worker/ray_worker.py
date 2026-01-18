@@ -211,48 +211,61 @@ class RayWorker:
         cache_path = f"/dev/shm/raylight_{node_id}_{model_hash}.pt"
 
         if self.local_rank == 0 and not os.path.exists(cache_path):
-            print(f"[RayWorker 0] Streaming VRAM state to SHM (low-RAM mode)...")
+            print(f"[RayWorker 0] Streaming VRAM state to SHM (true streaming mode)...")
             
-            # STREAMING WRITE: Save tensors one at a time to avoid 15GB RAM spike
-            # We use pickle protocol to write incrementally, then torch.load can read it back
+            # TRUE STREAMING: Write tensors one at a time using pickle protocol
+            # This avoids building a 15GB state_dict in RAM before saving
             param_count = 0
             buf_count = 0
             bytes_written = 0
             
-            # Build dict one tensor at a time, immediately releasing after save
-            state_dict = {}
+            # Open file for incremental pickle writes  
+            import pickle
+            import io
             
-            for name, param in self.model.model.named_parameters():
-                if param.device.type == "cuda":
-                    # Copy single tensor to CPU
-                    cpu_tensor = param.detach().cpu()
-                    state_dict[name] = cpu_tensor
-                    param_count += 1
-                    
-            for name, buf in self.model.model.named_buffers():
-                if buf.device.type == "cuda":
-                    cpu_tensor = buf.detach().cpu()
-                    state_dict[f"buf_{name}"] = cpu_tensor
-                    buf_count += 1
+            # We'll build a streaming dict by writing key-value pairs one at a time
+            # Using a temporary approach: collect keys/shapes first, then stream values
+            tensor_index = {}  # name -> (offset, dtype, shape) for verification
             
-            # Save atomically
-            torch.save(state_dict, cache_path)
-            cache_size_mb = os.path.getsize(cache_path) / 1024**2
+            # Use buffered I/O and protocol 5 for speed (protocol 5 is optimized for large arrays)
+            with open(cache_path, 'wb', buffering=8*1024*1024) as f:  # 8MB buffer
+                pickler = pickle.Pickler(f, protocol=5)
+                
+                # Write header placeholder (will be dict with metadata)
+                header_pos = f.tell()
+                pickler.dump({"version": 2, "streaming": True, "count": 0})
+                data_start = f.tell()
+                
+                # Stream parameters one at a time (NO gc.collect during loop - major speedup)
+                for name, param in self.model.model.named_parameters():
+                    if param.device.type == "cuda":
+                        # Copy single tensor to CPU and write immediately
+                        cpu_tensor = param.detach().cpu()
+                        tensor_index[name] = (f.tell() - data_start, str(cpu_tensor.dtype), tuple(cpu_tensor.shape))
+                        pickler.dump((name, cpu_tensor))
+                        param_count += 1
+                        del cpu_tensor
+                
+                # Stream buffers one at a time  
+                for name, buf in self.model.model.named_buffers():
+                    if buf.device.type == "cuda":
+                        cpu_tensor = buf.detach().cpu()
+                        key = f"buf_{name}"
+                        tensor_index[key] = (f.tell() - data_start, str(cpu_tensor.dtype), tuple(cpu_tensor.shape))
+                        pickler.dump((key, cpu_tensor))
+                        buf_count += 1
+                        del cpu_tensor
+                
+                # Write end marker
+                pickler.dump(None)
+                bytes_written = f.tell()
+            
+            cache_size_mb = bytes_written / 1024**2
             print(f"[RayWorker 0] Cache created: {cache_path} ({cache_size_mb:.1f} MB)")
-            print(f"[RayWorker 0] Cache contains: {param_count} params + {buf_count} buffers")
+            print(f"[RayWorker 0] Cache contains: {param_count} params + {buf_count} buffers (streamed)")
             
-            # CRITICAL: Aggressive cleanup of CPU copies
-            # Delete each tensor reference individually before clearing dict
-            for key in list(state_dict.keys()):
-                state_dict[key] = None  # Break reference
-            state_dict.clear()
-            del state_dict
-            
-            import gc
-            import ctypes
-            # Aggressive GC - force multiple passes
-            for _ in range(5):
-                gc.collect()
+            # Cleanup only at end - much faster than periodic GC
+            gc.collect()
             torch.cuda.empty_cache()
             
             # Force libc to release freed memory back to OS
@@ -621,9 +634,8 @@ class RayWorker:
              # Optimized prefix search
              prefixes = ["", "model.diffusion_model.", "diffusion_model."]
              
-             model_params = dict(self.model.model.named_parameters())
-             
-             for name, param in model_params.items():
+             # Iterate directly - no dict() materialization (saves ~50KB + avoids temp allocations)
+             for name, param in self.model.model.named_parameters():
                  key_found = None
                  # Quick lookup (exact match)
                  if name in state_dict:
@@ -1093,6 +1105,7 @@ class RayWorker:
         temporal_size=64,
         temporal_overlap=8,
         discard_latent_frames=0,
+        vae_dtype="auto",
     ):
         with monitor_memory(f"RayWorker {self.local_rank} - ray_vae_decode", device=self.device):
             print(f"[RayWorker {self.local_rank}] Entering ray_vae_decode (direct method call) for shard {shard_index}...")
@@ -1119,20 +1132,29 @@ class RayWorker:
 
         compression = self.vae_model.spacial_compression_decode()
 
-        # Use bfloat16 for VAE if supported (RTX 3000+)
-        # BF16 has same dynamic range as FP32 (no NaN overflow) but uses 50% less memory
-        # Falls back to float32 on older GPUs without native bf16 support
-        if torch.cuda.is_bf16_supported():
-            vae_dtype = torch.bfloat16
-            print(f"[RayWorker {self.local_rank}] Using bfloat16 VAE (50% memory savings, stable)")
-        else:
-            vae_dtype = torch.float32
-            print(f"[RayWorker {self.local_rank}] Falling back to float32 VAE (bf16 not supported)")
+        # Determine VAE dtype based on user selection
+        if vae_dtype == "auto":
+            # Auto: Use bfloat16 if supported (RTX 3000+), else fall back to float32
+            if torch.cuda.is_bf16_supported():
+                dtype = torch.bfloat16
+                print(f"[RayWorker {self.local_rank}] Using bfloat16 VAE (auto: bf16 supported)")
+            else:
+                dtype = torch.float32
+                print(f"[RayWorker {self.local_rank}] Using float32 VAE (auto: bf16 not supported)")
+        elif vae_dtype == "bf16":
+            dtype = torch.bfloat16
+            print(f"[RayWorker {self.local_rank}] Using bfloat16 VAE (user selected)")
+        elif vae_dtype == "fp16":
+            dtype = torch.float16
+            print(f"[RayWorker {self.local_rank}] Using float16 VAE (user selected - may cause NaN on some models)")
+        else:  # fp32
+            dtype = torch.float32
+            print(f"[RayWorker {self.local_rank}] Using float32 VAE (user selected - stable but 2x memory)")
         
-        self.vae_model.first_stage_model.to(vae_dtype)
-        self.vae_model.vae_dtype = vae_dtype
+        self.vae_model.first_stage_model.to(dtype)
+        self.vae_model.vae_dtype = dtype
         
-        latents_to_decode = samples["samples"].to(vae_dtype)
+        latents_to_decode = samples["samples"].to(dtype)
         print(f"[RayWorker {self.local_rank}] latents_to_decode shape: {latents_to_decode.shape}")
         print(f"[RayWorker {self.local_rank}] tiling: tile_t={temporal_size}, overlap_t={temporal_overlap}")
 

@@ -871,6 +871,10 @@ class RayVAEDecodeDistributed:
                 "ray_actors": ("RAY_ACTORS", {"tooltip": "Ray Actor to submit the model into"}),
                 "samples": ("LATENT",),
                 "vae_name": (folder_paths.get_filename_list("vae"),),
+                "vae_dtype": (["auto", "bf16", "fp16", "fp32"], {
+                    "default": "auto",
+                    "tooltip": "VAE precision: auto=bf16 on RTX3000+/fp32 fallback, bf16=bfloat16 (recommended), fp16=half (may cause NaN), fp32=full (stable but 2x memory)"
+                }),
                 "tile_size": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 32},),
                 "overlap": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 32}),
                 "temporal_size": (
@@ -901,7 +905,7 @@ class RayVAEDecodeDistributed:
 
     CATEGORY = "Raylight"
 
-    def ray_decode(self, ray_actors, vae_name, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8):
+    def ray_decode(self, ray_actors, vae_name, samples, tile_size, vae_dtype="auto", overlap=64, temporal_size=64, temporal_overlap=8):
         gpu_actors = ray_actors["workers"]
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
 
@@ -933,13 +937,10 @@ class RayVAEDecodeDistributed:
             total_output_frames = total_frames
             overlap_latent_frames = 0
         
-        # Pre-divide temporal parameters to match standard ComfyUI VAE Decode behavior
-        if temporal_compression > 1:
-            scaled_temporal_size = max(2, temporal_size // temporal_compression)
-            scaled_temporal_overlap = max(1, min(scaled_temporal_size // 2, temporal_overlap // temporal_compression))
-        else:
-            scaled_temporal_size = None
-            scaled_temporal_overlap = None
+        # NOTE: Do NOT pre-divide temporal parameters by compression factor.
+        # Original ComfyUI's decode_tiled passes tile_t and overlap_t directly to decode_tiled_3d,
+        # which handles scaling internally via tiled_scale_multidim's index_formulas.
+        # Pre-dividing was causing excessive internal tiling cuts, leading to jitter.
         
         frames_per_shard = (total_frames + num_workers - 1) // num_workers
         
@@ -970,9 +971,10 @@ class RayVAEDecodeDistributed:
                 shard_samples,
                 tile_size,
                 overlap=overlap,
-                temporal_size=scaled_temporal_size,
-                temporal_overlap=scaled_temporal_overlap,
-                discard_latent_frames=discard_latent_frames
+                temporal_size=temporal_size,  # Pass raw value, decode_tiled handles scaling
+                temporal_overlap=temporal_overlap,  # Pass raw value, decode_tiled handles scaling
+                discard_latent_frames=discard_latent_frames,
+                vae_dtype=vae_dtype
             ))
 
         print(f"[RayVAEDecode] Dispatched {len(futures)} shards. Pre-allocating streaming buffer...")
