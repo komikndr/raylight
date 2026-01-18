@@ -31,10 +31,48 @@ Bug on Comfy mixed precision model, if you use any `model_name_fp8mixed.safetens
 - Full LoRA support.
 - FSDP CPU offload, analogous to block swap/DisTorch.
 
+## Fork Enhancements (hiyazakite)
+
+The following enhancements were added on top of komikndr's v0.16.0:
+
+### Memory Optimization
+- **Zero-Copy GGUF RAM Offload**: Implemented efficient RAM-based model caching using `/dev/shm` shared memory. Models can be offloaded to RAM and reloaded without duplicating memory across workers.
+- **Smart Model Reload**: Workers now detect if the requested model is already loaded and skip redundant reloads, significantly reducing iteration time for repeated sampling.
+- **Memory Monitoring Utilities**: Added `utils_memory.py` with comprehensive memory tracking (`monitor_memory` context manager, RAM/VRAM/SHM statistics logging).
+- **Aggressive Memory Cleanup**: Enhanced garbage collection and `malloc_trim` calls to reduce memory fragmentation and RSS bloat after model operations.
+- **Dynamic Object Store Sizing**: Changed default `ray_object_store_gb` to `0.0` (Auto) to let Ray manage shared memory automatically (~30% of system RAM), preventing disk spilling with large models.
+
+### GGUF Improvements
+- **GGUF Metadata Backport**: Ported metadata extraction fix from ComfyUI-GGUF PR #399 to support LTXAV (LTX Audio-Video) models.
+- **Zero-Copy Fast Load from Cache**: Implemented streaming restore from `/dev/shm` cache with async CUDA DMA transfers for minimal reload latency.
+- **GGMLTensor Metadata Preservation**: Fixed double-LoRA patching issues by correctly reconstructing `GGMLTensor` objects with their original `tensor_type` and `tensor_shape` metadata during cache restore.
+- **Page Cache Eviction**: Added `evict_page_cache()` to release mmap file handles and reduce RSS after GGUF loading.
+
+### Distributed VAE Decoding
+- **Fixed Distributed VAE**: Corrected sharding and stitching logic for Causal VAEs to eliminate "black blinks" and visual artifacts in decoded video output.
+- **Optimized VAE Memory**: Enhanced memory cleanup within `ray_vae_decode` to prevent VRAM accumulation across shards.
+
+### LTXV/LTX-2 Multi-GPU Support
+- **CompressedTimestep Fix**: Fixed shape mismatch in Ulysses/Sequence Parallel mode by correctly splitting `CompressedTimestep` objects across GPU ranks.
+- **External Sigmas Support**: `XFuserKSamplerAdvanced` now accepts optional `SIGMAS` input for full LTXV scheduler compatibility.
+- **FFN Chunking Node**: Added `RayLTXFFNChunker` node to reduce peak VRAM for LTX-2/LTXAV models by processing FeedForward layers in chunks.
+
+### Worker Lifecycle
+- **Model Offload Node**: Added `RayOffloadModel` node to explicitly trigger full model offload across all Ray workers, releasing VRAM.
+- **Worker Cleanup**: Implemented `offload_and_clear()` method for proper VRAM release and ComfyUI cache deregistration.
+- **NCCL Test Skip Option**: Added `skip_comm_test` parameter to skip the NCCL communication test at startup, saving ~10-15 seconds.
+- **Cluster Reuse**: Ray now attempts to reuse an existing cluster connection instead of always reinitializing.
+
+### Additional Features
+- **GPU Pinning**: Added `gpu_indices` parameter to `RayInitializer` for dedicating specific GPUs to the Ray cluster.
+- **Combined QKV All-to-All**: Added `pack_qkv` option for reduced NCCL communication overhead (experimental, for self-attention models).
+- **Cancellable Ray Operations**: Replaced blocking `ray.get()` calls with `cancellable_get()` for better interrupt handling.
+
 
 ## Table of Contents
 - [Raylight](#raylight)
 - [UPDATE](#update)
+- [Fork Enhancements (hiyazakite)](#fork-enhancements-hiyazakite)
 - [What exactly is Raylight](#what-exactly-is-raylight)
 - [Raylight vs MultiGPU vs ComfyUI Worksplit vs ComfyUI-Distributed](#raylight-vs-multigpu-vs-comfyui-worksplit-branch-vs-comfyui-distributed)
 - [RTM and Known Issues](#rtm-and-known-issues)
