@@ -23,10 +23,12 @@ from raylight.distributed_modules.usp import USPInjectRegistry
 from raylight.distributed_modules.cfg import CFGParallelInjectRegistry
 
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
-from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
+from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm, cleanup_memory, force_malloc_trim
+from raylight.distributed_worker.gguf_utils import GGUFStreamer, evict_page_cache, check_mmap_leak
 from raylight.utils_memory import monitor_memory
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 from raylight.comfy_dist.utils import cancellable_get
+from ray.exceptions import RayActorError
 from ray.exceptions import RayActorError
 from contextlib import contextmanager
 import inspect
@@ -42,43 +44,6 @@ import inspect
 
 
 # Comfy cli args, does not get pass through into ray actor
-def evict_page_cache(path):
-    """Tells the kernel to evict pages of the given file from the Page Cache."""
-    if not path or not os.path.exists(path):
-        return
-    
-    try:
-        if sys.platform.startswith("linux"):
-            fd = os.open(path, os.O_RDONLY)
-            file_size = os.path.getsize(path)
-            # POSIX_FADV_DONTNEED = 4 - tells kernel to evict pages from cache
-            os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_DONTNEED)
-            os.close(fd)
-            print(f"[Raylight] SUCCESS: Evicted {os.path.basename(path)} from page cache ({file_size / 1024**3:.2f} GB)")
-    except (OSError, AttributeError) as e:
-        # posix_fadvise not available on all platforms
-        print(f"[Raylight] Note: Could not evict {os.path.basename(path)} from page cache: {e}")
-
-def _check_mmap_leak(path):
-    """Checks /proc/self/maps to see if the file is still mapped."""
-    if not sys.platform.startswith("linux"):
-        return False
-    
-    try:
-        with open("/proc/self/maps", "r") as f:
-            maps = f.read()
-            
-        if path in maps:
-            # Count occurrences
-            count = maps.count(path)
-            print(f"[Raylight] WARNING: GGUF file is still mapped {count} times in memory: {path}")
-            return True
-        else:
-            print(f"[Raylight] SUCCESS: GGUF file is NOT mapped in memory (Clean Release): {path}")
-            return False
-    except Exception as e:
-        print(f"[Raylight] Failed to check maps: {e}")
-        return False
 
 class RayWorker:
 
@@ -223,113 +188,15 @@ class RayWorker:
         
         STREAMING VERSION: Writes tensors one at a time to avoid 15GB RAM spike.
         """
-        import hashlib
-        import ray
-        import torch
-        import pickle
-
-        # Unique ID per Node + Model (prevents cross-node /dev/shm collisions)
-        node_id = ray.get_runtime_context().get_node_id()[:8]
-        model_hash = hashlib.md5(self.current_unet_path.encode()).hexdigest()[:8] if self.current_unet_path else "unknown"
-        cache_path = f"/dev/shm/raylight_{node_id}_{model_hash}_v2.pt"
-
-        if self.local_rank == 0 and not os.path.exists(cache_path):
-            print(f"[RayWorker 0] Streaming VRAM state to SHM (true streaming mode)...")
-            
-            # TRUE STREAMING: Write tensors one at a time using pickle protocol
-            # This avoids building a 15GB state_dict in RAM before saving
-            param_count = 0
-            buf_count = 0
-            bytes_written = 0
-            
-            # Open file for incremental pickle writes  
-            import pickle
-            import io
-            
-            # We'll build a streaming dict by writing key-value pairs one at a time
-            # Using a temporary approach: collect keys/shapes first, then stream values
-            tensor_index = {}  # name -> (offset, dtype, shape) for verification
-            
-            # Use buffered I/O and protocol 5 for speed (protocol 5 is optimized for large arrays)
-            with open(cache_path, 'wb', buffering=8*1024*1024) as f:  # 8MB buffer
-                pickler = pickle.Pickler(f, protocol=5)
-                
-                # Write header placeholder (will be dict with metadata)
-                header_pos = f.tell()
-                pickler.dump({"version": 2, "streaming": True, "count": 0})
-                data_start = f.tell()
-                
-                # Stream parameters one at a time (NO gc.collect during loop - major speedup)
-                for name, param in self.model.model.named_parameters():
-                    if param.device.type == "cuda":
-                        # Copy single tensor to CPU
-                        cpu_tensor = param.detach().cpu()
-                        
-                        # Fix for UnpicklingError & Metadata Loss:
-                        # 1. Cast to plain torch.Tensor to ensure pickle compatibility
-                        # 2. Extract GGML metadata manually
-                        # 3. Clear patches to ensure we cache BASE weights (prevent double-patching)
-                        metadata = None
-                        if hasattr(cpu_tensor, "tensor_type") or hasattr(param, "tensor_type"):
-                            # Prefer param attrs if cpu_tensor lost them
-                            t_type = getattr(cpu_tensor, "tensor_type", getattr(param, "tensor_type", None))
-                            t_shape = getattr(cpu_tensor, "tensor_shape", getattr(param, "tensor_shape", None))
-                            metadata = {
-                                "tensor_type": t_type,
-                                "tensor_shape": t_shape,
-                                "patches": [] # Explicitly clear patches for clean base weights
-                            }
-                        
-                        plain_tensor = cpu_tensor.as_subclass(torch.Tensor)
-                        
-                        tensor_index[name] = (f.tell() - data_start, str(plain_tensor.dtype), tuple(plain_tensor.shape))
-                        pickler.dump((name, plain_tensor, metadata))
-                        pickler.clear_memo()
-                        param_count += 1
-                        del cpu_tensor
-                        del plain_tensor
-                
-                # Stream buffers one at a time  
-                for name, buf in self.model.model.named_buffers():
-                    if buf.device.type == "cuda":
-                        cpu_tensor = buf.detach().cpu()
-                        key = f"buf_{name}"
-                        tensor_index[key] = (f.tell() - data_start, str(cpu_tensor.dtype), tuple(cpu_tensor.shape))
-                        pickler.dump((key, cpu_tensor, None)) # None metadata for buffers
-                        pickler.clear_memo()
-                        buf_count += 1
-                        del cpu_tensor
-                
-                # Write end marker
-                pickler.dump(None)
-                pickler.clear_memo()
-                bytes_written = f.tell()
-            
-            cache_size_mb = bytes_written / 1024**2
-            print(f"[RayWorker 0] Cache created: {cache_path} ({cache_size_mb:.1f} MB)")
-            print(f"[RayWorker 0] Cache contains: {param_count} params + {buf_count} buffers (streamed)")
-            
-            # Cleanup only at end - much faster than periodic GC
-            gc.collect()
-            torch.cuda.empty_cache()
-            
-            # Force libc to release freed memory back to OS
-            try:
-                libc = ctypes.CDLL('libc.so.6')
-                libc.malloc_trim(0)
-            except Exception:
-                pass
-            
-            # Evict original GGUF file from page cache - we'll use /dev/shm cache instead
-            if self.current_unet_path:
-                evict_page_cache(self.current_unet_path)
-        elif self.local_rank != 0:
-            print(f"[RayWorker {self.local_rank}] Waiting for cache from Worker 0...")
-        else:
-            print(f"[RayWorker 0] Cache already exists: {cache_path}")
-        
         # CRITICAL: Barrier to ensure Worker 0 finishes cache before others proceed
         # Workers 1-3 must wait for cache file to be fully written
+        
+        cache_path = GGUFStreamer.stream_to_shm(
+            self.model, 
+            self.current_unet_path, 
+            self.local_rank
+        )
+        
         import torch.distributed as dist
         if dist.is_initialized():
             dist.barrier()
@@ -366,12 +233,7 @@ class RayWorker:
             print(f"[RayWorker {self.local_rank}] Warning during GPU strip: {e}")
 
         # Force VRAM cleanup
-        import gc
-        gc.collect()
-        gc.collect() 
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+        cleanup_memory()
         
         print(f"[RayWorker {self.local_rank}] GGUF Soft-Offload complete. Model retained with nuked weights.")
 
@@ -384,9 +246,7 @@ class RayWorker:
         self.current_unet_path = None
         self.current_sd_ref = None
         
-        gc.collect()
-        gc.collect()
-        torch.cuda.empty_cache()
+        cleanup_memory()
         print(f"[RayWorker {self.local_rank}] Offload complete.")
 
         # Manually deregister from ComfyUI's cache
@@ -400,10 +260,7 @@ class RayWorker:
 
         del model_to_remove
         
-        gc.collect()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+        cleanup_memory()
         
         print(f"[RayWorker {self.local_rank}] Model offloaded successfully.")
 
@@ -477,9 +334,7 @@ class RayWorker:
         del self.state_dict
         self.model = None
         self.state_dict = None
-        torch.cuda.synchronize()
-        comfy.model_management.soft_empty_cache()
-        gc.collect()
+        cleanup_memory()
 
         self.model, self.state_dict = fsdp_load_diffusion_model(
             unet_path,
@@ -488,9 +343,7 @@ class RayWorker:
             self.is_cpu_offload,
             model_options=model_options,
         )
-        torch.cuda.synchronize()
-        comfy.model_management.soft_empty_cache()
-        gc.collect()
+        cleanup_memory()
 
         import ray
         if self.state_dict is not None:
@@ -558,8 +411,7 @@ class RayWorker:
     def set_base_ref(self, ref):
         self.base_sd_ref = ref
 
-    def get_base_ref(self):
-        return getattr(self, "base_sd_ref", None)
+
 
     def create_patched_ref(self, lora_list):
         import copy
@@ -584,41 +436,44 @@ class RayWorker:
         # trigger Copy-on-Write and permanently bloat Worker 0's memory usage with dirty pages.
         scratch_unet = copy.deepcopy(self.model.model)
         
-        # Create a new Patcher wrapping this private model
-        work_model = self.model.clone()
-        work_model.model = scratch_unet
-        
-        # 3. Apply LoRAs to Scratchpad
-        for lora in lora_list:
-             lora_path = lora["path"]
-             strength_model = lora["strength_model"]
-             strength_clip = 1.0 
-             try:
-                 lora_model = comfy.utils.load_torch_file(lora_path, safe_load=True)
-             except Exception as e:
-                 print(f"[Raylight] Failed to load LoRA {lora_path}: {e}")
-                 continue
-             
-             work_model, _ = comfy.sd.load_lora_for_models(
-                 work_model, None, lora_model, strength_model, strength_clip
-             )
-             del lora_model
-             gc.collect()
-
-        # 4. Flatten to State Dict
-        print("[RayWorker] Compiling Patched State Dict (Target: Object Store)...")
-        # patch_model(cpu) modifies scratch_unet in-place.
-        work_model.patch_model(device_to=torch.device("cpu"))
-        
-        patched_sd = work_model.model.state_dict()
-        
-        # 5. Cleanup
-        # We don't need to unpatch because we're discarding scratch_unet.
-        del work_model
-        del scratch_unet
-        gc.collect()
-        
-        return patched_sd
+        try:
+            # Create a new Patcher wrapping this private model
+            work_model = self.model.clone()
+            work_model.model = scratch_unet
+            
+            # 3. Apply LoRAs to Scratchpad
+            for lora in lora_list:
+                 lora_path = lora["path"]
+                 strength_model = lora["strength_model"]
+                 strength_clip = 1.0 
+                 try:
+                     lora_model = comfy.utils.load_torch_file(lora_path, safe_load=True)
+                 except Exception as e:
+                     print(f"[Raylight] Failed to load LoRA {lora_path}: {e}")
+                     continue
+                 
+                 work_model, _ = comfy.sd.load_lora_for_models(
+                     work_model, None, lora_model, strength_model, strength_clip
+                 )
+                 del lora_model
+                 cleanup_memory()
+    
+            # 4. Flatten to State Dict
+            print("[RayWorker] Compiling Patched State Dict (Target: Object Store)...")
+            # patch_model(cpu) modifies scratch_unet in-place.
+            work_model.patch_model(device_to=torch.device("cpu"))
+            
+            patched_sd = work_model.model.state_dict()
+            return patched_sd
+            
+        finally:
+            # 5. Cleanup
+            # We don't need to unpatch because we're discarding scratch_unet.
+            if 'work_model' in locals():
+                del work_model
+            if 'scratch_unet' in locals():
+                del scratch_unet
+            cleanup_memory()
 
     def _inject_gguf_ops(self, model_options, state_dict):
         print("[RayWorker] Detected GGUF Reload. Injecting GGMLOps...")
@@ -722,8 +577,7 @@ class RayWorker:
              if count > 0 or cast_count > 0:
                  print(f"[Raylight] Memory Sharing ENFORCED: {count} exact + {cast_count} casted parameters linked back to Shared Object Store.")
                  # Trigger GC to free the temporary copies we just orphaned
-                 gc.collect()
-                 torch.cuda.empty_cache()
+                 cleanup_memory()
              else:
                  print("[Raylight] Zero-Copy check passed (or no matching keys found).")
 
@@ -842,9 +696,8 @@ class RayWorker:
         self.is_model_loaded = True
 
         # Explicitly free memory
-        import gc
-        gc.collect()
-        comfy.model_management.soft_empty_cache()
+        # Explicitly free memory
+        cleanup_memory()
 
 
     def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype):
@@ -905,13 +758,10 @@ class RayWorker:
                 self.model.backup.clear()
             
             # Aggressive GC
-            import gc
-            for _ in range(3):
-                gc.collect()
-            comfy.model_management.soft_empty_cache()
-            
+            cleanup_memory()
+
             # Verify clean release
-            _check_mmap_leak(unet_path)
+            check_mmap_leak(unet_path)
             
             # NOTE: We do NOT evict here anymore to avoid deadlocks.
             # Eviction is now handled explicitly by the Loader node via barrier_and_evict()
@@ -1055,7 +905,7 @@ class RayWorker:
             )
             del lora_model # Release raw dict immediately
         
-        gc.collect()
+        cleanup_memory()
         return work_model
 
 
@@ -1140,17 +990,10 @@ class RayWorker:
             self.vae_model = None
             
             # Aggressive cleanup
-            import gc
-            for _ in range(3):
-                gc.collect()
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+            cleanup_memory()
             
             # Force OS to reclaim freed memory
-            try:
-                ctypes.CDLL("libc.so.6").malloc_trim(0)
-            except Exception:
-                pass
+            force_malloc_trim()
             
             print(f"[RayWorker {self.local_rank}] VAE released.")
         return True
@@ -1334,20 +1177,65 @@ class RayWorker:
             self.vae_model.first_stage_model.to('cpu')
         
         print(f"[RayWorker {self.local_rank}] Shard {shard_index} complete. Cleanup and return.")
-        import gc
-        for _ in range(3):
-            gc.collect()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+        cleanup_memory()
 
         # Force OS to reclaim freed memory (fixes RSS creep on Worker 0)
-        try:
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception as e:
-            print(f"[RayWorker {self.local_rank}] Warning: malloc_trim failed: {e}")
+        force_malloc_trim()
             
         return (shard_index, result_payload)
+
+    def _prepare_for_sampling(self, latent, lora_list):
+        """Common setup for sampling methods."""
+        # Apply Runtime LoRAs locally
+        work_model = self._apply_runtime_loras(self.model, lora_list)
+
+        latent_image = latent["samples"]
+        # Handle dict copy in caller if needed, or here if we want to be safe
+        # common_ksampler makes a copy of latent later (out = latent.copy())
+        # custom_sampler makes a copy of latent early. 
+        # For now, we return modified latent_image.
+
+        latent_image = comfy.sample.fix_empty_latent_channels(work_model, latent_image)
+
+        if self.parallel_dict["is_fsdp"] is True:
+            work_model.patch_fsdp()
+            # FSDP cleanup
+            if hasattr(self, "state_dict") and self.state_dict is not None:
+                del self.state_dict
+                self.state_dict = None
+                cleanup_memory()
+
+        disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
+        if self.local_rank == 0:
+            disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+        # CRITICAL: Ensure model device references are valid for this worker
+        if hasattr(work_model, 'load_device') and work_model.load_device != self.device:
+            work_model.load_device = self.device
+            
+        noise_mask = latent.get("noise_mask", None)
+            
+        return work_model, latent_image, noise_mask, disable_pbar
+    
+    @contextmanager
+    def sampling_context(self, latent, lora_list):
+        """Context manager for sampling operations to ensure cleanup."""
+        try:
+            # 1. Common Setup (LoRAs, FSDP, Pbar, Device, Latent Fix)
+            # We need a copy of latent because _prepare modifies it
+            # The caller passes the original dict, we copy it here
+            work_latent = latent.copy()
+            
+            setup_result = self._prepare_for_sampling(work_latent, lora_list)
+            # setup_result is (work_model, latent_image, noise_mask, disable_pbar)
+            
+            # We yield the setup results along with the work_latent dict 
+            # so the caller can update it with samples
+            yield setup_result + (work_latent,)
+            
+        finally:
+            # Always clean up memory, even if sampling fails
+            cleanup_memory()
 
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
@@ -1364,66 +1252,32 @@ class RayWorker:
         lora_list=None,
     ):
         # NOTE: Reload is now handled by coordinator (sampler node) BEFORE dispatching.
-        # This ensures all workers are ready before any collective operations begin.
-             
-        # Apply Runtime LoRAs locally
-        work_model = self._apply_runtime_loras(self.model, lora_list)
 
+        with self.sampling_context(latent_image, lora_list) as (work_model, final_samples, noise_mask, disable_pbar, work_latent):
+            # 2. Noise Generation
+            if not add_noise:
+                noise = Noise_EmptyNoise().generate_noise(work_latent)
+            else:
+                noise = Noise_RandomNoise(noise_seed).generate_noise(work_latent)
 
-        latent = latent_image
-        latent_image = latent["samples"]
-        latent = latent.copy()
-        latent_image = comfy.sample.fix_empty_latent_channels(work_model, latent_image)
-        latent["samples"] = latent_image
+            # 3. Sampling
+            with torch.no_grad():
+                samples = comfy.sample.sample_custom(
+                    work_model,
+                    noise,
+                    cfg,
+                    sampler,
+                    sigmas,
+                    positive,
+                    negative,
+                    final_samples,
+                    noise_mask=noise_mask,
+                    disable_pbar=disable_pbar,
+                    seed=noise_seed,
+                )
+                out = work_latent.copy()
+                out["samples"] = samples
 
-        if not add_noise:
-            noise = Noise_EmptyNoise().generate_noise(latent)
-        else:
-            noise = Noise_RandomNoise(noise_seed).generate_noise(latent)
-
-        noise_mask = None
-        if "noise_mask" in latent:
-            noise_mask = latent["noise_mask"]
-
-        if self.parallel_dict["is_fsdp"] is True:
-            work_model.patch_fsdp()
-            del self.state_dict
-            self.state_dict = None
-            torch.cuda.synchronize()
-            comfy.model_management.soft_empty_cache()
-            gc.collect()
-
-        disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
-        if self.local_rank == 0:
-            disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-
-        # CRITICAL: Ensure model device references are valid for this worker
-        # This guards against stale device references from previous contexts
-        if hasattr(work_model, 'load_device') and work_model.load_device != self.device:
-            work_model.load_device = self.device
-
-        with torch.no_grad():
-            samples = comfy.sample.sample_custom(
-                work_model,
-                noise,
-                cfg,
-                sampler,
-                sigmas,
-                positive,
-                negative,
-                latent_image,
-                noise_mask=noise_mask,
-                disable_pbar=disable_pbar,
-                seed=noise_seed,
-            )
-            out = latent.copy()
-            out["samples"] = samples
-
-            # Legacy debug_memory_leaks call removed
-
-        
-        comfy.model_management.soft_empty_cache()
-        gc.collect()
         return out
 
     @patch_temp_fix_ck_ops
@@ -1448,93 +1302,68 @@ class RayWorker:
     ):
         with monitor_memory(f"RayWorker {self.local_rank} - common_ksampler", device=self.device):
             # NOTE: Reload is now handled by coordinator (sampler node) BEFORE dispatching.
-            # This ensures all workers are ready before any collective operations begin.
-
-            # Apply Runtime LoRAs locally (Fallback for FSDP/No-Base-Ref)
-            work_model = self._apply_runtime_loras(self.model, lora_list)
-
-
-            latent_image = latent["samples"]
-            latent_image = comfy.sample.fix_empty_latent_channels(work_model, latent_image)
-
-            if self.parallel_dict["is_fsdp"] is True:
-                work_model.patch_fsdp()
-
-            if disable_noise:
-                noise = torch.zeros(
-                    latent_image.size(),
-                    dtype=latent_image.dtype,
-                    layout=latent_image.layout,
-                    device="cpu",
-                )
-            else:
-                batch_inds = latent["batch_index"] if "batch_index" in latent else None
-                noise = comfy.sample.prepare_noise(
-                    latent_image, seed, batch_inds
-                )
-
-            noise_mask = None
-            if "noise_mask" in latent:
-                noise_mask = latent["noise_mask"]
-
-            disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
-            if self.local_rank == 0:
-                disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
             
-            # Sampler resolution logic for custom sigmas
-            sampler_obj = sampler_name
-            if sigmas is not None:
-                 if isinstance(sampler_name, str):
-                     sampler_obj = comfy.samplers.ksampler(sampler_name)
-
-            # CRITICAL: Ensure model device references are valid for this worker
-            # This guards against stale device references from previous contexts
-            if hasattr(work_model, 'load_device') and work_model.load_device != self.device:
-                work_model.load_device = self.device
-
-            with torch.no_grad():
-                if sigmas is None:
-                    samples = comfy.sample.sample(
-                        work_model,
-                        noise,
-                        steps,
-                        cfg,
-                        sampler_name,
-                        scheduler,
-                        positive,
-                        negative,
-                        latent_image,
-                        denoise=denoise,
-                        disable_noise=disable_noise,
-                        start_step=start_step,
-                        last_step=last_step,
-                        force_full_denoise=force_full_denoise,
-                        noise_mask=noise_mask,
-                        disable_pbar=disable_pbar,
-                        seed=seed,
-                   )
-                else:
-                     samples = comfy.sample.sample_custom(
-                        work_model,
-                        noise,
-                        cfg,
-                        sampler_obj,
-                        sigmas,
-                        positive,
-                        negative,
-                        latent_image,
-                        noise_mask=noise_mask,
-                        disable_pbar=disable_pbar,
-                        seed=seed,
+            with self.sampling_context(latent, lora_list) as (work_model, final_samples, noise_mask, disable_pbar, work_latent):
+                # 2. Noise Generation
+                if disable_noise:
+                    noise = torch.zeros(
+                        final_samples.size(),
+                        dtype=final_samples.dtype,
+                        layout=final_samples.layout,
+                        device="cpu",
                     )
-                
-                out = latent.copy()
-                out["samples"] = samples
+                else:
+                    batch_inds = work_latent.get("batch_index", None)
+                    noise = comfy.sample.prepare_noise(
+                        final_samples, seed, batch_inds
+                    )
 
-        # Legacy debug_memory_leaks call removed
+                # 3. Sampler resolution logic for custom sigmas
+                sampler_obj = sampler_name
+                if sigmas is not None:
+                     if isinstance(sampler_name, str):
+                         sampler_obj = comfy.samplers.ksampler(sampler_name)
 
-        #comfy.model_management.soft_empty_cache()
-        gc.collect()
+                # 4. Sampling
+                with torch.no_grad():
+                    if sigmas is None:
+                        samples = comfy.sample.sample(
+                            work_model,
+                            noise,
+                            steps,
+                            cfg,
+                            sampler_name,
+                            scheduler,
+                            positive,
+                            negative,
+                            final_samples,
+                            denoise=denoise,
+                            disable_noise=disable_noise,
+                            start_step=start_step,
+                            last_step=last_step,
+                            force_full_denoise=force_full_denoise,
+                            noise_mask=noise_mask,
+                            disable_pbar=disable_pbar,
+                            seed=seed,
+                       )
+                    else:
+                         samples = comfy.sample.sample_custom(
+                            work_model,
+                            noise,
+                            cfg,
+                            sampler_obj,
+                            sigmas,
+                            positive,
+                            negative,
+                            final_samples,
+                            noise_mask=noise_mask,
+                            disable_pbar=disable_pbar,
+                            seed=seed,
+                        )
+                    
+                    out = work_latent.copy()
+                    out["samples"] = samples
+
         return (out,)
 
 
