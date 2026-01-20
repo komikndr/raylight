@@ -25,50 +25,6 @@ from .distributed_worker.ray_worker import (
 from .comfy_dist.utils import cancellable_get
 from .utils_memory import monitor_memory
 
-
-def _cleanup_raylight_shm_cache():
-    """Clean up stale /dev/shm cache files from previous Raylight sessions."""
-    import glob
-    cache_files = glob.glob("/dev/shm/raylight_*.pt")
-    if cache_files:
-        print(f"[Raylight] Cleaning up {len(cache_files)} stale SHM cache files...")
-        for f in cache_files:
-            try:
-                os.remove(f)
-            except OSError:
-                pass  # Ignore if file is in use or already removed
-
-
-# Hook into ComfyUI's manual cache clearing mechanism
-_original_unload_all_models = None
-
-def _install_smart_cleanup_hook():
-    """Monkey-patch ComfyUI's unload_all_models to catch manual button presses."""
-    global _original_unload_all_models
-    import comfy.model_management as mm
-    import traceback
-    
-    if _original_unload_all_models is None:
-        _original_unload_all_models = mm.unload_all_models
-        
-        def _hooked_unload_all_models():
-            # Check if this is a manual clear vs automatic pre-run clear
-            # execution.py calls it automatically (OOM or end of run) - we want to keep cache then.
-            # Manual 'Free memory' via API/button triggers from main.py or server.py.
-            stack = traceback.format_stack()
-            is_automatic = any("execution.py" in frame for frame in stack)
-            
-            if not is_automatic:
-                _cleanup_raylight_shm_cache()
-            
-            return _original_unload_all_models()
-        
-        mm.unload_all_models = _hooked_unload_all_models
-
-# Install hook at import time
-_install_smart_cleanup_hook()
-
-
 # Workaround https://github.com/comfyanonymous/ComfyUI/pull/11134
 # since in FSDPModelPatcher mode, ray cannot pickle None type cause by getattr
 def _monkey():
@@ -341,9 +297,6 @@ class RayInitializer:
                     # Shut down so if comfy user try another workflow it will not cause error
                     ray.shutdown()
                     
-                    # Clean up stale /dev/shm cache files from previous sessions
-                    _cleanup_raylight_shm_cache()
-                    
                     # Build init kwargs - disable metrics agent for faster startup
                     init_kwargs = {
                         'namespace': ray_cluster_namespace,
@@ -480,7 +433,6 @@ class RayUNETLoader:
                     {"tooltip": "Ray Actor to submit the model into"},
                 ),
             },
-            "optional": {"lora": ("RAY_LORA", {"default": None})},
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
@@ -489,7 +441,7 @@ class RayUNETLoader:
 
     CATEGORY = "Raylight"
 
-    def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, lora=None):
+    def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype):
         with monitor_memory("RayUNETLoader.load_ray_unet"):
             ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
 
@@ -510,11 +462,6 @@ class RayUNETLoader:
 
         loaded_futures = []
         patched_futures = []
-
-        for actor in gpu_actors:
-            loaded_futures.append(actor.set_lora_list.remote(lora))
-        cancellable_get(loaded_futures)
-        loaded_futures = []
 
         if parallel_dict["is_fsdp"] is True:
             worker0 = ray.get_actor("RayWorker:0")
@@ -555,53 +502,7 @@ class RayUNETLoader:
         return (ray_actors,)
 
 
-class RayLoraLoader:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "lora_name": (
-                    folder_paths.get_filename_list("loras"),
-                    {"tooltip": "The name of the LoRA."},
-                ),
-                "strength_model": (
-                    "FLOAT",
-                    {
-                        "default": 1.0,
-                        "min": -100.0,
-                        "max": 100.0,
-                        "step": 0.01,
-                        "tooltip": "How strongly to modify the diffusion model. This value can be negative.",
-                    },
-                ),
-            },
-            "optional": {"prev_ray_lora": ("RAY_LORA", {"default": None})},
-        }
 
-    RETURN_TYPES = ("RAY_LORA",)
-    RETURN_NAMES = ("ray_lora",)
-    FUNCTION = "load_lora"
-    CATEGORY = "Raylight"
-
-    def load_lora(self, lora_name, strength_model, prev_ray_lora=None):
-        loras_list = []
-
-        if strength_model == 0.0:
-            if prev_ray_lora is not None:
-                loras_list.extend(prev_ray_lora)
-            return (loras_list,)
-
-        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
-        lora = {
-            "path": lora_path,
-            "strength_model": strength_model,
-        }
-
-        if prev_ray_lora is not None:
-            loras_list.extend(prev_ray_lora)
-
-        loras_list.append(lora)
-        return (loras_list,)
 
 
 class XFuserKSamplerAdvanced:
@@ -673,9 +574,7 @@ class XFuserKSamplerAdvanced:
     ):
         with monitor_memory("XFuserKSampler.ray_sample"):
             # Clean VRAM for preparation to load model
-            gc.collect()
-            comfy.model_management.unload_all_models()
-            comfy.model_management.soft_empty_cache()
+            pass
         force_full_denoise = True
         if return_with_leftover_noise == "enable":
             force_full_denoise = False
@@ -795,9 +694,6 @@ class DPKSamplerAdvanced:
             latent_image = [latent_image[0]] * len(gpu_actors)
 
         # Clean VRAM for preparation to load model
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
         force_full_denoise = True
         if return_with_leftover_noise == "enable":
             force_full_denoise = False
@@ -1079,8 +975,6 @@ class RayVAEDecodeDistributed:
 
                         del shard_data
 
-                gc.collect()
-
             del remaining
             del futures # Ensure all futures are deleted to release Ray object store references
 
@@ -1110,9 +1004,6 @@ class RayVAEDecodeDistributed:
                 release_futures = [actor.ray_vae_release.remote() for actor in gpu_actors]
                 cancellable_get(release_futures)
                 print("[RayVAEDecode] VAE released from all workers.")
-                
-                # Local GC as well
-                gc.collect()
 
             return (full_image,)
             
@@ -1161,7 +1052,7 @@ NODE_CLASS_MAPPINGS = {
     "XFuserKSamplerAdvanced": XFuserKSamplerAdvanced,
     "DPKSamplerAdvanced": DPKSamplerAdvanced,
     "RayUNETLoader": RayUNETLoader,
-    "RayLoraLoader": RayLoraLoader,
+
     "RayInitializer": RayInitializer,
     "RayInitializerAdvanced": RayInitializerAdvanced,
     "DPNoiseList": DPNoiseList,
@@ -1173,7 +1064,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "XFuserKSamplerAdvanced": "XFuser KSampler (Advanced)",
     "DPKSamplerAdvanced": "Data Parallel KSampler (Advanced)",
     "RayUNETLoader": "Load Diffusion Model (Ray)",
-    "RayLoraLoader": "Load Lora Model (Ray)",
+
     "RayInitializer": "Ray Init Actor",
     "RayInitializerAdvanced": "Ray Init Actor (Advanced)",
     "DPNoiseList": "Data Parallel Noise List",

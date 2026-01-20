@@ -79,3 +79,6 @@ def cleanup_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+    
+    # CRITICAL for Zero-Copy: Force OS to reclaim freed buffers and page cache
+    force_malloc_trim()

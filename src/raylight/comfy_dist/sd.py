@@ -158,25 +158,9 @@ def gguf_load_diffusion_model(unet_path, model_options={}, dequant_dtype=None, p
         logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
         raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))
     model = GGUFModelPatcher.clone(model)
+    model.mmap_cache = sd # Capture mmap references for zero-copy offload
     model.gguf_metadata = extra.get("metadata", {})
     model.unet_path = unet_path
-    
-    # NUCLEAR CLEANUP: Explicitly delete state_dict and trigger GC
-    print(f"[Raylight] Loader: Nuclear cleanup of mmap state_dict...")
-    del sd
-    del extra
-    del ops
-    import gc
-    import ctypes
-    for _ in range(5):
-        gc.collect()
-    torch.cuda.empty_cache()
-    
-    # Force libc to release freed memory back to OS
-    try:
-        ctypes.CDLL('libc.so.6').malloc_trim(0)
-    except Exception:
-        pass
     
     return model
 

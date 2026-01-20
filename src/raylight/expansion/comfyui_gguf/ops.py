@@ -125,8 +125,10 @@ class GGMLLayer(torch.nn.Module):
         weight, bias = state_dict.get(f"{prefix}weight"), state_dict.get(
             f"{prefix}bias"
         )
-        # NOTE: using modified load for linear due to not initializing on creation, see GGMLOps todo
-        if self.is_ggml_quantized(weight=weight, bias=bias) or isinstance(
+        # CRITICAL: Always use pointer swapping (GGML load) if the incoming weight is a GGMLTensor.
+        # This prevents standard load_state_dict from doing a dense copy_ for F16/F32 layers in GGUF.
+        from .ops import GGMLTensor
+        if isinstance(weight, GGMLTensor) or self.is_ggml_quantized(weight=weight, bias=bias) or isinstance(
             self, torch.nn.Linear
         ):
             return self.ggml_load_from_state_dict(state_dict, prefix, *args, **kwargs)

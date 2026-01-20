@@ -240,9 +240,6 @@ class XFuserSamplerCustom:
                 "sigmas": ("SIGMAS",),
                 "latent_image": ("LATENT",),
             },
-            "optional": {
-                "lora": ("RAY_LORA", {"default": None}),
-            }
         }
 
     RETURN_TYPES = ("LATENT",)
@@ -315,9 +312,6 @@ class DPSamplerCustom:
                 "sigmas": ("SIGMAS",),
                 "latent_image": ("LATENT",),
             },
-            "optional": {
-                "lora": ("RAY_LORA", {"default": None}),
-            }
         }
 
     RETURN_TYPES = ("LATENT",)
