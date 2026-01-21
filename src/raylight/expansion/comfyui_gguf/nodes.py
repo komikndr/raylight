@@ -40,7 +40,9 @@ update_folder_names_and_paths("clip_gguf", ["text_encoders", "clip"])
 
 class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     patch_on_device = False
-    mmap_cache = {}
+    # Instance attributes:
+    # mmap_cache: Dict[str, GGMLTensor]
+    # unet_path: str
 
     def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
         if key not in self.patches:
@@ -82,23 +84,75 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
 
     def unpatch_model(self, device_to=None, unpatch_weights=True):
         if unpatch_weights:
-            print(f"[GGUFModelPatcher] Unpatching model... (Target: {device_to}, Weights: {unpatch_weights})")
+            print(f"[GGUFModelPatcher] Zero-Copy Offload: Restoring mmap references (Target: {device_to})")
             
             # 1. Standard unpatch for non-weight state.
-            # We pass device_to=None to prevent super() from moving/converting our 'meta' weights.
             super().unpatch_model(device_to=None, unpatch_weights=unpatch_weights)
 
-            # 2. GHOST OFFLOAD: Convert all parameters to 'meta' and clear mmap_cache.
-            # This destroys the process mappings and drops RSS to near-zero.
-            print(f"[GGUFModelPatcher] Ghost Offload: Moving weights to 'meta' and clearing mappings...")
-            for p in self.model.parameters():
-                if p.device.type != 'meta':
-                    p.data = torch.empty_like(p.data, device='meta')
+            # 2. POINTER SWAP: Restore mmap references to parameters
+            # This drops the GPU reference and replaces it with the CPU mmap reference
+            # without triggering a copy to RAM.
+            from .ops import GGMLTensor
             
-            self.mmap_cache = {}
+            moved_to_mmap = 0
+            mmap_cache = getattr(self, "mmap_cache", None)
+            
+            if mmap_cache:
+                # Build a local lookup for parameters
+                param_map = {name: param for name, param in self.model.named_parameters()}
+                
+                for name in mmap_cache:
+                    mmap_weight = mmap_cache[name]
+                    
+                    # Extract raw data from GGMLTensor if needed
+                    if isinstance(mmap_weight, GGMLTensor):
+                        mmap_data = mmap_weight.data
+                    else:
+                        mmap_data = mmap_weight
+
+                    # Advanced Fuzzy Matching
+                    target_param = None
+                    
+                    # 1. Exact & Standard Prefix Matches
+                    if name in param_map:
+                        target_param = param_map[name]
+                    elif f"diffusion_model.{name}" in param_map:
+                        target_param = param_map[f"diffusion_model.{name}"]
+                    elif f"model.diffusion_model.{name}" in param_map:
+                        target_param = param_map[f"model.diffusion_model.{name}"]
+                    elif name.startswith("model.diffusion_model.") and name[len("model.diffusion_model."):] in param_map:
+                        target_param = param_map[name[len("model.diffusion_model."):]]
+                    
+                    # 2. Fuzzy Suffix Match (if still not found)
+                    if target_param is None:
+                        # Try matching just the suffix (e.g. '0.attn_q.weight')
+                        # normalize name
+                        norm_name = name.replace("model.diffusion_model.", "")
+                        for p_name, p_val in param_map.items():
+                             norm_p_name = p_name.replace("model.diffusion_model.", "")
+                             if norm_p_name == norm_name:
+                                 target_param = p_val
+                                 break
+
+                    if target_param is not None:
+                        # CRITICAL: Pointer Swap. 
+                        # We use .data = ... to avoid triggering autograd or complex assignment logic.
+                        target_param.data = mmap_data.data
+                        moved_to_mmap += 1
+            
+            print(f"[GGUFModelPatcher] Zero-Copy: Restored {moved_to_mmap} parameters to mmap.")
+            
+            # FALLBACK: If we failed to swap ANYTHING, we MUST still offload the VRAM!
+            if moved_to_mmap == 0 and device_to is not None and device_to.type == "cpu":
+                 print(f"[GGUFModelPatcher] WARNING: Zero-Copy failed (0 swapped). Forcing standard offload to {device_to}...")
+                 self.model.to(device_to)
+            
+            if device_to is not None:
+                self.current_device = device_to
+                
             from raylight.distributed_worker.utils import cleanup_memory
             cleanup_memory()
-            print(f"[GGUFModelPatcher] Ghost Offload Complete. RSS should be released.")
+            print(f"[GGUFModelPatcher] Offload Complete.")
 
         # Move patches themselves back to offload device if they were on GPU
         for key, patch_list in self.patches.items():
@@ -129,50 +183,31 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                                 new_patch[1] = new_v
                                 patch_list[i] = tuple(new_patch)
 
-        # Manually move non-GGUF weights to target device
-        # This ensures real GPU weights (like biases or non-quantized layers) are offloaded,
-        # while GGUF/Mmap weights stay untouched.
+        # Manually move non-GGUF weights (buffers etc) to target device
         if device_to is not None and unpatch_weights:
-             self.current_device = device_to
-             from raylight.expansion.comfyui_gguf.ops import GGMLTensor
-             
-             print(f"[GGUFModelPatcher] Offloading non-GGUF weights to {device_to}...")
+             print(f"[GGUFModelPatcher] Offloading remaining buffers to {device_to}...")
              moved_count = 0
-             
-             # Move all parameters directly
-             for param in self.model.parameters():
-                 # SIMPLE RULE: If it's on CUDA, it must go to CPU to free VRAM.
-                 # GGUF mmap tensors are always on CPU, so they are naturally skipped.
-                 # We don't need complex isinstance checks which might fail.
-                 if param.device.type == 'cuda' and device_to.type == 'cpu':
-                      param.data = param.data.to(device_to)
-                      if param._grad is not None:
-                           param._grad.data = param._grad.data.to(device_to)
-                      moved_count += 1
-                 elif param.device != device_to and device_to.type != 'cpu':
-                      # If moving TO cuda (reloading), we might want strict checks vs GGUF
-                      # But here we are mostly concerned with Offload.
-                      pass 
-
-             # Move all buffers directly
              for buf in self.model.buffers():
                  if buf.device.type == 'cuda' and device_to.type == 'cpu':
                      buf.data = buf.data.to(device_to)
                      moved_count += 1
-            
-             print(f"[GGUFModelPatcher] Offloaded {moved_count} tensors to {device_to}.")
+             print(f"[GGUFModelPatcher] Offloaded {moved_count} buffers to {device_to}.")
 
     def load(self, *args, force_patch_weights=False, **kwargs):
-        # GHOST RE-HYDRATION: Re-map the GGUF file if cache was cleared during offload.
-        if not hasattr(self, "mmap_cache") or (not self.mmap_cache and hasattr(self, "unet_path")):
-            print(f"[GGUFModelPatcher] Ghost Re-hydration: Mapping {self.unet_path}...")
+        # GHOST RE-HYDRATION: Re-map the GGUF file ONLY if cache is missing and we have a path.
+        m_cache = getattr(self, "mmap_cache", None)
+        u_path = getattr(self, "unet_path", None)
+        
+        # Robust check for empty or missing cache
+        if (m_cache is None or (isinstance(m_cache, dict) and len(m_cache) == 0)) and u_path:
+            print(f"[GGUFModelPatcher] Ghost Re-hydration: Mapping {u_path}...")
             from .loader import gguf_sd_loader
-            sd, _ = gguf_sd_loader(self.unet_path)
+            sd, _ = gguf_sd_loader(u_path)
             self.mmap_cache = sd
             print(f"[GGUFModelPatcher] Re-hydration complete.")
 
         super().load(*args, force_patch_weights=True, **kwargs)
-        
+
         # Optimization: Clear backup after load to drop extra references?
         # Standard ComfyUI keeps backup to restore later. We need it for unpatching.
         # But if we accumulate backups across reloads (in clones), it leaks.

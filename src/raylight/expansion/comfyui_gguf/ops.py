@@ -70,10 +70,18 @@ class GGMLTensor(torch.Tensor):
         return new
 
     def clone(self, *args, **kwargs):
-        return self
+        new = super().clone(*args, **kwargs)
+        new.tensor_type = getattr(self, "tensor_type", None)
+        new.tensor_shape = getattr(self, "tensor_shape", None)
+        new.patches = getattr(self, "patches", []).copy()
+        return new
 
     def detach(self, *args, **kwargs):
-        return self
+        new = super().detach(*args, **kwargs)
+        new.tensor_type = getattr(self, "tensor_type", None)
+        new.tensor_shape = getattr(self, "tensor_shape", None)
+        new.patches = getattr(self, "patches", []).copy()
+        return new
 
     def copy_(self, *args, **kwargs):
         # fixes .weight.copy_ in comfy/clip_model/CLIPTextModel
@@ -203,6 +211,7 @@ class GGMLLayer(torch.nn.Module):
         # consolidate and load patches to GPU in async
         patch_list = []
         device = tensor.device
+        key = None
         for patches, key in getattr(tensor, "patches", []):
             patch_list += move_patch_to_device(patches, device)
 

@@ -1040,10 +1040,18 @@ class RayOffloadModel:
     def offload(self, ray_actors, latent=None):
         gpu_actors = ray_actors["workers"]
         
-        # Offload from all workers
-        offload_futures = [actor.offload_and_clear.remote() for actor in gpu_actors]
-        cancellable_get(offload_futures)
-        
+        # Offload from all workers SEQUENTIALLY to prevent OOM
+        # Parallel offload causes massive RAM spike as all re-hydration happens at once.
+        print("[RayOffloadModel] Starting sequential offload...")
+        for i, actor in enumerate(gpu_actors):
+            try:
+                # Wait for each worker to finish before triggering the next
+                ray.get(actor.offload_and_clear.remote())
+                # Free local memory handles immediately
+                gc.collect()
+            except Exception as e:
+                print(f"[RayOffloadModel] Error offloading worker {i}: {e}")
+
         print("[RayOffloadModel] All workers offloaded.")
         return (latent,)
 

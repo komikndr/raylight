@@ -58,6 +58,7 @@ class RayWorker:
         self.overwrite_cast_dtype = None
         
         self.lora_cache = {} # Cache for Runtime LoRAs
+        self.worker_mmap_cache = {} # Persistent cache for GGUF mmap refs
 
 
         self.local_rank = local_rank
@@ -185,22 +186,24 @@ class RayWorker:
         return self.is_model_loaded
 
     def _offload_gguf_soft(self):
-        """Hard unload for GGUF to ensure RSS drops on workers."""
-        print(f"[RayWorker {self.local_rank}] GGUF Offload: Performing Full Unload to clear RSS...")
-        
-        # We perform a hard unload. Setting model to None ensures all mmap 
-        # references are dropped, freeing Resident RAM from the process page table.
-        # OS page cache will keep the file in physical RAM for 'instant' zero-copy reload.
-        self._offload_standard()
-        
-        # Clear any specific gguf caches to be absolutely sure
-        if hasattr(self, "mmap_cache"):
-            self.mmap_cache = {}
-        if hasattr(self, "state_dict"):
-            self.state_dict = None
+        """Zero-Copy Offload: Restores mmap references to clear VRAM without copies."""
+        if self.model is not None:
+            print(f"[RayWorker {self.local_rank}] GGUF Offload: Performing Zero-Copy Pointer Swap...")
             
-        self.is_model_loaded = False
-        print(f"[RayWorker {self.local_rank}] GGUF Offload: Full Unload Complete.")
+            # Use our optimized unpatch_model which restores mmap pointers
+            self.model.unpatch_model(device_to=torch.device('cpu'), unpatch_weights=True)
+            self.model.current_device = torch.device('cpu')
+            
+            # Store in worker-level cache to survive model deletions/swaps
+            if hasattr(self.model, "mmap_cache") and self.model.mmap_cache:
+                unet_path = getattr(self.model, "unet_path", None)
+                if unet_path:
+                    self.worker_mmap_cache[unet_path] = self.model.mmap_cache
+            
+            cleanup_memory()
+            print(f"[RayWorker {self.local_rank}] GGUF Soft-Offload Complete (VRAM freed, Mapping preserved).")
+        else:
+            self.is_model_loaded = False
 
     def _offload_standard(self):
         print(f"[RayWorker {self.local_rank}] Offloading model (releasing VRAM)...")
@@ -235,9 +238,42 @@ class RayWorker:
         """
         if self.model is not None:
             if getattr(self, "is_gguf", False):
+                print(f"[RayWorker {self.local_rank}] Offloading GGUF model...")
                 self._offload_gguf_soft()
             else:
+                print(f"[RayWorker {self.local_rank}] Offloading standard model...")
                 self._offload_standard()
+            
+            # CRITICAL: Force PyTorch Caching Allocator to release memory to OS
+            torch.cuda.empty_cache()
+            
+            # Verify retention logic
+            mem_now = torch.cuda.memory_allocated(self.device) / 1e9
+            print(f"[RayWorker {self.local_rank}] Post-Offload VRAM: {mem_now:.2f}GB")
+            
+            # FORENSIC: Check where parameters actually live
+            on_gpu = 0
+            on_cpu = 0
+            for p in self.model.model.parameters():
+                if p.device.type == 'cuda':
+                    on_gpu += 1
+                else:
+                    on_cpu += 1
+            print(f"[RayWorker {self.local_rank}] Param Stats: GPU={on_gpu}, CPU={on_cpu} (Total={on_gpu+on_cpu})")
+
+            # Check for leaked tensors if VRAM is still high
+            if mem_now > 1.0:
+                 print(f"[RayWorker {self.local_rank}] WARNING: VRAM still high! Scanning for GPU objects...")
+                 import gc
+                 gpu_objects = 0
+                 for obj in gc.get_objects():
+                     try:
+                         if torch.is_tensor(obj) and obj.device.type == 'cuda':
+                             gpu_objects += 1
+                     except Exception:
+                         pass
+                 print(f"[RayWorker {self.local_rank}] Found {gpu_objects} alive CUDA tensors in GC.")
+
         else:
             print(f"[RayWorker {self.local_rank}] No model to offload.")
 
@@ -344,25 +380,62 @@ class RayWorker:
         
         if is_gguf:
              print(f"[RayWorker] Loading GGUF Model via Generic Loader...")
-             from raylight.comfy_dist.sd import gguf_load_diffusion_model
-             self.model = gguf_load_diffusion_model(
-                unet_path,
-                dequant_dtype=dequant_dtype,
-                patch_dtype=patch_dtype
-            )
+             
+             # Worker-Level Cache Check: Skip disk I/O entirely if we already have the mapping
+             if unet_path in self.worker_mmap_cache:
+                 print(f"[RayWorker] Worker Cache Hit: Reusing mmap state dict for {os.path.basename(unet_path)}...")
+                 cached_sd = self.worker_mmap_cache[unet_path]
+                 from raylight.expansion.comfyui_gguf.ops import GGMLOps
+                 from raylight.expansion.comfyui_gguf.nodes import GGUFModelPatcher
+                 import comfy.sd
+                 import inspect
+                 
+                 ops = GGMLOps()
+                 # Apply dequant/patch dtypes to ops if provided
+                 if dequant_dtype: ops.Linear.dequant_dtype = None if dequant_dtype == "default" else getattr(torch, dequant_dtype)
+                 if patch_dtype: ops.Linear.patch_dtype = None if patch_dtype == "default" else getattr(torch, patch_dtype)
+                 
+                 # Fast instantiation from existing SD
+                 valid_params = inspect.signature(comfy.sd.load_diffusion_model_state_dict).parameters
+                 kwargs = {}
+                 if "metadata" in valid_params: kwargs["metadata"] = getattr(self, "gguf_metadata", {})
+                 
+                 # CACHE ISOLATION: Create a fresh clone of the tensors so the model's to(device) calls
+                 # don't mutate the persistent worker-level mmap cache.
+                 isolated_sd = {k: v.clone() if hasattr(v, 'clone') else v for k, v in cached_sd.items()}
+
+                 # IMPORTANT: load_diffusion_model_state_dict usually returns a ModelPatcher
+                 model = comfy.sd.load_diffusion_model_state_dict(isolated_sd, model_options={"custom_operations": ops}, **kwargs)
+                 
+                 # Cast to our GGUF variant if it's not already
+                 if not isinstance(model, GGUFModelPatcher):
+                     model = GGUFModelPatcher.clone(model)
+                 
+                 self.model = model
+                 self.model.mmap_cache = cached_sd
+                 self.model.unet_path = unet_path
+             else:
+                 # Standard Cold Load (Disk I/O)
+                 print(f"[RayWorker] Worker Cache Miss: Loading GGUF from disk...")
+                 from raylight.comfy_dist.sd import gguf_load_diffusion_model
+                 self.model = gguf_load_diffusion_model(
+                    unet_path,
+                    dequant_dtype=dequant_dtype,
+                    patch_dtype=patch_dtype
+                )
+                 # Populate Worker Cache
+                 self.worker_mmap_cache[unet_path] = self.model.mmap_cache
+
              self.is_gguf = True
              self.gguf_metadata = getattr(self.model, "gguf_metadata", {})
              
              # GGUF "Hot Load" logic (force VRAM load immediately)
              print(f"[RayWorker {self.local_rank}] GGUF: Forcing immediate VRAM load...")
              if hasattr(self.model, "load"):
+                # This will call GGUFModelPatcher.load(), which now checks mmap_cache presence.
                 self.model.load(self.device, force_patch_weights=True)
                 self.model.current_device = self.device
                 
-             # CRITICAL: Do NOT clear backup. We need it for mmap restoration.
-             # if hasattr(self.model, "backup"):
-             #    self.model.backup.clear()
-             
              cleanup_memory()
              check_mmap_leak(unet_path)
 
@@ -371,7 +444,7 @@ class RayWorker:
              if cast_dtype:
                 print(f"[RayWorker] Mmap Preservation: Loading Native (skipping cast to {cast_dtype})")
 
-             self.model = comfy.sd.load_diffusion_model(
+             self.model = sd.load_diffusion_model(
                 unet_path, model_options=load_options,
              )
              
@@ -745,34 +818,52 @@ class RayWorker:
         else:
              raise ValueError("[RayWorker] Cannot RELOAD GGUF: Missing reload params for parallel loading.")
 
-    def reload_model_if_needed(self):
+    def reload_model_if_needed(self, load_device=None):
         """Auto-reloads the model if it was offloaded.
         
         Supports two reload modes:
         - GGUF Soft-Reload: model exists but current_device=cpu (nuked weights) → uses /dev/shm cache
         - Standard Reload: model is None → uses disk or shared memory
         """
+        # Idempotency / Optimistic Check
+        # If load_device is provided, and we are already on it, skip.
+        if load_device is not None and self.model is not None:
+             curr = getattr(self.model, "current_device", None)
+             if str(curr) == str(load_device):
+                  # Check if we really have weights (heuristic: check first param)
+                  # GGUF pointer swap maintains .data, so this check usually passes if loaded.
+                  # If we offloaded, current_device would be cpu.
+                  print(f"[RayWorker] Idempotency: Model already on {load_device}. Skipping reload.")
+                  return
+
         # Check if model needs reload:
         # - For standard offload: self.model is None
         # - For GGUF soft-offload: self.model exists but current_device is CPU (nuked weights)
         needs_reload = self.model is None
         if self.model is not None and hasattr(self.model, 'current_device'):
-            if self.model.current_device != self.model.load_device:
+            # If load_device arg is missing, fallback to model.load_device
+            target_device = load_device if load_device is not None else self.model.load_device
+            if str(self.model.current_device) != str(target_device):
                 needs_reload = True
         
         if not needs_reload:
             return  # Model is loaded, nothing to do
         
-        print("[RayWorker] Model offloaded. Auto-reloading...")
+        print("[RayWorker] Model offloaded or device mismatch. Auto-reloading...")
         
         # GGUF SOFT-RELOAD: Use /dev/shm cache via model.load()
         if self.model is not None and getattr(self, "is_gguf", False):
-            print("[RayWorker] GGUF Soft-Reload: Triggering Self-Heal via model.load()...")
-            self.model.load(self.device, force_patch_weights=True)
-            self.model.current_device = self.model.load_device
+            print("[RayWorker] GGUF Soft-Reload: Triggering Zero-Copy VRAM Transfer...")
             
-            # CRITICAL: Do NOT clear backup. We need it for mmap restoration.
-            # self.model.backup.clear() <- REMOVED
+            # Re-hydrate mmap_cache from worker if it was lost (e.g. by manual cleanup)
+            if (not hasattr(self.model, "mmap_cache") or not self.model.mmap_cache) and hasattr(self.model, "unet_path"):
+                u_path = self.model.unet_path
+                if u_path in self.worker_mmap_cache:
+                    print(f"[RayWorker] Re-hydrating model.mmap_cache from persistent worker store...")
+                    self.model.mmap_cache = self.worker_mmap_cache[u_path]
+
+            self.model.load(self.device, force_patch_weights=True)
+            self.model.current_device = self.device
             
             print("[RayWorker] GGUF Soft-Reload: Complete.")
             return
@@ -1163,14 +1254,19 @@ class RayWorker:
                 noise = Noise_RandomNoise(noise_seed).generate_noise(work_latent)
 
             # 3. Sampling
-            with torch.no_grad():
-                samples = comfy.sample.sample_custom(
-                    work_model,
-                    noise,
-                    cfg,
-                    sampler,
-                    sigmas,
-                    positive,
+            # Use utility for consistent memory logging
+            with monitor_memory(f"RayWorker {self.local_rank} - custom_sampler", device=self.device):
+                if hasattr(self.model, "mmap_cache"):
+                     print(f"[RayWorker {self.local_rank}] Mmap Cache Len: {len(self.model.mmap_cache) if self.model.mmap_cache else 0}")
+                
+                with torch.no_grad():
+                    samples = comfy.sample.sample_custom(
+                        work_model,
+                        noise,
+                        cfg,
+                        sampler,
+                        sigmas,
+                        positive,
                     negative,
                     final_samples,
                     noise_mask=noise_mask,
