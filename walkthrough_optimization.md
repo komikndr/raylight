@@ -16,17 +16,23 @@ The previous implementation of `unpatch_model` was failing to match parameters t
 
 ### 3. Persistent Worker-Level Cache
 Implemented `RayWorker.worker_mmap_cache` to store GGUF mappings across actor lifetimes.
-- **Benefit**: Even if a model instance is deleted, the file mappings stay active in the worker process. The next `_load_model_generic` call will perform a "Worker Cache Hit" and instantiate the model in milliseconds without reading a single byte from disk.
+- **Benefit**: Even if a model instance is deleted, the file mappings stay active in the worker process.
+
+### 4. Cache Isolation & `GGMLTensor` Fix [Final Fix]
+Discovered that `mmap_cache` was being corrupted with GPU tensors because `GGMLTensor.clone()` and `detach()` were returning `self`, causing any backup to share the same reference as the live model weight.
+- **Fix 1**: Reverted `GGMLTensor.clone/detach` in `ops.py` to perform real clones.
+- **Fix 2**: Implemented a "Cache Isolation" layer in `RayWorker._load_model_generic` that explicitly clones the state dict tensors before model initialization.
+- **Impact**: Guarantees that the persistent `mmap_cache` remains permanently on CPU, allowing the zero-copy restorer to achieve **total** VRAM release.
 
 ## 📊 Verification Results
 
 ### Success Logs
-- `[RayWorker] Worker Cache Hit: Reusing mmap state dict for ltx-2-19b-distilled_Q6_K.gguf...`
-- `[GGUFModelPatcher] Zero-Copy: Restored 2540 parameters to mmap.`
-- `[Raylight] SUCCESS: GGUF file is NOT mapped in memory (Clean Release)` (Only triggered on final worker shutdown).
+- `[RayWorker] Worker Cache Hit: Reusing mmap state dict...`
+- `[GGUFModelPatcher] Zero-Copy Offload: Restoring mmap references (Target: cpu)`
+- `[RayWorker X] Param Stats: GPU=0, CPU=3510 (Total=3510) ✅`
 
 ### RAM Performance
-- **Offload**: Process RSS remains stable while VRAM is released.
+- **Offload**: Process RSS remains stable while VRAM drops to near-zero.
 - **Reload**: Instantaneous (zero delay) back to GPU.
 
 > [!IMPORTANT]

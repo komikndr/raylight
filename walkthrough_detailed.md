@@ -25,13 +25,17 @@ GGUF is designed for zero-copy RAM sharing between workers.
     *   **Tensor Creation**: Calls `torch.from_numpy(tensor.data)`. 
         > [!IMPORTANT]
         > Because `gguf` returns a memory-mapped numpy array, `torch.from_numpy` creates a **zero-copy view**. The tensor's storage is directly linked to the file on disk.
-2.  **Worker Logic**: `RW._load_model_generic` -> `comfy_dist.sd.gguf_load_diffusion_model`
-    *   **Custom Ops**: Initializes `GGMLOps`.
-        *   `Linear.dequant_dtype`: (e.g., `fp16`) The target precision for on-the-fly dequantization.
-    *   **VRAM Force**: Calls `model.load(self.device)`. This triggers the actual dequantization of weights from the `mmap` RAM into the GPU VRAM.
-    *   **Cache Preservation**: Line 161 in `sd.py` saves the `mmap` state dict to `model.mmap_cache`. This is the key to Raylight's "Soft Offload" — we keep the RAM pointers alive even when VRAM is cleared.
+### `sd.py` & `ray_worker.py` Orchestration
+`src/raylight/comfy_dist/sd.py` and `ray_worker.py` collaborate to ensure zero-copy reloads.
 
-### `sd.py` Distribution Utilities
+1.  **Cache Isolation layer [NEW]**:
+    *   **Logic**: Before passing a cached `state_dict` to the model loader, `RayWorker` executes: `isolated_sd = {k: v.clone() for k, v in cached_sd.items()}`.
+    *   **Requirement**: This requires a functioning `clone()` on `GGMLTensor`.
+2.  **`GGMLTensor` Fix (`ops.py`)**:
+    *   **Issue**: Original `ops.py` had `clone()` and `detach()` returning `self`. This caused any model "backup" or "cloned" state-dict entry to point to the same object as the live weight. When the live weight moved to GPU, the "cache" moved with it.
+    *   **Fix**: Restored `super().clone()` and `super().detach()` with proper metadata propagation (`tensor_type`, `tensor_shape`).
+3.  **VRAM Force**: Calls `model.load(self.device)`. This triggers the actual dequantization of weights from the `mmap` RAM into the GPU VRAM.
+4.  **Zero-Copy Offload**: `GGUFModelPatcher.unpatch_model` performs a pointer swap back to the **cloned** (and thus still on CPU) mmap handles in `self.mmap_cache`.
 `src/raylight/comfy_dist/sd.py` acts as a distributed wrapper for ComfyUI's core model loading.
 
 *   **`fsdp_load_diffusion_model_stat_dict`**:
