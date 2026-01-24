@@ -3,7 +3,7 @@
 Similar to GGMLTensor - wraps mmap'd tensor data and defers materialization
 until GPU access is needed. This avoids RAM spikes during model loading.
 
-Supports pointer-swap offload/reload like GGUF:
+Supports pointer-swap offload/reload:
 - After .to(device), tensor keeps reference to mmap source
 - swap_to_mmap() restores pointer to mmap (zero-copy offload)
 - Enables fast hot-reload without re-reading from disk
@@ -63,11 +63,11 @@ class MaterializedTensor(torch.Tensor):
 class LazySafetensor(torch.Tensor):
     """Lazy wrapper for mmap'd safetensor data.
     
-    Like GGMLTensor, this tensor subclass wraps mmap'd data and defers
+    This tensor subclass wraps mmap'd safetensors and defers
     the actual clone/transfer until the tensor is moved to GPU.
     
     Key behaviors:
-    - Contains actual mmap tensor data (not empty placeholder)
+    - Contains actual mmap safetensor data (not empty placeholder)
     - .to(device) returns MaterializedTensor that keeps mmap ref
     - Enables pointer-swap offload via MaterializedTensor.swap_to_mmap()
     """
@@ -117,8 +117,9 @@ class LazySafetensor(torch.Tensor):
         
         Returns MaterializedTensor that keeps mmap ref for pointer-swap.
         """
-        # Clone from self (which IS the mmap data) and transfer to device
-        materialized_data = torch.Tensor.to(self.clone(), *args, **kwargs)
+        # Use as_subclass to avoid cloning data on CPU (Zero-Copy)
+        # This streams directly from mmap ref to GPU (via pinned memory or direct transfer)
+        materialized_data = self.as_subclass(torch.Tensor).to(*args, **kwargs)
         # Wrap in MaterializedTensor to preserve mmap ref
         return MaterializedTensor(materialized_data, self)
     
@@ -146,20 +147,48 @@ def wrap_state_dict_lazy(sd: dict) -> dict:
     return wrapped
 
 
-def swap_model_to_mmap(model) -> None:
-    """Swap all MaterializedTensors in a model back to mmap refs (offload).
+def swap_model_to_mmap(model, mmap_cache: Optional[Dict[str, torch.Tensor]] = None) -> None:
+    """Swap all parameters in a model back to mmap refs (offload).
     
-    This is the safetensor equivalent of GGUF's unpatch_model.
+    Args:
+        model: The model to offload
+        mmap_cache: Optional cache of mmap tensors. If provided, uses robust name matching
+                   to swap parameters even if they lost MaterializedTensor identity.
     """
+    swapped_count = 0
+    
+    # Method A: Robust name matching (Preferred)
+    if mmap_cache:
+        param_map = dict(model.named_parameters())
+        # Iterate cache keys to find corresponding model params
+        for key, mmap_tensor in mmap_cache.items():
+            # Try matching with common prefixes
+            matched_param = None
+            for prefix in ['', 'diffusion_model.', 'model.diffusion_model.']:
+                target_key = f"{prefix}{key}" if prefix else key
+                if target_key in param_map:
+                    matched_param = param_map[target_key]
+                    break
+            
+            if matched_param is not None:
+                # Found it! Swap to LazySafetensor pointing to mmap
+                # This works regardless of whether the current param is on GPU, CPU, or wrapped
+                lazy = LazySafetensor(mmap_tensor)
+                matched_param.data = lazy
+                swapped_count += 1
+        
+        print(f"[LazySafetensor] Offloaded {swapped_count} params via name matching.")
+        return
+
+    # Method B: Type-based discovery (Fallback)
+    # Only works if parameters preserved MaterializedTensor type
     for name, param in model.named_parameters():
         if isinstance(param.data, MaterializedTensor):
             lazy = param.data.swap_to_mmap()
             param.data = lazy.mmap_ref  # Point to CPU mmap
-    
-    for name, buffer in model.named_buffers():
-        if isinstance(buffer, MaterializedTensor):
-            lazy = buffer.swap_to_mmap()
-            # Can't easily reassign buffers, but they're usually small
+            swapped_count += 1
+            
+    print(f"[LazySafetensor] Offloaded {swapped_count} params via type checking.")
 
 
 def restore_model_mmap_refs(model, mmap_cache: Dict[str, torch.Tensor]) -> None:

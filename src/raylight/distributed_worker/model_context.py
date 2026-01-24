@@ -204,122 +204,8 @@ class GGUFContext(ModelContext):
         self.worker.model.current_device = device
 
 
-class SafetensorMmapWrapper:
-    """Wraps mmap'd safetensor state dict for streaming GPU transfer.
-    
-    Enables per-tensor GPU loading to avoid RAM spikes from full clone.
-    """
-    
-    def __init__(self, mmap_sd: Dict[str, torch.Tensor]):
-        self._mmap = mmap_sd
-    
-    def stream_to_model(self, model, device: torch.device) -> int:
-        """Transfer weights per-parameter to avoid RAM spike.
-        
-        Returns number of parameters transferred.
-        """
-        transferred = 0
-        param_map = {name: param for name, param in model.named_parameters()}
-        
-        for name, mmap_tensor in self._mmap.items():
-            target_name = self._resolve_name(name, param_map)
-            if target_name and target_name in param_map:
-                # Clone only this tensor, transfer to GPU
-                # GC can reclaim RAM before next tensor
-                param_map[target_name].data = mmap_tensor.clone().to(device)
-                transferred += 1
-        
-        return transferred
-    
-    def _resolve_name(self, name: str, param_map: Dict) -> Optional[str]:
-        """Resolve mmap key to model parameter name."""
-        # Direct match
-        if name in param_map:
-            return name
-        # Common prefixes
-        prefixes = ["diffusion_model.", "model.diffusion_model.", ""]
-        for prefix in prefixes:
-            candidate = f"{prefix}{name}" if prefix else name
-            if candidate in param_map:
-                return candidate
-            # Strip prefix if present
-            if name.startswith(prefix) and name[len(prefix):] in param_map:
-                return name[len(prefix):]
-        return None
-
-
-class LazySafetensorsModelPatcher:
-    """Lazy wrapper for safetensor models - defers instantiation to sampling time.
-    
-    Mimics GGUFModelPatcher pattern: holds mmap refs without creating real model.
-    Model is only instantiated when .load() is called (at sampling time).
-    """
-    
-    def __init__(self, mmap_sd: Dict[str, torch.Tensor], model_options: Dict, unet_path: str):
-        self.mmap_cache = mmap_sd  # Shared mmap refs
-        self.model_options = model_options
-        self.unet_path = unet_path
-        self.current_device = torch.device('cpu')
-        self._real_model = None  # Actual ModelPatcher, created lazily
-        self._is_instantiated = False
-    
-    def load(self, device: torch.device, **kwargs):
-        """Called at sampling time - instantiate model and load to GPU."""
-        import comfy.sd
-        import gc
-        
-        if not self._is_instantiated:
-            print(f"[LazySafetensorsModelPatcher] Instantiating model on first load...")
-            # Clone tensors for model instantiation (unavoidable)
-            # But this happens at sampling time, not loader time
-            # So only one worker instantiates at a time (sequential by nature of sampling)
-            isolated = {k: v.clone() for k, v in self.mmap_cache.items()}
-            
-            load_options = self.model_options.copy()
-            cast_dtype = load_options.pop("dtype", None)
-            
-            model = comfy.sd.load_diffusion_model_state_dict(isolated, model_options=load_options)
-            
-            if model is None:
-                raise RuntimeError(f"Could not load model: {self.unet_path}")
-            
-            if cast_dtype and hasattr(model, "model"):
-                model.model.manual_cast_dtype = cast_dtype
-            
-            self._real_model = model
-            self._is_instantiated = True
-            
-            # Free the cloned dict
-            del isolated
-            gc.collect()
-            print(f"[LazySafetensorsModelPatcher] Model instantiated.")
-        
-        # Load to device (this moves weights to GPU)
-        if hasattr(self._real_model, 'load'):
-            self._real_model.load(device, **kwargs)
-        elif hasattr(self._real_model, 'model'):
-            self._real_model.model.to(device)
-        
-        self.current_device = device
-    
-    def __getattr__(self, name):
-        """Proxy all other attributes to the real model.
-        
-        If model not instantiated, force instantiation on CPU first.
-        This handles patching scenarios where model is accessed before sampling.
-        """
-        if name in ('mmap_cache', 'model_options', 'unet_path', 'current_device', 
-                    '_real_model', '_is_instantiated', 'load'):
-            return object.__getattribute__(self, name)
-        
-        real_model = object.__getattribute__(self, '_real_model')
-        if real_model is None:
-            # Force instantiation on CPU for attribute access
-            print(f"[LazySafetensorsModelPatcher] Force instantiating for attribute '{name}'...")
-            self.load(torch.device('cpu'))
-            real_model = object.__getattribute__(self, '_real_model')
-        
-        return getattr(real_model, name)
+from raylight.expansion.comfyui_lazytensors.loader import SafetensorMmapWrapper
+from raylight.expansion.comfyui_lazytensors.model_patcher import LazySafetensorsModelPatcher
 
 
 # Check for optional fastsafetensors
@@ -479,8 +365,17 @@ class SafetensorsContext(ModelContext):
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import swap_model_to_mmap
         
         if self.worker.model is not None and hasattr(self.worker.model, 'model'):
-            print("[SafetensorsContext] Pointer-swap offload: Swapping GPU tensors to mmap refs...")
-            swap_model_to_mmap(self.worker.model.model)
+            print("[SafetensorsContext] Pointer-swap offload: Unpatching and swapping GPU tensors to mmap refs...")
+            
+            # CRITICAL: Unpatch first! 
+            # If LoRAs are applied, params are plain Tensors (on GPU).
+            # We must restore original MaterializedTensors (from backup) so they can be swapped.
+            if hasattr(self.worker.model, "unpatch_model"):
+                self.worker.model.unpatch_model(device_to=None, unpatch_weights=True)
+            
+            mmap_cache = getattr(self.worker.model, "mmap_cache", None)
+            swap_model_to_mmap(self.worker.model.model, mmap_cache)
+            
             self.worker.model.current_device = torch.device('cpu')
     
     def hot_load(self, device: torch.device):

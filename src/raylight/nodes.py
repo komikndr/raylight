@@ -23,7 +23,7 @@ from .distributed_worker.ray_worker import (
     ray_nccl_tester,
 )
 from .comfy_dist.utils import cancellable_get
-from .utils_memory import monitor_memory
+from raylight.utils.memory import monitor_memory
 
 # Workaround https://github.com/comfyanonymous/ComfyUI/pull/11134
 # since in FSDPModelPatcher mode, ray cannot pickle None type cause by getattr
