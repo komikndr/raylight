@@ -8,6 +8,8 @@ import comfy.lora
 import comfy.model_management
 from .dequant import dequantize_tensor, is_quantized
 
+from raylight.comfy_dist.lora import calculate_weight as ray_calculate_weight
+
 
 def chained_hasattr(obj, chained_attr):
     probe = obj
@@ -230,13 +232,13 @@ class GGMLLayer(torch.nn.Module):
         # apply patches
         if len(patch_list) > 0:
             if self.patch_dtype is None:
-                weight = comfy.lora.calculate_weight(patch_list, weight, key)
+                weight = ray_calculate_weight(patch_list, weight, key)
             else:
                 # for testing, may degrade image quality
                 patch_dtype = (
                     dtype if self.patch_dtype == "target" else self.patch_dtype
                 )
-                weight = comfy.lora.calculate_weight(
+                weight = ray_calculate_weight(
                     patch_list, weight, key, patch_dtype
                 )
         return weight

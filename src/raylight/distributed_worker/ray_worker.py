@@ -60,6 +60,10 @@ class RayWorker:
         self.lora_cache = {} # Cache for Runtime LoRAs
         self.worker_mmap_cache = {} # Persistent cache for GGUF mmap refs
 
+        # CRITICAL: Apply LowVramPatch monkey-patch early to ensure ALL model types
+        # (GGUF, standard, FSDP) use Raylight's LoRA-compatible patch handler.
+        # This must happen before any model loading.
+        self._apply_global_patches()
 
         self.local_rank = local_rank
         self.global_world_size = self.parallel_dict["global_world_size"]
@@ -190,6 +194,10 @@ class RayWorker:
         if self.model is not None:
             print(f"[RayWorker {self.local_rank}] GGUF Offload: Performing Zero-Copy Pointer Swap...")
             
+            # FIRST: Clear all LoRA/patch GPU references before pointer swap
+            # This releases GPU tensors so they can be GC'd after unpatch
+            self._clear_lora_gpu_refs()
+            
             # Use our optimized unpatch_model which restores mmap pointers
             self.model.unpatch_model(device_to=torch.device('cpu'), unpatch_weights=True)
             self.model.current_device = torch.device('cpu')
@@ -204,6 +212,47 @@ class RayWorker:
             print(f"[RayWorker {self.local_rank}] GGUF Soft-Offload Complete (VRAM freed, Mapping preserved).")
         else:
             self.is_model_loaded = False
+
+    def _clear_lora_gpu_refs(self):
+        """Clear all GPU tensor references from LoRA/patches to allow proper VRAM release.
+        
+        This clears:
+        - weight_function/bias_function closures on modules (hold patches dict refs)
+        - patches dict on model patcher
+        - .patches attribute on individual GGMLTensor parameters
+        """
+        if self.model is None:
+            return
+        
+        # 1. Clear weight_function/bias_function closures on ALL modules
+        diffusion_model = getattr(self.model, "model", None)
+        if diffusion_model is not None:
+            cleared_funcs = 0
+            for m in diffusion_model.modules():
+                if hasattr(m, "weight_function") and len(m.weight_function) > 0:
+                    m.weight_function = []
+                    cleared_funcs += 1
+                if hasattr(m, "bias_function") and len(m.bias_function) > 0:
+                    m.bias_function = []
+                    cleared_funcs += 1
+            if cleared_funcs > 0:
+                print(f"[RayWorker {self.local_rank}] Cleared {cleared_funcs} weight/bias functions.")
+        
+        # 2. Clear patches dict on model patcher
+        if hasattr(self.model, "patches") and self.model.patches:
+            patch_count = len(self.model.patches)
+            self.model.patches.clear()
+            print(f"[RayWorker {self.local_rank}] Cleared {patch_count} patches from patcher.")
+        
+        # 3. Clear .patches attribute on individual parameters (GGMLTensor carries these)
+        if diffusion_model is not None:
+            cleared_param_patches = 0
+            for name, param in diffusion_model.named_parameters():
+                if hasattr(param, "patches") and param.patches:
+                    param.patches = []
+                    cleared_param_patches += 1
+            if cleared_param_patches > 0:
+                print(f"[RayWorker {self.local_rank}] Cleared .patches on {cleared_param_patches} parameters.")
 
     def _offload_standard(self):
         print(f"[RayWorker {self.local_rank}] Offloading model (releasing VRAM)...")
@@ -244,8 +293,48 @@ class RayWorker:
                 print(f"[RayWorker {self.local_rank}] Offloading standard model...")
                 self._offload_standard()
             
+            # CRITICAL: Clear LoRA tracking since model will need fresh patches after reload
+            # If we don't clear this, the idempotency check will skip LoRA application on re-runs
+            if hasattr(self, "_applied_loras"):
+                self._applied_loras.clear()
+            if hasattr(self, "_current_lora_config_hash"):
+                self._current_lora_config_hash = None
+            print(f"[RayWorker {self.local_rank}] LoRA tracking cleared for fresh re-application.")
+            
+            # AGGRESSIVE CLEANUP: Move all buffers to CPU (PE caches, normalization stats, etc.)
+            print(f"[RayWorker {self.local_rank}] Moving buffers to CPU...")
+            diffusion_model = getattr(self.model, "model", None)
+            if diffusion_model is not None:
+                try:
+                    # Move all registered buffers to CPU
+                    for name, buf in diffusion_model.named_buffers():
+                        if buf is not None and buf.device.type == 'cuda':
+                            buf.data = buf.data.to('cpu')
+                    print(f"[RayWorker {self.local_rank}] Buffers moved to CPU.")
+                except Exception as e:
+                    print(f"[RayWorker {self.local_rank}] Buffer cleanup warning: {e}")
+                
+                # CRITICAL: Delete any cached PE or intermediate tensors
+                # These are often stored as attributes during forward pass
+                for attr in ['_cached_pe', 'cached_pe', 'pe_cache', '_pe']:
+                    if hasattr(diffusion_model, attr):
+                        delattr(diffusion_model, attr)
+                
+                # Clear any diffusion model submodule caches
+                if hasattr(diffusion_model, 'diffusion_model'):
+                    inner_model = diffusion_model.diffusion_model
+                    for attr in ['_cached_pe', 'cached_pe', 'pe_cache', '_pe']:
+                        if hasattr(inner_model, attr):
+                            delattr(inner_model, attr)
+            
+            # CRITICAL: Force garbage collection BEFORE empty_cache
+            import gc
+            gc.collect()
+            gc.collect()  # Second pass for reference cycles
+            
             # CRITICAL: Force PyTorch Caching Allocator to release memory to OS
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()  # Ensure all GPU ops complete
             
             # Verify retention logic
             mem_now = torch.cuda.memory_allocated(self.device) / 1e9
@@ -264,15 +353,20 @@ class RayWorker:
             # Check for leaked tensors if VRAM is still high
             if mem_now > 1.0:
                  print(f"[RayWorker {self.local_rank}] WARNING: VRAM still high! Scanning for GPU objects...")
-                 import gc
-                 gpu_objects = 0
+                 gpu_objects = []
                  for obj in gc.get_objects():
                      try:
                          if torch.is_tensor(obj) and obj.device.type == 'cuda':
-                             gpu_objects += 1
+                             gpu_objects.append((obj.shape, obj.dtype, obj.numel() * obj.element_size() / 1e6))
                      except Exception:
                          pass
-                 print(f"[RayWorker {self.local_rank}] Found {gpu_objects} alive CUDA tensors in GC.")
+                 # Sort by size and show largest
+                 gpu_objects.sort(key=lambda x: x[2], reverse=True)
+                 print(f"[RayWorker {self.local_rank}] Found {len(gpu_objects)} alive CUDA tensors in GC.")
+                 if gpu_objects[:5]:
+                     print(f"[RayWorker {self.local_rank}] Largest CUDA tensors:")
+                     for shape, dtype, size_mb in gpu_objects[:5]:
+                         print(f"    {shape} ({dtype}): {size_mb:.1f}MB")
 
         else:
             print(f"[RayWorker {self.local_rank}] No model to offload.")
@@ -312,6 +406,20 @@ class RayWorker:
             print(f"[RayWorker {self.local_rank}] FFN chunking complete: {info}")
         
         return info
+
+    def _apply_global_patches(self):
+        """Apply monkey patches that are needed for ALL model types.
+        
+        This is called once during worker initialization to ensure consistent
+        behavior across GGUF, Standard, and FSDP models.
+        """
+        import comfy.model_patcher as model_patcher
+        from raylight.comfy_dist.model_patcher import LowVramPatch
+        
+        # Patch LowVramPatch to use Raylight's LoRA-compatible calculate_weight
+        # This is critical for LoRA support across all model types.
+        model_patcher.LowVramPatch = LowVramPatch
+        print(f"[RayWorker] Applied global LowVramPatch monkey-patch.")
 
     def _apply_fsdp_patches(self):
         # Monkey patch
@@ -473,6 +581,11 @@ class RayWorker:
             "dequant_dtype": dequant_dtype,
             "patch_dtype": patch_dtype,
         }
+        
+        # CRITICAL: Clear LoRA tracking when loading a fresh model
+        # A newly loaded model has no patches, so we must reset the tracking.
+        if hasattr(self, "_applied_loras"):
+            self._applied_loras.clear()
         
         # 3. Unified Coordination Ref
         # Put a lightweight dummy in Ray Store to satisfy checks.
@@ -774,6 +887,118 @@ class RayWorker:
 
             
             self.is_model_loaded = True
+            return True
+
+    def load_lora(self, lora_path, strength_model, lora_config_hash=None):
+        """Loads a LoRA into the model on this worker via mmap.
+        
+        Args:
+            lora_path: Path to the LoRA file
+            strength_model: Strength to apply the LoRA
+            lora_config_hash: Optional hash identifying the complete LoRA configuration
+                              for this branch. If this changes from the previous call,
+                              all existing patches are reset before applying new ones.
+                              This enables isolated LoRA branches in workflows.
+        
+        Handles:
+        - Branch isolation: Different lora_config_hash triggers a reset
+        - Idempotency: Same LoRA in same config is not re-applied
+        """
+        filename = os.path.basename(lora_path)
+        if filename.startswith("._") or filename == ".DS_Store":
+            print(f"[RayWorker {self.local_rank}] Skipping hidden/junk file: {filename}")
+            return True
+
+        # Initialize LoRA tracking if needed
+        if not hasattr(self, "_applied_loras"):
+            self._applied_loras = set()
+        if not hasattr(self, "_current_lora_config_hash"):
+            self._current_lora_config_hash = None
+        
+        # BRANCH ISOLATION: If lora_config_hash changed, reset all LoRAs first
+        if lora_config_hash is not None and lora_config_hash != self._current_lora_config_hash:
+            if self._current_lora_config_hash is not None:
+                print(f"[RayWorker {self.local_rank}] LoRA config changed ('{self._current_lora_config_hash}' -> '{lora_config_hash}'). Resetting patches...")
+                self.reset_loras()
+            self._current_lora_config_hash = lora_config_hash
+        
+        # Create a unique signature for this LoRA
+        lora_sig = (lora_path, strength_model)
+        
+        # IDEMPOTENCY: Skip if this exact LoRA was already applied in this config
+        if lora_sig in self._applied_loras:
+            print(f"[RayWorker {self.local_rank}] LoRA already applied: {filename} (strength={strength_model}). Skipping duplicate.")
+            return True
+
+        print(f"[RayWorker {self.local_rank}] Loading LoRA: {filename} (strength={strength_model})")
+        
+        # 1. Ensure model is loaded/re-hydrated
+        self.reload_model_if_needed()
+        
+        # 2. Load LoRA State Dict (Mmap)
+        # safe_load=True/False depends on Comfy version, usually uses safetensors mmap if possible.
+        lora_sd = comfy.utils.load_torch_file(lora_path)
+        
+        # 3. Resolve Keys & Convert
+        key_map = {}
+        if self.model is not None:
+            key_map = comfy.lora.model_lora_keys_unet(self.model.model, key_map)
+        
+        from comfy.lora_convert import convert_lora
+        lora_patches = convert_lora(lora_sd)
+        
+        # 4. Load Patches using Raylight's distributed lora helper
+        from raylight.comfy_dist.lora import load_lora
+        loaded_patches = load_lora(lora_patches, key_map)
+        
+        # 5. Apply to Model
+        # This adds to the .patches dict in ModelPatcher/GGUFModelPatcher
+        self.model.add_patches(loaded_patches, strength_model)
+        
+        # 6. Track this LoRA as applied
+        self._applied_loras.add(lora_sig)
+        
+        print(f"[RayWorker {self.local_rank}] LoRA applied successfully.")
+        return True
+
+    def reset_loras(self):
+        """Clears all applied LoRAs and resets the model patches.
+        
+        Call this before applying a new set of LoRAs to ensure clean state,
+        especially when switching between different LoRA configurations.
+        """
+        import uuid
+        print(f"[RayWorker {self.local_rank}] Resetting LoRAs...")
+        
+        # Clear tracking
+        if hasattr(self, "_applied_loras"):
+            self._applied_loras.clear()
+        
+        # FIX Bug #1: Clear the config hash so next LoRA application is seen as new
+        if hasattr(self, "_current_lora_config_hash"):
+            self._current_lora_config_hash = None
+        
+        # Clear model patches if model exists
+        if self.model is not None:
+            # Clear the patches dict
+            if hasattr(self.model, "patches"):
+                self.model.patches.clear()
+            
+            # FIX Bug #3: Update patches_uuid to signal ComfyUI that patches changed
+            if hasattr(self.model, "patches_uuid"):
+                self.model.patches_uuid = uuid.uuid4()
+            
+            # Restore original weights from backup if any
+            if hasattr(self.model, "backup") and self.model.backup:
+                print(f"[RayWorker {self.local_rank}] Restoring {len(self.model.backup)} backed up weights...")
+                for k, bk in self.model.backup.items():
+                    if bk.inplace_update:
+                        comfy.utils.copy_to_param(self.model.model, k, bk.weight)
+                    else:
+                        comfy.utils.set_attr_param(self.model.model, k, bk.weight)
+                self.model.backup.clear()
+        
+        print(f"[RayWorker {self.local_rank}] LoRAs reset complete.")
 
     def barrier_and_evict(self, path):
          """Synchronizes all workers and then evicts page cache."""

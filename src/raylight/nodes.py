@@ -1020,6 +1020,8 @@ class RayOffloadModel:
     """
     Offloads the diffusion model from all Ray workers' VRAM.
     Place this node after the sampler to free GPU memory.
+    
+    This is an OUTPUT node - it will always execute if connected.
     """
     @classmethod
     def INPUT_TYPES(cls):
@@ -1028,38 +1030,104 @@ class RayOffloadModel:
                 "ray_actors": ("RAY_ACTORS",),
             },
             "optional": {
-                "latent": ("LATENT", {"default": None, "tooltip": "Passthrough for workflow chaining"}),
+                "latent": ("LATENT", {"tooltip": "Passthrough for workflow chaining"}),
             }
         }
 
+    # Return the latent passthrough for chaining
     RETURN_TYPES = ("LATENT",)
     RETURN_NAMES = ("latent",)
     FUNCTION = "offload"
     CATEGORY = "Raylight"
+    OUTPUT_NODE = True  # Marks this as an output node - always executes
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Return NaN to force re-execution on every run.
+        # NaN != NaN, so this node is always considered "changed"
+        return float("nan")
 
     def offload(self, ray_actors, latent=None):
+        import sys
+        print("[RayOffloadModel] ========== OFFLOAD NODE EXECUTING ==========", flush=True)
+        sys.stdout.flush()
+        
         gpu_actors = ray_actors["workers"]
         
         # Offload from all workers SEQUENTIALLY to prevent OOM
-        # Parallel offload causes massive RAM spike as all re-hydration happens at once.
-        print("[RayOffloadModel] Starting sequential offload...")
+        print(f"[RayOffloadModel] Starting sequential offload for {len(gpu_actors)} workers...", flush=True)
         for i, actor in enumerate(gpu_actors):
             try:
                 # Wait for each worker to finish before triggering the next
+                print(f"[RayOffloadModel] Offloading worker {i}...", flush=True)
                 ray.get(actor.offload_and_clear.remote())
                 # Free local memory handles immediately
                 gc.collect()
+                print(f"[RayOffloadModel] Worker {i} offloaded.", flush=True)
             except Exception as e:
-                print(f"[RayOffloadModel] Error offloading worker {i}: {e}")
+                print(f"[RayOffloadModel] Error offloading worker {i}: {e}", flush=True)
 
-        print("[RayOffloadModel] All workers offloaded.")
+        print("[RayOffloadModel] ========== ALL WORKERS OFFLOADED ==========", flush=True)
         return (latent,)
+
+
+
+class RayLoraLoaderModelOnly:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "lora_name": (folder_paths.get_filename_list("loras"),),
+                "strength_model": (
+                    "FLOAT",
+                    {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01},
+                ),
+            },
+            "optional": {
+                "prev_ray_lora": ("RAY_LORA", {"tooltip": "Chain from previous RayLoraLoader for stacking. Creates isolated config per branch."}),
+            },
+        }
+
+    RETURN_TYPES = ("RAY_ACTORS", "RAY_LORA")
+    RETURN_NAMES = ("ray_actors", "ray_lora")
+    FUNCTION = "load_lora_model_only"
+
+    CATEGORY = "Raylight"
+
+    def load_lora_model_only(self, ray_actors, lora_name, strength_model, prev_ray_lora=None):
+        # Build config chain for branch isolation
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        this_lora_sig = f"{lora_name}:{strength_model}"
+        
+        # Build config hash from chain
+        if prev_ray_lora is not None:
+            config_chain = prev_ray_lora.get("chain", "") + "|" + this_lora_sig
+        else:
+            config_chain = this_lora_sig
+        
+        # Create output lora object for chaining
+        ray_lora = {"chain": config_chain, "hash": hash(config_chain)}
+        
+        if strength_model == 0:
+            return (ray_actors, ray_lora)
+
+        gpu_actors = ray_actors["workers"]
+        lora_config_hash = ray_lora["hash"]
+
+        # Dispatch UNET patching to Ray Workers with config hash for branch isolation
+        print(f"[RayLoraLoaderModelOnly] Dispatching LoRA {lora_name} to {len(gpu_actors)} workers (config_hash={lora_config_hash})...")
+        futures = [actor.load_lora.remote(lora_path, strength_model, lora_config_hash) for actor in gpu_actors]
+        cancellable_get(futures)
+
+        return (ray_actors, ray_lora)
 
 
 NODE_CLASS_MAPPINGS = {
     "XFuserKSamplerAdvanced": XFuserKSamplerAdvanced,
     "DPKSamplerAdvanced": DPKSamplerAdvanced,
     "RayUNETLoader": RayUNETLoader,
+    "RayLoraLoaderModelOnly": RayLoraLoaderModelOnly,
 
     "RayInitializer": RayInitializer,
     "RayInitializerAdvanced": RayInitializerAdvanced,
@@ -1072,6 +1140,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "XFuserKSamplerAdvanced": "XFuser KSampler (Advanced)",
     "DPKSamplerAdvanced": "Data Parallel KSampler (Advanced)",
     "RayUNETLoader": "Load Diffusion Model (Ray)",
+    "RayLoraLoaderModelOnly": "Ray LoRA Loader",
 
     "RayInitializer": "Ray Init Actor",
     "RayInitializerAdvanced": "Ray Init Actor (Advanced)",

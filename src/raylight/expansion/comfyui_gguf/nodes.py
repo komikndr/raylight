@@ -19,6 +19,7 @@ from .ops import move_patch_to_device, GGMLTensor
 from .dequant import is_quantized, is_torch_compatible
 
 from raylight.distributed_worker.ray_worker import ensure_fresh_actors
+from raylight.comfy_dist.lora import calculate_weight as ray_calculate_weight
 
 
 def update_folder_names_and_paths(key, targets=[]):
@@ -74,7 +75,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             else:
                 temp_weight = weight.to(torch.float32, copy=True)
 
-            out_weight = comfy.lora.calculate_weight(patches, temp_weight, key)
+            out_weight = ray_calculate_weight(patches, temp_weight, key)
             out_weight = comfy.float.stochastic_rounding(out_weight, weight.dtype)
 
         if inplace_update:
@@ -135,12 +136,41 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                                  break
 
                     if target_param is not None:
-                        # CRITICAL: Pointer Swap. 
-                        # We use .data = ... to avoid triggering autograd or complex assignment logic.
-                        target_param.data = mmap_data.data
-                        moved_to_mmap += 1
+                        # CRITICAL: Full replacement, not just pointer swap!
+                        # Using .data = ... only changes the data pointer but leaves the GPU tensor
+                        # object alive. We need to replace the entire parameter with the mmap tensor.
+                        # This allows GC to release the old GPU tensor.
+                        
+                        # Get the matched full name for this parameter
+                        matched_name = None
+                        for p_name, p_val in param_map.items():
+                            if p_val is target_param:
+                                matched_name = p_name
+                                break
+                        
+                        if matched_name is not None:
+                            # Replace with mmap tensor wrapped in Parameter
+                            comfy.utils.set_attr_param(self.model, matched_name, mmap_weight)
+                            moved_to_mmap += 1
+                        else:
+                            # Fallback to pointer swap if we can't find the name
+                            target_param.data = mmap_data.data
+                            if hasattr(target_param, "patches"):
+                                target_param.patches = []
+                            moved_to_mmap += 1
             
             print(f"[GGUFModelPatcher] Zero-Copy: Restored {moved_to_mmap} parameters to mmap.")
+            
+            # CRITICAL: Clear .patches on ALL parameters, not just those matched during swap.
+            # GGMLTensor.to() copies .patches, so there may be GPU tensor refs on params
+            # that weren't in mmap_cache or weren't matched.
+            cleared_patches = 0
+            for name, param in self.model.named_parameters():
+                if hasattr(param, "patches") and param.patches:
+                    param.patches = []
+                    cleared_patches += 1
+            if cleared_patches > 0:
+                print(f"[GGUFModelPatcher] Cleared .patches on {cleared_patches} parameters.")
             
             # FALLBACK: If we failed to swap ANYTHING, we MUST still offload the VRAM!
             if moved_to_mmap == 0 and device_to is not None and device_to.type == "cpu":
@@ -226,6 +256,11 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         # CRITICAL FIX: Empty backup in clone to prevent mmap reference leaks
         # Clones will repopulate backup when they act.
         n.backup = {}
+        
+        # FIX: Create a shallow copy of patches dict to prevent shared mutation.
+        # The super().clone() already copies patches, but we ensure isolation here.
+        if hasattr(self, "patches") and self.patches:
+            n.patches = {k: list(v) for k, v in self.patches.items()}
         
         return n
 
