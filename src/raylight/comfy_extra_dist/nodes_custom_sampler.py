@@ -270,6 +270,12 @@ class XFuserSamplerCustom:
         # Ensure model is loaded before sampling (triggers /dev/shm hot reload if needed)
         ray.get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
 
+        # Re-apply LoRAs for this branch's config_hash if needed
+        lora_config_hash = ray_actors.get("lora_config_hash")
+        if lora_config_hash is not None:
+            print(f"[XFuserSamplerCustom] Ensuring LoRAs for config_hash={lora_config_hash}...")
+            ray.get([actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors])
+
         futures = [
             actor.custom_sampler.remote(
                 add_noise,
@@ -349,6 +355,12 @@ class DPSamplerCustom:
 
         # Ensure model is loaded before sampling (triggers /dev/shm hot reload if needed)
         ray.get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
+
+        # Re-apply LoRAs for this branch's config_hash if needed
+        lora_config_hash = ray_actors.get("lora_config_hash")
+        if lora_config_hash is not None:
+            print(f"[DPSamplerCustom] Ensuring LoRAs for config_hash={lora_config_hash}...")
+            ray.get([actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors])
 
         futures = [
             actor.custom_sampler.remote(

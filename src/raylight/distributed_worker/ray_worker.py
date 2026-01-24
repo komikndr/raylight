@@ -914,6 +914,19 @@ class RayWorker:
             self._applied_loras = set()
         if not hasattr(self, "_current_lora_config_hash"):
             self._current_lora_config_hash = None
+        # NEW: Store LoRA configs per config_hash for branch-aware re-application
+        if not hasattr(self, "_lora_configs"):
+            self._lora_configs = {}  # config_hash -> [(lora_path, strength), ...]
+        
+        # Store this LoRA in the config registry for re-application after offload
+        if lora_config_hash is not None:
+            if lora_config_hash not in self._lora_configs:
+                self._lora_configs[lora_config_hash] = []
+            lora_entry = (lora_path, strength_model)
+            # Avoid duplicate entries in the same config
+            if lora_entry not in self._lora_configs[lora_config_hash]:
+                self._lora_configs[lora_config_hash].append(lora_entry)
+                print(f"[RayWorker {self.local_rank}] Registered LoRA for config {lora_config_hash}: {filename}")
         
         # BRANCH ISOLATION: If lora_config_hash changed, reset all LoRAs first
         if lora_config_hash is not None and lora_config_hash != self._current_lora_config_hash:
@@ -935,28 +948,8 @@ class RayWorker:
         # 1. Ensure model is loaded/re-hydrated
         self.reload_model_if_needed()
         
-        # 2. Load LoRA State Dict (Mmap)
-        # safe_load=True/False depends on Comfy version, usually uses safetensors mmap if possible.
-        lora_sd = comfy.utils.load_torch_file(lora_path)
-        
-        # 3. Resolve Keys & Convert
-        key_map = {}
-        if self.model is not None:
-            key_map = comfy.lora.model_lora_keys_unet(self.model.model, key_map)
-        
-        from comfy.lora_convert import convert_lora
-        lora_patches = convert_lora(lora_sd)
-        
-        # 4. Load Patches using Raylight's distributed lora helper
-        from raylight.comfy_dist.lora import load_lora
-        loaded_patches = load_lora(lora_patches, key_map)
-        
-        # 5. Apply to Model
-        # This adds to the .patches dict in ModelPatcher/GGUFModelPatcher
-        self.model.add_patches(loaded_patches, strength_model)
-        
-        # 6. Track this LoRA as applied
-        self._applied_loras.add(lora_sig)
+        # 2. Apply using core logic (shared with re-apply)
+        self._apply_lora_core(lora_path, strength_model)
         
         print(f"[RayWorker {self.local_rank}] LoRA applied successfully.")
         return True
@@ -999,6 +992,84 @@ class RayWorker:
                 self.model.backup.clear()
         
         print(f"[RayWorker {self.local_rank}] LoRAs reset complete.")
+
+    def reapply_loras_for_config(self, config_hash):
+        """Re-apply all LoRAs for a specific config_hash after model reload.
+        
+        This is called before sampling when the sampler's config_hash differs from
+        the current applied config. It allows different branches to use different
+        LoRA configurations without interference.
+        
+        Args:
+            config_hash: The configuration hash identifying which LoRAs to apply.
+        """
+        # Initialize storage if needed
+        if not hasattr(self, "_lora_configs"):
+            self._lora_configs = {}
+        
+        # Nothing to do if no config stored
+        if config_hash not in self._lora_configs:
+            print(f"[RayWorker {self.local_rank}] No LoRAs registered for config {config_hash}. Skipping re-apply.")
+            return True
+        
+        # Check if we already have the right config applied
+        current_hash = getattr(self, "_current_lora_config_hash", None)
+        if current_hash == config_hash and hasattr(self, "_applied_loras") and self._applied_loras:
+            print(f"[RayWorker {self.local_rank}] Config {config_hash} already applied. Skipping re-apply.")
+            return True
+        
+        print(f"[RayWorker {self.local_rank}] Re-applying LoRAs for config {config_hash}...")
+        
+        # Reset current patches first
+        self.reset_loras()
+        
+        # Ensure model is loaded
+        self.reload_model_if_needed()
+        
+        # Re-apply each LoRA in this config
+        lora_list = self._lora_configs[config_hash]
+        for lora_path, strength in lora_list:
+            filename = os.path.basename(lora_path)
+            print(f"[RayWorker {self.local_rank}] Re-applying LoRA: {filename} (strength={strength})")
+            self._apply_lora_core(lora_path, strength)
+        
+        # Update tracking
+        self._current_lora_config_hash = config_hash
+        
+        print(f"[RayWorker {self.local_rank}] Re-applied {len(lora_list)} LoRAs for config {config_hash}.")
+        return True
+    
+    def _apply_lora_core(self, lora_path, strength_model):
+        """Core LoRA application logic without registration/tracking.
+        
+        Used by both load_lora (initial apply) and reapply_loras_for_config (re-apply).
+        """
+        filename = os.path.basename(lora_path)
+        
+        # Load LoRA State Dict (Mmap)
+        lora_sd = comfy.utils.load_torch_file(lora_path)
+        
+        # Resolve Keys & Convert
+        key_map = {}
+        if self.model is not None:
+            key_map = comfy.lora.model_lora_keys_unet(self.model.model, key_map)
+        
+        from comfy.lora_convert import convert_lora
+        lora_patches = convert_lora(lora_sd)
+        
+        # Load Patches using Raylight's distributed lora helper
+        from raylight.comfy_dist.lora import load_lora
+        loaded_patches = load_lora(lora_patches, key_map)
+        
+        # Apply to Model
+        self.model.add_patches(loaded_patches, strength_model)
+        
+        # Track as applied
+        if not hasattr(self, "_applied_loras"):
+            self._applied_loras = set()
+        self._applied_loras.add((lora_path, strength_model))
+        
+        print(f"[RayWorker {self.local_rank}] LoRA core apply complete: {filename}")
 
     def barrier_and_evict(self, path):
          """Synchronizes all workers and then evicts page cache."""

@@ -219,7 +219,8 @@ class GGMLLayer(torch.nn.Module):
 
         # DEBUG: Inspect tensor type before dequant
         if not hasattr(self, "_logged_debug"):
-            print(f"[GGUF Forward DEBUG] Layer {self.__class__.__name__} processing weight: class={tensor.__class__.__name__}, dtype={tensor.dtype}, shape={tensor.shape}, tensor_type={getattr(tensor, 'tensor_type', 'NO_ATTR')}")
+            has_patches = len(getattr(tensor, "patches", [])) > 0
+            print(f"[GGUF Forward DEBUG] Layer {self.__class__.__name__} processing weight: class={tensor.__class__.__name__}, dtype={tensor.dtype}, shape={tensor.shape}, tensor_type={getattr(tensor, 'tensor_type', 'NO_ATTR')}, has_patches={has_patches}")
             self._logged_debug = True
 
         # dequantize tensor while patches load
@@ -231,6 +232,13 @@ class GGMLLayer(torch.nn.Module):
 
         # apply patches
         if len(patch_list) > 0:
+            # Log first 3 times per layer to confirm LoRA is being applied
+            if not hasattr(self, "_lora_log_count"):
+                self._lora_log_count = 0
+            if self._lora_log_count < 3:
+                print(f"[GGUF LoRA] Applying {len(patch_list)} patches to key={key}")
+                self._lora_log_count += 1
+            
             if self.patch_dtype is None:
                 weight = ray_calculate_weight(patch_list, weight, key)
             else:

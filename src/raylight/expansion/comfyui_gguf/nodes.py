@@ -49,6 +49,10 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         if key not in self.patches:
             return
         
+        # Debug: Log when patches are being applied
+        patches = self.patches[key]
+        print(f"[GGUFModelPatcher] Applying {len(patches)} patches to {key} -> {device_to}")
+        
         # GHOST REFRESH: Pull from mmap_cache if available (handles 'meta' restoration)
         # This allows the model to re-hydrate from a fresh mapping.
         if hasattr(self, "mmap_cache") and key in self.mmap_cache:
