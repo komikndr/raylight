@@ -159,6 +159,20 @@ class RayInitializer:
                     "default": False,
                     "tooltip": "Enable combined QKV all-to-all optimization. Only works for self-attention models. Disable for cross-attention (LTXV, SD3, etc.)."
                 }),
+                "use_mmap": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Use memory-mapped (zero-copy) model loading. Enabled: parallel loading with OS page cache sharing. Disabled: sequential leader-follower loading (use if mmap causes issues)."
+                }),
+                "mmap_cache_size": ("INT", {
+                    "default": 2,
+                    "min": 1,
+                    "max": 10,
+                    "tooltip": "LRU cache size for mmap'd model state dicts. Higher values keep more models in RAM for fast reloading."
+                }),
+                "use_fastsafe": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Use fastsafetensors library for accelerated loading (requires pip install fastsafetensors). Enables GPUDirect Storage on compatible hardware."
+                }),
             }
         }
 
@@ -186,6 +200,9 @@ class RayInitializer:
         gpu_indices: str = "",
         skip_comm_test: bool = True,
         pack_qkv: bool = True,
+        use_mmap: bool = True,
+        mmap_cache_size: int = 2,
+        use_fastsafe: bool = False,
     ):
         with monitor_memory("RayInitializer.spawn_actor"):
             # THIS IS PYTORCH DIST ADDRESS
@@ -224,6 +241,11 @@ class RayInitializer:
             self.parallel_dict["is_fsdp"] = False
             self.parallel_dict["sync_ulysses"] = False
             self.parallel_dict["global_world_size"] = world_size
+            
+            # Mmap settings for zero-copy loading
+            self.parallel_dict["use_mmap"] = use_mmap
+            self.parallel_dict["mmap_cache_size"] = mmap_cache_size
+            self.parallel_dict["use_fastsafe"] = use_fastsafe
 
             if (
                 ulysses_degree > 0
@@ -401,6 +423,20 @@ class RayInitializerAdvanced(RayInitializer):
                     "default": False,
                     "tooltip": "Enable combined QKV all-to-all optimization. Only works for self-attention models. Disable for cross-attention (LTXV, SD3, etc.)."
                 }),
+                "use_mmap": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Use memory-mapped (zero-copy) model loading. Enabled: parallel loading with OS page cache sharing. Disabled: sequential leader-follower loading."
+                }),
+                "mmap_cache_size": ("INT", {
+                    "default": 2,
+                    "min": 1,
+                    "max": 10,
+                    "tooltip": "LRU cache size for mmap'd model state dicts."
+                }),
+                "use_fastsafe": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Use fastsafetensors library for accelerated loading (requires pip install fastsafetensors)."
+                }),
             }
         }
 
@@ -481,8 +517,10 @@ class RayUNETLoader:
             cancellable_get(loaded_futures)
             loaded_futures = []
         else:
-            # Parallel Loading Mode: Trigger load_unet on all workers.
-            # RayWorker is responsible for "Lightweight Ref" logic if needed to save RAM.
+            # Parallel Loading Mode: All workers load simultaneously
+            # With LazySafetensorsModelPatcher, only mmap refs are cached at this stage
+            # Actual model instantiation is deferred to sampling time
+            print("[Raylight] Parallel UNet Load: Creating lazy wrappers on all workers...")
             for actor in gpu_actors:
                 loaded_futures.append(
                     actor.load_unet.remote(unet_path, model_options=model_options)
@@ -490,14 +528,18 @@ class RayUNETLoader:
             cancellable_get(loaded_futures)
             loaded_futures = []
 
-        for actor in gpu_actors:
-            if parallel_dict["is_xdit"]:
-                if (parallel_dict["ulysses_degree"]) > 1 or (parallel_dict["ring_degree"] > 1):
-                    patched_futures.append(actor.patch_usp.remote())
-                if parallel_dict["cfg_degree"] > 1:
-                    patched_futures.append(actor.patch_cfg.remote())
-
-        cancellable_get(patched_futures)
+        # Patching: Done SEQUENTIALLY to avoid RAM spikes
+        # For safetensors with lazy wrappers, patching triggers model instantiation
+        # Sequential ensures only one worker's RAM usage peaks at a time
+        if parallel_dict["is_xdit"]:
+            if (parallel_dict["ulysses_degree"]) > 1 or (parallel_dict["ring_degree"] > 1):
+                print("[Raylight] Sequential USP Patching: Instantiating workers one at a time...")
+                for actor in gpu_actors:
+                    cancellable_get(actor.patch_usp.remote())
+            if parallel_dict["cfg_degree"] > 1:
+                print("[Raylight] Sequential CFG Patching...")
+                for actor in gpu_actors:
+                    cancellable_get(actor.patch_cfg.remote())
 
         return (ray_actors,)
 

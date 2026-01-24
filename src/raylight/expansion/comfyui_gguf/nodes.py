@@ -334,42 +334,65 @@ class RayGGUFLoader:
             ray.get(loaded_futures)
             loaded_futures = []
         else:
-            # 1. Leader (Worker 0) Load
-            worker0 = ray.get_actor("RayWorker:0")
-            print("[Raylight] Starting Leader GGUF Load on Worker 0...")
-            ray.get(
-                worker0.load_gguf_unet.remote(
-                    unet_path,
-                    dequant_dtype=dequant_dtype,
-                    patch_dtype=patch_dtype,
-                )
-            )
-
-            # 2. Get Ref & Metadata
-            base_ref = ray.get(worker0.get_base_ref.remote())
-            gguf_metadata = ray.get(worker0.get_gguf_metadata.remote())
-
-            # Prepare params for fallback
-            reload_params = {
-                "unet_path": unet_path,
-                "dequant_dtype": dequant_dtype,
-                "patch_dtype": patch_dtype,
-                "model_options": {}
-            }
-
-            # 3. Follower Hydration (Zero-Copy with Fallback)
-            print("[Raylight] Initializing Followers via Shared RAM (with mmap fallback)...")
-            for actor in gpu_actors:
-                if actor != worker0:
-                    loaded_futures.append(
-                        actor.init_gguf_from_ref.remote(
-                            base_ref,
-                            gguf_metadata,
-                            reload_params
+            # Mmap-aware loading strategy:
+            # - use_mmap=True: Pure parallel loading (OS page cache handles sharing)
+            # - use_mmap=False: Leader-follower sequential (avoid RAM spikes from concurrent copies)
+            use_mmap = parallel_dict.get("use_mmap", True)
+            
+            if use_mmap:
+                # PARALLEL: All workers load simultaneously via mmap
+                # OS page cache ensures single physical copy shared across processes
+                print("[Raylight] GGUF Parallel Mmap Load: All workers loading simultaneously...")
+                load_futures = []
+                for actor in gpu_actors:
+                    load_futures.append(
+                        actor.load_gguf_unet.remote(
+                            unet_path,
+                            dequant_dtype=dequant_dtype,
+                            patch_dtype=patch_dtype,
                         )
                     )
-            ray.get(loaded_futures)
-            loaded_futures = []
+                ray.get(load_futures)
+            else:
+                # SEQUENTIAL: Leader-follower to avoid RAM spikes
+                print("[Raylight] GGUF Sequential Load (mmap disabled): Using leader-follower pattern...")
+                
+                # 1. Leader (Worker 0) Load
+                worker0 = ray.get_actor("RayWorker:0")
+                print("[Raylight] Starting Leader GGUF Load on Worker 0...")
+                ray.get(
+                    worker0.load_gguf_unet.remote(
+                        unet_path,
+                        dequant_dtype=dequant_dtype,
+                        patch_dtype=patch_dtype,
+                    )
+                )
+
+                # 2. Get Ref & Metadata
+                base_ref = ray.get(worker0.get_base_ref.remote())
+                gguf_metadata = ray.get(worker0.get_gguf_metadata.remote())
+
+                # Prepare params for fallback
+                reload_params = {
+                    "unet_path": unet_path,
+                    "dequant_dtype": dequant_dtype,
+                    "patch_dtype": patch_dtype,
+                    "model_options": {}
+                }
+
+                # 3. Follower Hydration
+                print("[Raylight] Initializing Followers via Shared RAM (with mmap fallback)...")
+                for actor in gpu_actors:
+                    if actor != worker0:
+                        loaded_futures.append(
+                            actor.init_gguf_from_ref.remote(
+                                base_ref,
+                                gguf_metadata,
+                                reload_params
+                            )
+                        )
+                ray.get(loaded_futures)
+                loaded_futures = []
 
 
 
