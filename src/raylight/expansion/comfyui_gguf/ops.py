@@ -238,7 +238,7 @@ class GGMLLayer(torch.nn.Module):
             if self._lora_log_count < 3:
                 print(f"[GGUF LoRA] Applying {len(patch_list)} patches to key={key}")
                 self._lora_log_count += 1
-            
+
             if self.patch_dtype is None:
                 weight = ray_calculate_weight(patch_list, weight, key)
             else:

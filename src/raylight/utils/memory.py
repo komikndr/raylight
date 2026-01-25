@@ -5,6 +5,7 @@ import torch
 import psutil
 import gc
 
+
 def get_system_ram_gb():
     """Returns (used_gb, total_gb, available_gb, cached_gb)."""
     try:
@@ -14,6 +15,7 @@ def get_system_ram_gb():
     except Exception:
         return (0, 0, 0, 0)
 
+
 def get_process_rss_gb():
     """Returns RSS of current process in GB."""
     try:
@@ -22,22 +24,24 @@ def get_process_rss_gb():
     except Exception:
         return 0
 
+
 def get_vram_gb(device=None):
     """Returns (allocated_gb, reserved_gb) for the specified or current device."""
     if not torch.cuda.is_available():
         return (0, 0)
-        
+
     try:
         if device is not None:
-             with torch.cuda.device(device):
-                 alloc = torch.cuda.memory_allocated()
-                 res = torch.cuda.memory_reserved()
+            with torch.cuda.device(device):
+                alloc = torch.cuda.memory_allocated()
+                res = torch.cuda.memory_reserved()
         else:
-             alloc = torch.cuda.memory_allocated()
-             res = torch.cuda.memory_reserved()
+            alloc = torch.cuda.memory_allocated()
+            res = torch.cuda.memory_reserved()
         return (alloc / 1024**3, res / 1024**3)
     except Exception:
         return (0, 0)
+
 
 def get_shm_usage_gb():
     """Returns total size of Raylight cache files in /dev/shm in GB."""
@@ -52,6 +56,7 @@ def get_shm_usage_gb():
     except Exception:
         pass
     return total_bytes / 1024**3
+
 
 def get_gguf_mmap_gb():
     """Returns total size of .gguf files mapped in /proc/self/maps in GB."""
@@ -73,6 +78,7 @@ def get_gguf_mmap_gb():
         pass
     return total_bytes / 1024**3
 
+
 def log_memory_stats(tag="Memory", device=None):
     """Logs comprehensive memory statistics to stdout."""
     # Data collection
@@ -81,30 +87,30 @@ def log_memory_stats(tag="Memory", device=None):
     vram_alloc, vram_res = get_vram_gb(device)
     shm = get_shm_usage_gb()
     mmap = get_gguf_mmap_gb()
-    
+
     # Formatting
     header = f"[{tag}] Memory Stats"
     print(f"{header:-^60}")
-    
+
     # System Level
     print(f"System RAM : {sys_used:5.2f} GB Used / {sys_total:5.2f} GB Total")
     print(f"           : {sys_avail:5.2f} GB Available | {sys_cached:5.2f} GB Cached (Benign)")
-    
+
     # Process Level
     print(f"Process RSS: {rss:5.2f} GB (This Process)")
-    
+
     # VRAM
     if vram_res > 0:
         frag = vram_res - vram_alloc
         print(f"VRAM       : {vram_alloc:5.2f} GB Alloc / {vram_res:5.2f} GB Rsrvd | Frag: {frag:5.2f} GB")
-        
+
     # Shared Resources
     if shm > 0:
         print(f"Shared Mem : {shm:5.2f} GB (Raylight /dev/shm cache)")
-    
+
     if mmap > 0:
         print(f"GGUF Mmap  : {mmap:5.2f} GB (Mapped into this process)")
-        
+
     print("-" * 60)
 
 
@@ -126,7 +132,7 @@ class monitor_memory:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         status = "FAILED" if exc_type else "SUCCESS"
-        
+
         peak_gb = 0.0
         try:
             if torch.cuda.is_available():
@@ -134,6 +140,6 @@ class monitor_memory:
                 peak_gb = peak_bytes / 1024**3
         except:
             pass
-            
+
         print(f"[{'END:' + status}] {self.tag} | Peak VRAM Delta: {peak_gb:.2f} GB")
         log_memory_stats(f"[END:{status}] {self.tag}", self.device)

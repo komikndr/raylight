@@ -7,6 +7,7 @@ from raylight.utils.memory import monitor_memory
 from raylight.utils.common import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm, cleanup_memory
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 
+
 class SamplerManager:
     def __init__(self, worker):
         self.worker = worker
@@ -14,7 +15,7 @@ class SamplerManager:
     def _prepare_for_sampling(self, latent):
         """Common setup for sampling methods."""
         if self.worker.model is None:
-             raise RuntimeError(f"[RayWorker {self.worker.local_rank}] Model not loaded! Please use a Load node first.")
+            raise RuntimeError(f"[RayWorker {self.worker.local_rank}] Model not loaded! Please use a Load node first.")
         work_model = self.worker.model
 
         latent_image = latent["samples"]
@@ -40,11 +41,11 @@ class SamplerManager:
         # CRITICAL: Ensure model device references are valid for this worker
         if hasattr(work_model, 'load_device') and work_model.load_device != self.worker.device:
             work_model.load_device = self.worker.device
-            
+
         noise_mask = latent.get("noise_mask", None)
-            
+
         return work_model, latent_image, noise_mask, disable_pbar
-    
+
     @contextmanager
     def sampling_context(self, latent):
         """Context manager for sampling operations to ensure cleanup."""
@@ -53,14 +54,14 @@ class SamplerManager:
             # We need a copy of latent because _prepare modifies it
             # The caller passes the original dict, we copy it here
             work_latent = latent.copy()
-            
+
             setup_result = self._prepare_for_sampling(work_latent)
             # setup_result is (work_model, latent_image, noise_mask, disable_pbar)
-            
+
             # We yield the setup results along with the work_latent dict 
             # so the caller can update it with samples
             yield setup_result + (work_latent,)
-            
+
         finally:
             # Always clean up memory, even if sampling fails
             cleanup_memory()
@@ -91,8 +92,8 @@ class SamplerManager:
             # Use utility for consistent memory logging
             with monitor_memory(f"RayWorker {self.worker.local_rank} - custom_sampler", device=self.worker.device):
                 if hasattr(self.worker.model, "mmap_cache"):
-                     print(f"[RayWorker {self.worker.local_rank}] Mmap Cache Len: {len(self.worker.model.mmap_cache) if self.worker.model.mmap_cache else 0}")
-                
+                    print(f"[RayWorker {self.worker.local_rank}] Mmap Cache Len: {len(self.worker.model.mmap_cache) if self.worker.model.mmap_cache else 0}")
+
                 with torch.no_grad():
                     samples = comfy.sample.sample_custom(
                         work_model,
@@ -133,7 +134,7 @@ class SamplerManager:
     ):
         with monitor_memory(f"RayWorker {self.worker.local_rank} - common_ksampler", device=self.worker.device):
             # NOTE: Reload is now handled by coordinator (sampler node) BEFORE dispatching.
-            
+
             with self.sampling_context(latent) as (work_model, final_samples, noise_mask, disable_pbar, work_latent):
                 # 2. Noise Generation
                 if disable_noise:
@@ -152,8 +153,8 @@ class SamplerManager:
                 # 3. Sampler resolution logic for custom sigmas
                 sampler_obj = sampler_name
                 if sigmas is not None:
-                     if isinstance(sampler_name, str):
-                         sampler_obj = comfy.samplers.ksampler(sampler_name)
+                    if isinstance(sampler_name, str):
+                        sampler_obj = comfy.samplers.ksampler(sampler_name)
 
                 # 4. Sampling
                 with torch.no_grad():
@@ -178,20 +179,20 @@ class SamplerManager:
                             seed=seed,
                        )
                     else:
-                         samples = comfy.sample.sample_custom(
-                            work_model,
-                            noise,
-                            cfg,
-                            sampler_obj,
-                            sigmas,
-                            positive,
-                            negative,
-                            final_samples,
-                            noise_mask=noise_mask,
-                            disable_pbar=disable_pbar,
-                            seed=seed,
-                        )
-                    
+                        samples = comfy.sample.sample_custom(
+                           work_model,
+                           noise,
+                           cfg,
+                           sampler_obj,
+                           sigmas,
+                           positive,
+                           negative,
+                           final_samples,
+                           noise_mask=noise_mask,
+                           disable_pbar=disable_pbar,
+                           seed=seed,
+                       )
+
                     out = work_latent.copy()
                     out["samples"] = samples
 

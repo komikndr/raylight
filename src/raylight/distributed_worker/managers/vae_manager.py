@@ -6,6 +6,7 @@ import logging
 from raylight.utils.memory import monitor_memory
 from raylight.utils.common import cleanup_memory, force_malloc_trim
 
+
 class VaeManager:
     def __init__(self, worker):
         self.worker = worker
@@ -38,7 +39,7 @@ class VaeManager:
                 version = 1
                 if "encoder.down_blocks.1.conv.conv.bias" in state_dict: version = 2
             print(f"[RayWorker {self.worker.local_rank}] VAE Identification: Guessed version {version}")
-        
+
         if metadata:
             print(f"[RayWorker {self.worker.local_rank}] VAE Identification: Metadata found, contains 'config': {'config' in metadata}")
 
@@ -65,13 +66,13 @@ class VaeManager:
             print(f"[RayWorker {self.worker.local_rank}] Releasing VAE model from RAM...")
             del self.vae_model
             self.vae_model = None
-            
+
             # Aggressive cleanup
             cleanup_memory()
-            
+
             # Force OS to reclaim freed memory
             force_malloc_trim()
-            
+
             print(f"[RayWorker {self.worker.local_rank}] VAE released.")
         return True
 
@@ -89,11 +90,11 @@ class VaeManager:
         print(f"[RayWorker {self.worker.local_rank}] Input Latent Stats (shard {shard_index}): min={l_min:.4f}, max={l_max:.4f}, mean={l_mean:.4f}")
         if torch.isnan(samples["samples"]).any():
             print(f"[RayWorker {self.worker.local_rank}] CRITICAL: Input latents for shard {shard_index} contain NaNs!")
-        
+
         # Check if overwrite_cast_dtype is set (from patch_temp_fix_ck_ops)
         if getattr(self.worker, "overwrite_cast_dtype", None) is not None:
             print(f"[RayWorker {self.worker.local_rank}] Debug: overwrite_cast_dtype is set to {self.worker.overwrite_cast_dtype}")
-        
+
         # Check VAE weights for NaNs BEFORE decoding
         if self.vae_model is not None:
             nan_params = []
@@ -121,16 +122,16 @@ class VaeManager:
     ):
         with monitor_memory(f"RayWorker {self.worker.local_rank} - ray_vae_decode", device=self.worker.device):
             print(f"[RayWorker {self.worker.local_rank}] Entering ray_vae_decode (direct method call) for shard {shard_index}...")
-            
+
             import gc
             gc.collect()
             torch.cuda.empty_cache()
-        
+
         if tile_size < overlap * 4:
             overlap = tile_size // 4
         if temporal_size < temporal_overlap * 2:
             temporal_overlap = temporal_overlap // 2
-        
+
         temporal_compression = self.vae_model.temporal_compression_decode()
         if temporal_compression is not None:
             temporal_size = max(2, temporal_size // temporal_compression)
@@ -161,10 +162,10 @@ class VaeManager:
         else:  # fp32
             dtype = torch.float32
             print(f"[RayWorker {self.worker.local_rank}] Using float32 VAE (user selected - stable but 2x memory)")
-        
+
         self.vae_model.first_stage_model.to(dtype)
         self.vae_model.vae_dtype = dtype
-        
+
         latents_to_decode = samples["samples"].to(dtype)
         print(f"[RayWorker {self.worker.local_rank}] latents_to_decode shape: {latents_to_decode.shape}")
         print(f"[RayWorker {self.worker.local_rank}] tiling: tile_t={temporal_size}, overlap_t={temporal_overlap}")
@@ -178,10 +179,10 @@ class VaeManager:
             overlap_t=temporal_overlap,
         )
         print(f"[RayWorker {self.worker.local_rank}] decode_tiled complete. Shape: {images.shape}")
-        
+
         if torch.isnan(images).any():
             print(f"[RayWorker {self.worker.local_rank}] CRITICAL: VAE output STILL contains NaNs even in float32!")
-        
+
         if len(images.shape) == 5:
             # VAE.decode_tiled returns [B, T, H, W, C]
             # Reshape to [B*T, H, W, C] and squeeze leading dim if B=1
@@ -195,7 +196,7 @@ class VaeManager:
                 images = images.squeeze(0)
             if len(images.shape) == 3: # H, W, C -> 1, H, W, C
                 images = images.unsqueeze(0)
-            
+
         # If we have overlap, discard the warmup frames
         if discard_latent_frames > 0:
             # 1 latent frame = 8 video frames
@@ -203,33 +204,33 @@ class VaeManager:
             discard_video_frames = discard_latent_frames * temporal_compression
             print(f"[RayWorker {self.worker.local_rank}] Discarding {discard_video_frames} redundant warmup frames")
             images = images[discard_video_frames:]
-            
+
         # Move to CPU explicitly before transport to avoid Ray GPU serialization issues
         # and print stats to troubleshoot "Black Video" issues.
         stats_min, stats_max, stats_mean = images.min().item(), images.max().item(), images.mean().item()
         print(f"[RayWorker {self.worker.local_rank}] Shard {shard_index} statistics: min={stats_min:.4f}, max={stats_max:.4f}, mean={stats_mean:.4f}")
-        
+
         if mmap_path and mmap_shape:
             # Direct write to shared memory optimization
             print(f"[RayWorker {self.worker.local_rank}] Writing directly to shared mmap: {mmap_path} (offset={output_offset})...")
-            
+
             # Open shared mmap
             num_elements = 1
             for dim in mmap_shape: num_elements *= dim
-            
+
             # We assume float32 output
             out_buffer = torch.from_file(mmap_path, shared=True, size=num_elements, dtype=torch.float32).reshape(mmap_shape)
-            
+
             # Write slice
             write_len = images.shape[0]
             if output_offset + write_len > out_buffer.shape[0]:
-                 # Safety clip
-                 write_len = out_buffer.shape[0] - output_offset
-                 images = images[:write_len]
+                # Safety clip
+                write_len = out_buffer.shape[0] - output_offset
+                images = images[:write_len]
 
             # Write (auto-cast to float32 if needed)
             out_buffer[output_offset : output_offset + write_len] = images.to(torch.float32).cpu()
-            
+
             # Return stats only
             result_payload = {
                 "mmap": True,
@@ -237,7 +238,7 @@ class VaeManager:
                 "stats": (stats_min, stats_max, stats_mean)
             }
             del out_buffer
-            
+
         else:
             # Fallback: serializing large tensor over Ray Object Store (high RAM usage)
             print(f"[RayWorker {self.worker.local_rank}] Moving to CPU and converting to float16 for transport...")
@@ -247,16 +248,16 @@ class VaeManager:
         # Proactive memory cleanup - release decoded images tensor
         del images
         del latents_to_decode
-        
+
         # Release VAE from GPU VRAM (keep in CPU RAM for potential reuse within same prompt)
         # This is critical to avoid VRAM accumulation across shards
         if self.vae_model is not None and hasattr(self.vae_model, 'first_stage_model'):
             self.vae_model.first_stage_model.to('cpu')
-        
+
         print(f"[RayWorker {self.worker.local_rank}] Shard {shard_index} complete. Cleanup and return.")
         cleanup_memory()
 
         # Force OS to reclaim freed memory (fixes RSS creep on Worker 0)
         force_malloc_trim()
-            
+
         return (shard_index, result_payload)

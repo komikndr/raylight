@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import types
 
+
 def patch_ffn_forward(module, num_chunks, verbose=True):
     """
     Monkey-patches the forward method of a FeedForward module to run in chunks.
@@ -34,18 +35,18 @@ def patch_ffn_forward(module, num_chunks, verbose=True):
 
         # Pre-allocate output tensor to avoid memory peaks from concatenation
         out = torch.empty_like(x)
-        
+
         chunk_size = (seq_len + num_chunks - 1) // num_chunks
-        
+
         for i in range(0, seq_len, chunk_size):
             end = min(i + chunk_size, seq_len)
             chunk = x[:, i:end, :]
-            
+
             # Use original forward logic (usually self.net(chunk))
             chunk_out = self._original_forward(chunk)
-            
+
             out[:, i:end, :] = chunk_out
-            
+
             # Explicitly clear chunk references
             del chunk, chunk_out
 
@@ -55,12 +56,13 @@ def patch_ffn_forward(module, num_chunks, verbose=True):
     module.forward = types.MethodType(chunked_forward, module)
     return True
 
+
 def wrap_ffn_layers(model, num_chunks=8, verbose=True):
     """
     Finds and patches FFN layers in LTX-2 / LTXAV models.
     """
     info = {"ffn_wrapped": 0, "already_wrapped": 0}
-    
+
     # Target LTX-2 / LTXAV structure
     target = model
     # If it's a ComfyUI ModelPatcher, get the inner model
@@ -72,7 +74,7 @@ def wrap_ffn_layers(model, num_chunks=8, verbose=True):
             target = target.get_model_object("diffusion_model")
         except:
             pass
-    
+
     # Handle nested diffusion_model (some versions wrap it again)
     if hasattr(target, 'diffusion_model'):
         target = target.diffusion_model
@@ -95,11 +97,12 @@ def wrap_ffn_layers(model, num_chunks=8, verbose=True):
 
     info["ffn_wrapped"] = patched_count
     info["already_wrapped"] = already_patched
-    
+
     if verbose:
         print(f"[RayLTXFFNChunker] Patched {patched_count} FFN layers, updated {already_patched}.")
-        
+
     return info
+
 
 class RayLTXFFNChunker:
     @classmethod
@@ -118,10 +121,10 @@ class RayLTXFFNChunker:
     def apply_chunking(self, ray_actors, ffn_chunks):
         import ray
         gpu_actors = ray_actors["workers"]
-        
+
         # Apply to all workers
         ray.get([actor.apply_ffn_chunking.remote(ffn_chunks) for actor in gpu_actors])
-        
+
         return (ray_actors,)
 
 NODE_CLASS_MAPPINGS = {

@@ -27,6 +27,8 @@ from raylight.utils.memory import monitor_memory
 
 # Workaround https://github.com/comfyanonymous/ComfyUI/pull/11134
 # since in FSDPModelPatcher mode, ray cannot pickle None type cause by getattr
+
+
 def _monkey():
     from raylight.comfy_dist.supported_models_base import BASE as PatchedBASE
     import comfy.supported_models_base as supported_models_base
@@ -241,7 +243,7 @@ class RayInitializer:
             self.parallel_dict["is_fsdp"] = False
             self.parallel_dict["sync_ulysses"] = False
             self.parallel_dict["global_world_size"] = world_size
-            
+
             # Mmap settings for zero-copy loading
             self.parallel_dict["use_mmap"] = use_mmap
             self.parallel_dict["mmap_cache_size"] = mmap_cache_size
@@ -294,8 +296,8 @@ class RayInitializer:
                     # Validate and set
                     indices = [x.strip() for x in gpu_indices.split(",") if x.strip()]
                     if len(indices) < world_size:
-                         raise ValueError(f"gpu_indices contains {len(indices)} GPUs, but {world_size} (GPU input) were requested.")
-                    
+                        raise ValueError(f"gpu_indices contains {len(indices)} GPUs, but {world_size} (GPU input) were requested.")
+
                     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(indices)
                     print(f"[Raylight] Pinning Ray Cluster to GPUs: {os.environ['CUDA_VISIBLE_DEVICES']}")
 
@@ -303,7 +305,7 @@ class RayInitializer:
                 # Check if Ray is already initialized with matching config to skip expensive re-init
                 is_local = ray_cluster_address in _LOCAL_CLUSTER_ADDRESSES
                 should_reuse = False
-                
+
                 if ray.is_initialized():
                     try:
                         # Check if the cluster has matching GPU count
@@ -314,11 +316,11 @@ class RayInitializer:
                             should_reuse = True
                     except Exception:
                         pass
-                
+
                 if not should_reuse:
                     # Shut down so if comfy user try another workflow it will not cause error
                     ray.shutdown()
-                    
+
                     # Build init kwargs - disable metrics agent for faster startup
                     init_kwargs = {
                         'namespace': ray_cluster_namespace,
@@ -328,14 +330,14 @@ class RayInitializer:
                         'dashboard_port': dashboard_port,
                         '_metrics_export_port': None,  # Disable metrics agent to avoid connection retries
                     }
-                    
+
                     # Only set object_store_memory if explicitly configured (not for reused clusters)
                     if ray_object_store_memory is not None:
                         init_kwargs['object_store_memory'] = ray_object_store_memory
-                    
+
                     ray.init(ray_cluster_address, **init_kwargs)
                     print(f"[Raylight] Ray cluster initialized (new instance)")
-                
+
             except Exception as e:
                 ray.shutdown()
                 ray.init(
@@ -347,7 +349,7 @@ class RayInitializer:
             if original_visible_devices is not None:
                 os.environ["CUDA_VISIBLE_DEVICES"] = original_visible_devices
             elif "CUDA_VISIBLE_DEVICES" in os.environ and gpu_indices.strip():
-                 del os.environ["CUDA_VISIBLE_DEVICES"]
+                del os.environ["CUDA_VISIBLE_DEVICES"]
 
             # ===== OPTIMIZATION: Skip NCCL Test =====
             # NCCL test spawns/kills separate actors before real workers - saves ~10-15s
@@ -356,17 +358,17 @@ class RayInitializer:
                 ray_nccl_tester(world_size)
             else:
                 print("[Raylight] Skipping NCCL test (skip_comm_test=True)")
-            
+
             ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
             ray_actors = ray_actor_fn()
-            
+
             # Store GPU indices for later use in samplers (for partial offload matching)
             if gpu_indices.strip():
                 ray_actors["gpu_indices"] = [int(x.strip()) for x in gpu_indices.split(",") if x.strip()]
             else:
                 # Default: 0, 1, 2, ...
                 ray_actors["gpu_indices"] = list(range(world_size))
-            
+
             return ([ray_actors, ray_actor_fn],)
 
 
@@ -495,7 +497,6 @@ class RayUNETLoader:
         except:
             unet_path = folder_paths.get_full_path_or_raise("checkpoints", unet_name)
 
-
         loaded_futures = []
         patched_futures = []
 
@@ -542,9 +543,6 @@ class RayUNETLoader:
                     cancellable_get(actor.patch_cfg.remote())
 
         return (ray_actors,)
-
-
-
 
 
 class XFuserKSamplerAdvanced:
@@ -903,7 +901,7 @@ class RayVAEDecodeDistributed:
         else:
             total_output_frames = total_frames
             overlap_latent_frames = 0
-            
+
         # Calculate Master Output Shape (B, T, H, W, C)
         # We assume Batch=1 for video usually, but we handle standard (B, T, H, W, C) structure 
         # or (T, H, W, C) if squeezed. ComfyUI usually expects (TotalFrames, H, W, 3) for video batch.
@@ -911,59 +909,59 @@ class RayVAEDecodeDistributed:
         W_out = latents.shape[4] * spatial_compression
         # Final shape: (TotalFrames, Height, Width, 3)
         master_shape = (total_output_frames, H_out, W_out, 3)
-        
+
         # 3. Create Shared Memory File (Pre-allocation)
         mmap_path = f"/dev/shm/raylight_vae_out_{uuid.uuid4().hex}.bin"
         num_elements = 1
         for dim in master_shape: num_elements *= dim
         file_size_bytes = num_elements * 4 # float32 = 4 bytes
-        
+
         print(f"[RayVAEDecode] Pre-allocating shared output buffer: {mmap_path} ({file_size_bytes/1024**3:.2f} GB)")
         print(f"[RayVAEDecode] Output Shape: {master_shape}")
-        
+
         full_image = None # Initialize outside try block for finally access
         try:
             with open(mmap_path, "wb") as f:
                 f.seek(file_size_bytes - 1)
                 f.write(b"\0")
-                
+
             # Create the tensor wrapper immediately
             full_image = torch.from_file(mmap_path, shared=True, size=num_elements, dtype=torch.float32).reshape(master_shape)
-            
+
             # 4. Dispatch Workers
             # NOTE: Do NOT pre-divide temporal parameters by compression factor.
             # Original ComfyUI's decode_tiled passes tile_t and overlap_t directly to decode_tiled_3d.
-            
+
             frames_per_shard = (total_frames + num_workers - 1) // num_workers
-            
+
             futures = []
             for i, actor in enumerate(gpu_actors):
                 start = i * frames_per_shard
                 end = min((i + 1) * frames_per_shard, total_frames)
-                
+
                 if start >= total_frames:
                     continue # No work for this worker
-                    
+
                 # context_start: Provide 1 frame of context to ensure continuity
                 context_start = max(0, start - 1)
                 # actual_end: Each shard must produce frames up to the START of the next shard.
                 actual_end = min(end + (1 if i < num_workers - 1 else 0), total_frames)
-                
+
                 shard_samples = {
                     "samples": latents[:, :, context_start:actual_end].clone()
                 }
-                
+
                 # Pass how many latent frames to discard from the beginning of the result
                 discard_latent_frames = start - context_start
-                
+
                 # Calculate Output Offset due to temporal compression
                 # shard index 'start' corresponds to video frame:
                 start_video_frame = start * temporal_compression
                 if temporal_compression == 1:
-                     start_video_frame = start
-                
+                    start_video_frame = start
+
                 print(f"[RayVAEDecode] Shard {i}: Latents {context_start} to {end} (discard {discard_latent_frames}) -> Video Frame {start_video_frame}")
-                
+
                 futures.append(actor.ray_vae_decode.remote(
                     i, # shard_index
                     shard_samples,
@@ -977,14 +975,14 @@ class RayVAEDecodeDistributed:
                     mmap_shape=master_shape, # DIRECT WRITING
                     output_offset=start_video_frame # DIRECT WRITING
                 ))
-    
+
             print(f"[RayVAEDecode] Dispatched {len(futures)} shards. Direct-to-disk mode enabled.")
-            
+
             # 5. Gather Results (Stats Only)
             remaining = list(futures)
             futures_count = len(futures)
             received_count = 0
-            
+
             while remaining:
                 # Check ComfyUI cancel status
                 if comfy.model_management.processing_interrupted():
@@ -999,11 +997,11 @@ class RayVAEDecodeDistributed:
                 ready, remaining = ray.wait(remaining, num_returns=1, timeout=1.0)
                 if not ready:
                     continue
-                    
+
                 for ray_ref in ready:
                     shard_index, result = cancellable_get(ray_ref)
                     received_count += 1
-                    
+
                     if isinstance(result, dict) and result.get("mmap", False):
                         # Direct write success
                         shape = result["shape"]
@@ -1013,19 +1011,19 @@ class RayVAEDecodeDistributed:
                         # Fallback (Legacy / Failure fallback)
                         shard_data = result
                         print(f"[RayVAEDecode] Shard {shard_index} returned tensor {shard_data.shape} (Fallback path)")
-                        
+
                         # Write to mmap manually
                         start = shard_index * frames_per_shard
                         start_video_frame = start * temporal_compression
                         s_len = shard_data.shape[0]
                         end_video_frame = start_video_frame + s_len
-                        
+
                         # Handle truncation if needed
                         if end_video_frame > total_output_frames:
                             s_len = max(0, total_output_frames - start_video_frame)
                             shard_data = shard_data[:s_len]
                             end_video_frame = start_video_frame + s_len
-                        
+
                         if s_len > 0:
                             full_image[start_video_frame:end_video_frame] = shard_data.to(torch.float32)
 
@@ -1038,7 +1036,7 @@ class RayVAEDecodeDistributed:
             # Usually images are just a list of frames. Tensor shape (T, H, W, C).
             # ComfyUI "IMAGE" type is (BATCH, H, W, C). For video, BATCH = Frames.
             # So (T, H, W, 3) is correct.
-            
+
             # 6. Cleanup shared file?
             # If we delete the file now, full_image relies on valid fd/mapping.
             # Since torch.from_file uses Mmap, we should keep the file until we don't need it?
@@ -1062,7 +1060,7 @@ class RayVAEDecodeDistributed:
                 print("[RayVAEDecode] VAE released from all workers.")
 
             return (full_image,)
-            
+
         except Exception as e:
             # Cleanup on failure
             if os.path.exists(mmap_path):
@@ -1076,7 +1074,7 @@ class RayOffloadModel:
     """
     Offloads the diffusion model from all Ray workers' VRAM.
     Place this node after the sampler to free GPU memory.
-    
+
     This is an OUTPUT node - it will always execute if connected.
     """
     @classmethod
@@ -1107,9 +1105,9 @@ class RayOffloadModel:
         import sys
         print("[RayOffloadModel] ========== OFFLOAD NODE EXECUTING ==========", flush=True)
         sys.stdout.flush()
-        
+
         gpu_actors = ray_actors["workers"]
-        
+
         # Offload from all workers SEQUENTIALLY to prevent OOM
         print(f"[RayOffloadModel] Starting sequential offload for {len(gpu_actors)} workers...", flush=True)
         for i, actor in enumerate(gpu_actors):
@@ -1125,7 +1123,6 @@ class RayOffloadModel:
 
         print("[RayOffloadModel] ========== ALL WORKERS OFFLOADED ==========", flush=True)
         return (latent,)
-
 
 
 class RayLoraLoaderModelOnly:
@@ -1149,23 +1146,23 @@ class RayLoraLoaderModelOnly:
     CATEGORY = "Raylight"
 
     def load_lora_model_only(self, ray_actors, lora_name, strength_model):
-        
+
         # 1. Extract existing chain from ray_actors
         # Default to empty string if this is the first lora in the chain
         current_chain = ray_actors.get("lora_chain", "")
-        
+
         # 2. Append new LoRA to the chain
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         this_lora_sig = f"{lora_name}:{strength_model}"
-        
+
         if current_chain:
             new_chain = current_chain + "|" + this_lora_sig
         else:
             new_chain = this_lora_sig
-            
+
         # 3. Calculate new hash
         lora_config_hash = hash(new_chain)
-        
+
         if strength_model == 0:
             # Even if strength is 0, we should probably pass through the actors
             # But technically it doesn't change the model state relative to the *previous* state?

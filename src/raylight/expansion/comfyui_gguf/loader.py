@@ -13,6 +13,7 @@ IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltx
 TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
+
 def get_orig_shape(reader, tensor_name):
     field_key = f"comfy.gguf.orig_shape.{tensor_name}"
     field = reader.get_field(field_key)
@@ -22,6 +23,7 @@ def get_orig_shape(reader, tensor_name):
     if len(field.types) != 2 or field.types[0] != gguf.GGUFValueType.ARRAY or field.types[1] != gguf.GGUFValueType.INT32:
         raise TypeError(f"Bad original shape metadata for {field_key}: Expected ARRAY of INT32, got {field.types}")
     return torch.Size(tuple(int(field.parts[part_idx][0]) for part_idx in field.data))
+
 
 def get_field(reader, field_name, field_type):
     field = reader.get_field(field_name)
@@ -37,6 +39,7 @@ def get_field(reader, field_name, field_type):
     else:
         raise TypeError(f"Unknown field type {field_type}")
 
+
 def get_list_field(reader, field_name, field_type):
     field = reader.get_field(field_name)
     if field is None:
@@ -47,6 +50,7 @@ def get_list_field(reader, field_name, field_type):
         return tuple(field_type(field.parts[part_idx][0]) for part_idx in field.data)
     else:
         raise TypeError(f"Unknown field type {field_type}")
+
 
 def get_gguf_metadata(reader):
     """Extract all simple metadata fields like safetensors"""
@@ -66,6 +70,7 @@ def get_gguf_metadata(reader):
         except:
             continue
     return metadata
+
 
 def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=False):
     """
@@ -212,6 +217,7 @@ CLIP_VISION_SD_MAP = {
     "ln2.": "norm2.",
 }
 
+
 def sd_map_replace(raw_sd, key_map):
     sd = {}
     for k,v in raw_sd.items():
@@ -219,6 +225,7 @@ def sd_map_replace(raw_sd, key_map):
             k = k.replace(s,d)
         sd[k] = v
     return sd
+
 
 def llama_permute(raw_sd, n_head, n_head_kv):
     # Reverse version of LlamaModel.permute in llama.cpp convert script
@@ -232,12 +239,14 @@ def llama_permute(raw_sd, n_head, n_head_kv):
         sd[k] = v
     return sd
 
+
 def strip_quant_suffix(name):
     pattern = r"[-_]?(?:ud-)?i?q[0-9]_[a-z0-9_\-]{1,8}$"
     match = re.search(pattern, name, re.IGNORECASE)
     if match:
         name = name[:match.start()]
     return name
+
 
 def gguf_mmproj_loader(path):
     # Reverse version of Qwen2VLVisionModel.modify_tensors
@@ -305,6 +314,7 @@ def gguf_mmproj_loader(path):
 
     return vsd
 
+
 def gguf_tokenizer_loader(path, temb_shape):
     # convert gguf tokenizer to spiece
     logging.info("Attempting to recreate sentencepiece tokenizer from GGUF file metadata...")
@@ -353,6 +363,7 @@ def gguf_tokenizer_loader(path, temb_shape):
     del reader
     return torch.ByteTensor(list(spm.SerializeToString()))
 
+
 def gguf_tekken_tokenizer_loader(path, temb_shape):
     # convert ggml (hf) tokenizer metadata to tekken/comfy data
     logging.info("Attempting to recreate tekken tokenizer from GGUF file metadata...")
@@ -395,6 +406,7 @@ def gguf_tekken_tokenizer_loader(path, temb_shape):
     logging.info(f"Created tekken tokenizer with vocab size of {len(data['vocab'])} (+{len(data['special_tokens'])})")
     del reader
     return torch.ByteTensor(list(json.dumps(data).encode('utf-8')))
+
 
 def gguf_clip_loader(path):
     sd, extra = gguf_sd_loader(path, is_text_model=True)

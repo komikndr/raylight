@@ -47,7 +47,7 @@ def get_pack_qkv() -> bool:
 
 def make_xfuser_attention(attn_type, sync_ulysses, pack_qkv=None):
     """Create xFuser attention with optional combined QKV all-to-all.
-    
+
     Args:
         attn_type: Attention backend type (TORCH, FA, SAGE_*, etc.)
         sync_ulysses: Whether to use synchronous Ulysses parallelism
@@ -55,7 +55,7 @@ def make_xfuser_attention(attn_type, sync_ulysses, pack_qkv=None):
     """
     if pack_qkv is None:
         pack_qkv = get_pack_qkv()
-    
+
     print(f"Using XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}, Pack QKV: {pack_qkv}")
     attn = AttnType[attn_type]
     if attn_type == "SAGE_FP8_CUDA":

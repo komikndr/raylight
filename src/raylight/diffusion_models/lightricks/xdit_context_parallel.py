@@ -98,25 +98,25 @@ def process_usp_timestep(timestep, sp_rank, sp_world_size):
         return type(timestep)(
             process_usp_timestep(t, sp_rank, sp_world_size) for t in timestep
         )
-        
+
     elif torch.is_tensor(timestep):
         # Optimized Slicing for standard Tensors
         orig_len = timestep.size(1)
         padded_len = ((orig_len + sp_world_size - 1) // sp_world_size) * sp_world_size
         chunk_size = padded_len // sp_world_size
-        
+
         start = sp_rank * chunk_size
         end = (sp_rank + 1) * chunk_size
-        
+
         # All beyond original -> all padding
         if start >= orig_len:
             pad_len = end - start
             return timestep[:, -1:, :].expand(-1, pad_len, -1).clone()
-            
+
         # Entirely within original -> just slice
         if end <= orig_len:
             return timestep[:, start:end, :].clone()
-        
+
         # Spans across boundary -> slice + pad
         real_part = timestep[:, start:, :]
         pad_len = end - orig_len
@@ -129,22 +129,22 @@ def process_usp_timestep(timestep, sp_rank, sp_world_size):
         total_len = ts.num_frames * ts.patches_per_frame
         padded_len = ((total_len + sp_world_size - 1) // sp_world_size) * sp_world_size
         chunk_size = padded_len // sp_world_size
-        
+
         start_idx = sp_rank * chunk_size
         end_idx = (sp_rank + 1) * chunk_size
-        
+
         # Optimized Expansion: create local indices and gather frame data
         # This replaces the OOM-prone ts.expand() call
         indices = torch.arange(start_idx, end_idx, device=ts.data.device)
         # Handle padding by repeating last frame's data
         valid_indices = torch.clamp(indices, max=total_len - 1)
         frame_indices = valid_indices // ts.patches_per_frame
-        
+
         # Gather relevant frame data: [batch, chunk_size, feature_dim]
         # We use clone() to ensure it doesn't hold a reference to the full data if possible,
         # though slicing here is already a gather which creates a new tensor.
         return ts.data[:, frame_indices, :]
-        
+
     else:
         return timestep
 
@@ -216,7 +216,7 @@ def usp_dit_forward(
         pc_shape = [tuple(p.shape) for p in pixel_coords_chunk]
     else:
         pc_shape = tuple(pixel_coords_chunk.shape)
-        
+
     print(f"[RayWorker {sp_rank}] Generating PE for chunk: {pc_shape}")
     pe = self._prepare_positional_embeddings(pixel_coords_chunk, frame_rate, input_dtype)
     print(f"[RayWorker {sp_rank}] PE Generated. VRAM: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
@@ -228,7 +228,7 @@ def usp_dit_forward(
         x, context, attention_mask, timestep, pe, transformer_options=transformer_options, **merged_args
     )
     print(f"[RayWorker {sp_rank}] Blocks complete. Peak VRAM: {torch.cuda.max_memory_allocated()/1024**2:.1f}MB")
-    
+
     x = sp_gather_group(x, x_orig, dim=1)
 
     # Process output

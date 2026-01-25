@@ -140,8 +140,6 @@ class RayInitializerDebug:
         return ([ray_actors, ray_actor_fn],)
 
 
-
-
 class RayNF4Loader:
     @classmethod
     def INPUT_TYPES(s):

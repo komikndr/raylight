@@ -88,7 +88,6 @@ def usp_dit_forward(
     img = self.img_in(img)
     vec = self.time_in(timestep_embedding(timesteps, 256, time_factor=1.0).to(img.dtype))
 
-
     if (self.time_r_in is not None) and (not disable_time_r):
         w = torch.where(transformer_options['sigmas'][0] == transformer_options['sample_sigmas'])[0]  # This most likely could be improved
         if len(w) > 0:
@@ -154,7 +153,6 @@ def usp_dit_forward(
         txt = torch.cat((txt_vision_states.to(txt.dtype), txt), dim=1)
         extra_txt_ids = torch.zeros((txt_ids.shape[0], txt_vision_states.shape[1], txt_ids.shape[-1]), device=txt_ids.device, dtype=txt_ids.dtype)
         txt_ids = torch.cat((txt_ids, extra_txt_ids), dim=1)
-
 
     img_len = img.shape[1]
     if txt_mask is not None:

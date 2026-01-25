@@ -147,12 +147,12 @@ def gguf_load_diffusion_model(unet_path, model_options={}, dequant_dtype=None, p
 
     # init model
     sd, extra = gguf_sd_loader(unet_path)
-    
+
     kwargs = {}
     valid_params = inspect.signature(comfy.sd.load_diffusion_model_state_dict).parameters
     if "metadata" in valid_params:
         kwargs["metadata"] = extra.get("metadata", {})
-        
+
     model = comfy.sd.load_diffusion_model_state_dict(sd.copy(), model_options={"custom_operations": ops}, **kwargs)
     if model is None:
         logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
@@ -161,7 +161,7 @@ def gguf_load_diffusion_model(unet_path, model_options={}, dequant_dtype=None, p
     model.mmap_cache = sd # Capture mmap references for zero-copy offload
     model.gguf_metadata = extra.get("metadata", {})
     model.unet_path = unet_path
-    
+
     return model
 
 
@@ -238,7 +238,6 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
     finally:
         parameters = comfy.utils.calculate_parameters(sd)
         weight_dtype = comfy.utils.weight_dtype(sd)
-
 
     load_device = model_management.get_torch_device()
     model_config = model_detection.model_config_from_unet(sd, "")

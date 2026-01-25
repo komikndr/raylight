@@ -7,11 +7,12 @@ import gc
 import torch
 import ray
 
+
 def evict_page_cache(path):
     """Tells the kernel to evict pages of the given file from the Page Cache."""
     if not path or not os.path.exists(path):
         return
-    
+
     try:
         if sys.platform.startswith("linux"):
             fd = os.open(path, os.O_RDONLY)
@@ -24,15 +25,16 @@ def evict_page_cache(path):
         # posix_fadvise not available on all platforms
         print(f"[Raylight] Note: Could not evict {os.path.basename(path)} from page cache: {e}")
 
+
 def check_mmap_leak(path):
     """Checks /proc/self/maps to see if the file is still mapped."""
     if not sys.platform.startswith("linux"):
         return False
-    
+
     try:
         with open("/proc/self/maps", "r") as f:
             maps = f.read()
-            
+
         if path in maps:
             # Count occurrences
             count = maps.count(path)

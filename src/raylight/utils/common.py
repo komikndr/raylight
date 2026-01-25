@@ -10,6 +10,7 @@ except ImportError:
 import ctypes
 import gc
 
+
 class Noise_EmptyNoise:
     def __init__(self):
         self.seed = 0
@@ -64,6 +65,7 @@ def patch_ray_tqdm(fn):
 
     return wrapper
 
+
 def force_malloc_trim():
     """Forces the C library to release freed memory back to the OS."""
     try:
@@ -72,6 +74,7 @@ def force_malloc_trim():
     except Exception as e:
         print(f"[Raylight] Warning: malloc_trim failed: {e}")
 
+
 def cleanup_memory():
     """Performs comprehensive memory cleanup."""
     gc.collect()
@@ -79,6 +82,6 @@ def cleanup_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
-    
+
     # CRITICAL for Zero-Copy: Force OS to reclaim freed buffers and page cache
     force_malloc_trim()

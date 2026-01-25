@@ -158,13 +158,13 @@ def cancellable_get(refs, timeout=0.1):
     # Handle single ref
     is_list = isinstance(refs, (list, tuple))
     remaining = list(refs) if is_list else [refs]
-    
+
     # Store results in original order
     results = [None] * len(remaining)
     ref_to_idx = {ref: i for i, ref in enumerate(remaining)}
-    
+
     # print(f"[Raylight] Awaiting {len(remaining)} Ray tasks with cancellation support...")
-    
+
     try:
         while remaining:
             # Check ComfyUI cancel status
@@ -189,5 +189,5 @@ def cancellable_get(refs, timeout=0.1):
         if "Job canceled by user" not in str(e):
             print(f"[Raylight] Error during cancellable_get: {e}")
         raise e
-            
+
     return results if is_list else results[0]
