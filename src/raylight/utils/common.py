@@ -1,10 +1,14 @@
 import torch
 import torch.distributed as dist
-import comfy
+import comfy.model_management
 import functools
 from ray.experimental.tqdm_ray import tqdm as ray_tqdm
-import tqdm.auto as tqdm_auto
-
+try:
+    import tqdm.auto as tqdm_auto
+except ImportError:
+    import tqdm as tqdm_auto
+import ctypes
+import gc
 
 class Noise_EmptyNoise:
     def __init__(self):
@@ -59,3 +63,22 @@ def patch_ray_tqdm(fn):
             tqdm_auto.trange = orig_trange
 
     return wrapper
+
+def force_malloc_trim():
+    """Forces the C library to release freed memory back to the OS."""
+    try:
+        libc = ctypes.CDLL('libc.so.6')
+        libc.malloc_trim(0)
+    except Exception as e:
+        print(f"[Raylight] Warning: malloc_trim failed: {e}")
+
+def cleanup_memory():
+    """Performs comprehensive memory cleanup."""
+    gc.collect()
+    comfy.model_management.soft_empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    
+    # CRITICAL for Zero-Copy: Force OS to reclaim freed buffers and page cache
+    force_malloc_trim()

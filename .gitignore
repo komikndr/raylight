@@ -45,6 +45,7 @@ lib64/
 parts/
 sdist/
 var/
+xdit-reference-code/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -112,3 +113,7 @@ yarn-error.log*
 node.zip
 .vscode/
 .claude/
+
+
+
+reference/

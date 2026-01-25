@@ -10,7 +10,7 @@ from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
 import comfy.utils
 from .ray_patch_decorator import ray_patch_with_return
 
-from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise
+from raylight.utils.common import Noise_EmptyNoise, Noise_RandomNoise
 
 
 class RayBasicScheduler:
@@ -239,7 +239,7 @@ class XFuserSamplerCustom:
                 "sampler": ("SAMPLER",),
                 "sigmas": ("SIGMAS",),
                 "latent_image": ("LATENT",),
-            }
+            },
         }
 
     RETURN_TYPES = ("LATENT",)
@@ -264,7 +264,18 @@ class XFuserSamplerCustom:
         gc.collect()
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
+        comfy.model_management.soft_empty_cache()
         gpu_actors = ray_actors["workers"]
+
+        # Ensure model is loaded before sampling (triggers /dev/shm hot reload if needed)
+        ray.get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
+
+        # Re-apply LoRAs for this branch's config_hash if needed
+        lora_config_hash = ray_actors.get("lora_config_hash")
+        if lora_config_hash is not None:
+            print(f"[XFuserSamplerCustom] Ensuring LoRAs for config_hash={lora_config_hash}...")
+            ray.get([actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors])
+
         futures = [
             actor.custom_sampler.remote(
                 add_noise,
@@ -276,7 +287,7 @@ class XFuserSamplerCustom:
                 sigmas,
                 latent_image,
             )
-            for actor in gpu_actors
+            for i, actor in enumerate(gpu_actors)
         ]
         results = ray.get(futures)
         out = results[0]
@@ -306,7 +317,7 @@ class DPSamplerCustom:
                 "sampler": ("SAMPLER",),
                 "sigmas": ("SIGMAS",),
                 "latent_image": ("LATENT",),
-            }
+            },
         }
 
     RETURN_TYPES = ("LATENT",)
@@ -341,6 +352,15 @@ class DPSamplerCustom:
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
         gpu_actors = ray_actors["workers"]
+
+        # Ensure model is loaded before sampling (triggers /dev/shm hot reload if needed)
+        ray.get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
+
+        # Re-apply LoRAs for this branch's config_hash if needed
+        lora_config_hash = ray_actors.get("lora_config_hash")
+        if lora_config_hash is not None:
+            print(f"[DPSamplerCustom] Ensuring LoRAs for config_hash={lora_config_hash}...")
+            ray.get([actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors])
 
         futures = [
             actor.custom_sampler.remote(

@@ -1,5 +1,7 @@
 import torch
 import itertools
+import ray
+import comfy.model_management
 
 
 @torch.inference_mode()
@@ -121,7 +123,7 @@ def tiled_scale_multidim(
             if pbar is not None:
                 pbar.update(1)
 
-        output[b:b + 1] = out / out_div
+        output[b:b + 1] = out / out_div.clamp(min=1e-8)
     return output
 
 
@@ -146,3 +148,46 @@ def tiled_scale(
         output_device=output_device,
         pbar=pbar
     )
+
+
+def cancellable_get(refs, timeout=0.1):
+    """
+    A Ray.get() replacement that checks for ComfyUI cancellation.
+    Returns a list of results if refs is a list, otherwise a single result.
+    """
+    # Handle single ref
+    is_list = isinstance(refs, (list, tuple))
+    remaining = list(refs) if is_list else [refs]
+    
+    # Store results in original order
+    results = [None] * len(remaining)
+    ref_to_idx = {ref: i for i, ref in enumerate(remaining)}
+    
+    # print(f"[Raylight] Awaiting {len(remaining)} Ray tasks with cancellation support...")
+    
+    try:
+        while remaining:
+            # Check ComfyUI cancel status
+            if comfy.model_management.processing_interrupted():
+                print("[Raylight] Cancellation detected! Force-canceling Ray tasks...")
+                for ref in remaining:
+                    try:
+                        # Use force=True (SIGKILL) and recursive=True for immediate cleanup
+                        ray.cancel(ref, force=True, recursive=True)
+                    except Exception as e:
+                        print(f"[Raylight] Error canceling task: {e}")
+                # Raise exception to stop ComfyUI execution
+                raise Exception("Raylight: Job canceled by user.")
+
+            # Wait for some tasks to complete
+            ready, remaining = ray.wait(remaining, timeout=timeout)
+            for ref in ready:
+                idx = ref_to_idx[ref]
+                results[idx] = ray.get(ref)
+    except Exception as e:
+        # Rethrow if it's our cancellation exception, otherwise log and rethrow
+        if "Job canceled by user" not in str(e):
+            print(f"[Raylight] Error during cancellable_get: {e}")
+        raise e
+            
+    return results if is_list else results[0]

@@ -1,6 +1,7 @@
 import raylight
 import os
 import gc
+import math
 from typing import Any
 from pathlib import Path
 from copy import deepcopy
@@ -9,6 +10,8 @@ import ray
 import torch
 import comfy
 import folder_paths
+import tempfile
+import uuid
 from yunchang.kernels import AttnType
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
@@ -19,7 +22,8 @@ from .distributed_worker.ray_worker import (
     ensure_fresh_actors,
     ray_nccl_tester,
 )
-
+from .comfy_dist.utils import cancellable_get
+from raylight.utils.memory import monitor_memory
 
 # Workaround https://github.com/comfyanonymous/ComfyUI/pull/11134
 # since in FSDPModelPatcher mode, ray cannot pickle None type cause by getattr
@@ -74,12 +78,16 @@ def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir:
     env_vars = {
         'PYTHONPATH': python_path,
         'COMFYUI_BASE_DIRECTORY': str(repo_root),
+        'RAY_enable_metrics_collection': '0',
+        'RAY_USAGE_STATS_ENABLED': '0',
+        'RAY_METRICS_EXPORT_INTERVAL_MS': '0',  # Fully disable metrics export
     }
 
     return {
         'py_modules': [str(module_dir)],
         'working_dir': str(runtime_workdir),
         'env_vars': env_vars,
+        'config': {'eager_install': False},  # Defer module install until actors spawn
     }
 
 
@@ -97,8 +105,12 @@ def _build_remote_runtime_env(module_dir: Path, repo_root: Path):
         'working_dir': str(repo_root),
         'env_vars': {
             'COMFYUI_BASE_DIRECTORY': '.',
+            'RAY_enable_metrics_collection': '0',
+            'RAY_USAGE_STATS_ENABLED': '0',
+            'RAY_METRICS_EXPORT_INTERVAL_MS': '0',  # Fully disable metrics export
         },
         'excludes': excludes,
+        'config': {'eager_install': False},  # Defer module install until actors spawn
     }
 
 
@@ -130,6 +142,37 @@ class RayInitializer:
                     [member.name for member in AttnType],
                     {"default": "TORCH"},
                 ),
+                "ray_object_store_gb": ("FLOAT", {
+                    "default": 0.0,
+                    "tooltip": "Ray shared memory object store size in GB. 0.0 = Auto (Use Ray default ~30% of System RAM). Increase if you see spilling to disk."}),
+            },
+            "optional": {
+                "gpu_indices": ("STRING", {
+                    "default": "",
+                    "tooltip": "Comma-separated list of GPU indices to use (e.g., '0,1'). Overrides automatic selection."
+                }),
+                "skip_comm_test": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early."
+                }),
+                "pack_qkv": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable combined QKV all-to-all optimization. Only works for self-attention models. Disable for cross-attention (LTXV, SD3, etc.)."
+                }),
+                "use_mmap": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Use memory-mapped (zero-copy) model loading. Enabled: parallel loading with OS page cache sharing. Disabled: sequential leader-follower loading (use if mmap causes issues)."
+                }),
+                "mmap_cache_size": ("INT", {
+                    "default": 2,
+                    "min": 1,
+                    "max": 10,
+                    "tooltip": "LRU cache size for mmap'd model state dicts. Higher values keep more models in RAM for fast reloading."
+                }),
+                "use_fastsafe": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Use fastsafetensors library for accelerated loading (requires pip install fastsafetensors). Enables GPUDirect Storage on compatible hardware."
+                }),
             }
         }
 
@@ -151,103 +194,180 @@ class RayInitializer:
         FSDP: bool,
         FSDP_CPU_OFFLOAD: bool,
         XFuser_attention: int,
-        ray_object_store_gb: float = 2.0,
+        ray_object_store_gb: float = 0.0,
         ray_dashboard_address: str = "None",
-        torch_dist_address: str = "None"
+        torch_dist_address: str = "None",
+        gpu_indices: str = "",
+        skip_comm_test: bool = True,
+        pack_qkv: bool = True,
+        use_mmap: bool = True,
+        mmap_cache_size: int = 2,
+        use_fastsafe: bool = False,
     ):
-        # THIS IS PYTORCH DIST ADDRESS
-        # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
-        # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
-        if torch_dist_address != "None":
-            torch_host, torch_port = torch_dist_address.rsplit(":", 1)
-            os.environ.setdefault("MASTER_ADDR", torch_host)
-            os.environ.setdefault("MASTER_PORT", torch_port)
-        else:
-            torch_host, torch_port = "127.0.0.1", "29500"
-            os.environ.setdefault("MASTER_ADDR", torch_host)
-            os.environ.setdefault("MASTER_PORT", torch_port)
+        with monitor_memory("RayInitializer.spawn_actor"):
+            # THIS IS PYTORCH DIST ADDRESS
+            # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
+            # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
+            if torch_dist_address != "None":
+                torch_host, torch_port = torch_dist_address.rsplit(":", 1)
+                os.environ.setdefault("MASTER_ADDR", torch_host)
+                os.environ.setdefault("MASTER_PORT", torch_port)
+            else:
+                torch_host, torch_port = "127.0.0.1", "29500"
+                os.environ.setdefault("MASTER_ADDR", torch_host)
+                os.environ.setdefault("MASTER_PORT", torch_port)
 
-        # HF Tokenizer warning when forking
-        os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        self.parallel_dict: dict[str, Any] = dict()
-        _monkey()
+            # HF Tokenizer warning when forking
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
+            self.parallel_dict: dict[str, Any] = dict()
+            _monkey()
 
-        world_size = GPU
-        max_world_size = torch.cuda.device_count()
-        if world_size > max_world_size:
-            raise ValueError("Too many gpus")
-        if world_size == 0:
-            raise ValueError("Num of cuda/cudalike device is 0")
-        if world_size < ulysses_degree * ring_degree * cfg_degree:
-            raise ValueError(
-                f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} x {ring_degree=} x {cfg_degree=}"
-            )
-        if cfg_degree > 2:
-            raise ValueError(
-                "CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2"
-            )
+            world_size = GPU
+            max_world_size = torch.cuda.device_count()
+            if world_size > max_world_size:
+                raise ValueError("Too many gpus")
+            if world_size == 0:
+                raise ValueError("Num of cuda/cudalike device is 0")
+            if world_size < ulysses_degree * ring_degree * cfg_degree:
+                raise ValueError(
+                    f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} x {ring_degree=} x {cfg_degree=}"
+                )
+            if cfg_degree > 2:
+                raise ValueError(
+                    "CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2"
+                )
 
-        self.parallel_dict["is_xdit"] = False
-        self.parallel_dict["is_fsdp"] = False
-        self.parallel_dict["sync_ulysses"] = False
-        self.parallel_dict["global_world_size"] = world_size
+            self.parallel_dict["is_xdit"] = False
+            self.parallel_dict["is_fsdp"] = False
+            self.parallel_dict["sync_ulysses"] = False
+            self.parallel_dict["global_world_size"] = world_size
+            
+            # Mmap settings for zero-copy loading
+            self.parallel_dict["use_mmap"] = use_mmap
+            self.parallel_dict["mmap_cache_size"] = mmap_cache_size
+            self.parallel_dict["use_fastsafe"] = use_fastsafe
 
-        if (
-            ulysses_degree > 0
-            or ring_degree > 0
-            or cfg_degree > 0
-        ):
-            if ulysses_degree * ring_degree * cfg_degree == 0:
-                raise ValueError(f"""ERROR, parallel product of {ulysses_degree=} x {ring_degree=} x {cfg_degree=} is 0.
-                 Please make sure to set any parallel degree to be greater than 0,
-                 or switch into DPKSampler and set 0 to all parallel degree""")
-            self.parallel_dict["attention"] = XFuser_attention
-            self.parallel_dict["is_xdit"] = True
-            self.parallel_dict["ulysses_degree"] = ulysses_degree
-            self.parallel_dict["ring_degree"] = ring_degree
-            self.parallel_dict["cfg_degree"] = cfg_degree
-            self.parallel_dict["sync_ulysses"] = sync_ulysses
+            if (
+                ulysses_degree > 0
+                or ring_degree > 0
+                or cfg_degree > 0
+            ):
+                if ulysses_degree * ring_degree * cfg_degree == 0:
+                    raise ValueError(f"""ERROR, parallel product of {ulysses_degree=} x {ring_degree=} x {cfg_degree=} is 0.
+                     Please make sure to set any parallel degree to be greater than 0,
+                     or switch into DPKSampler and set 0 to all parallel degree""")
+                self.parallel_dict["attention"] = XFuser_attention
+                self.parallel_dict["is_xdit"] = True
+                self.parallel_dict["ulysses_degree"] = ulysses_degree
+                self.parallel_dict["ring_degree"] = ring_degree
+                self.parallel_dict["cfg_degree"] = cfg_degree
+                self.parallel_dict["sync_ulysses"] = sync_ulysses
+                self.parallel_dict["pack_qkv"] = pack_qkv
 
-        if FSDP:
-            self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
-            self.parallel_dict["is_fsdp"] = True
+            if FSDP:
+                self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
+                self.parallel_dict["is_fsdp"] = True
 
-        if ray_dashboard_address != "None":
-            dashboard_host, dashboard_port = ray_dashboard_address.rsplit(":", 1)
-            dashboard_port = int(dashboard_port)
-            enable_dashboard = True
-        else:
-            dashboard_host, dashboard_port = "127.0.0.1", None
-            enable_dashboard = False
+            if ray_dashboard_address != "None":
+                dashboard_host, dashboard_port = ray_dashboard_address.rsplit(":", 1)
+                dashboard_port = int(dashboard_port)
+                enable_dashboard = True
+            else:
+                dashboard_host, dashboard_port = "127.0.0.1", None
+                enable_dashboard = False
 
-        ray_object_store_gb = int(ray_object_store_gb * 1024**3)
-        runtime_env_base = _RAY_RUNTIME_ENV_LOCAL
-        if ray_cluster_address not in _LOCAL_CLUSTER_ADDRESSES:
-            runtime_env_base = _RAY_RUNTIME_ENV_REMOTE
+            if ray_object_store_gb <= 0:
+                ray_object_store_memory = None
+                print("[Raylight] object_store_memory set to Auto (Ray default).")
+            else:
+                ray_object_store_memory = int(ray_object_store_gb * 1024**3)
+                print(f"[Raylight] object_store_memory set to {ray_object_store_gb} GB.")
 
-        try:
-            # Shut down so if comfy user try another workflow it will not cause error
-            ray.shutdown()
-            ray.init(
-                ray_cluster_address,
-                namespace=ray_cluster_namespace,
-                runtime_env=deepcopy(runtime_env_base),
-                object_store_memory=ray_object_store_gb,
-                include_dashboard=enable_dashboard,
-                dashboard_host=dashboard_host,
-                dashboard_port=dashboard_port
-            )
-        except Exception as e:
-            ray.shutdown()
-            ray.init(
-                runtime_env=deepcopy(runtime_env_base)
-            )
-            raise RuntimeError(f"Ray connection failed: {e}")
+            runtime_env_base = _RAY_RUNTIME_ENV_LOCAL
+            if ray_cluster_address not in _LOCAL_CLUSTER_ADDRESSES:
+                runtime_env_base = _RAY_RUNTIME_ENV_REMOTE
 
-        ray_nccl_tester(world_size)
-        ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
-        ray_actors = ray_actor_fn()
-        return ([ray_actors, ray_actor_fn],)
+            # GPU Pinning Logic
+            original_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+            try:
+                if gpu_indices.strip():
+                    # Validate and set
+                    indices = [x.strip() for x in gpu_indices.split(",") if x.strip()]
+                    if len(indices) < world_size:
+                         raise ValueError(f"gpu_indices contains {len(indices)} GPUs, but {world_size} (GPU input) were requested.")
+                    
+                    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(indices)
+                    print(f"[Raylight] Pinning Ray Cluster to GPUs: {os.environ['CUDA_VISIBLE_DEVICES']}")
+
+                # ===== OPTIMIZATION: Cluster Reuse =====
+                # Check if Ray is already initialized with matching config to skip expensive re-init
+                is_local = ray_cluster_address in _LOCAL_CLUSTER_ADDRESSES
+                should_reuse = False
+                
+                if ray.is_initialized():
+                    try:
+                        # Check if the cluster has matching GPU count
+                        existing_resources = ray.cluster_resources()
+                        existing_gpus = int(existing_resources.get('GPU', 0))
+                        if existing_gpus >= world_size:
+                            print(f"[Raylight] Reusing existing Ray cluster (GPUs available: {existing_gpus})")
+                            should_reuse = True
+                    except Exception:
+                        pass
+                
+                if not should_reuse:
+                    # Shut down so if comfy user try another workflow it will not cause error
+                    ray.shutdown()
+                    
+                    # Build init kwargs - disable metrics agent for faster startup
+                    init_kwargs = {
+                        'namespace': ray_cluster_namespace,
+                        'runtime_env': deepcopy(runtime_env_base),
+                        'include_dashboard': enable_dashboard,
+                        'dashboard_host': dashboard_host,
+                        'dashboard_port': dashboard_port,
+                        '_metrics_export_port': None,  # Disable metrics agent to avoid connection retries
+                    }
+                    
+                    # Only set object_store_memory if explicitly configured (not for reused clusters)
+                    if ray_object_store_memory is not None:
+                        init_kwargs['object_store_memory'] = ray_object_store_memory
+                    
+                    ray.init(ray_cluster_address, **init_kwargs)
+                    print(f"[Raylight] Ray cluster initialized (new instance)")
+                
+            except Exception as e:
+                ray.shutdown()
+                ray.init(
+                    runtime_env=deepcopy(runtime_env_base),
+                    _metrics_export_port=None,
+                )
+                raise RuntimeError(f"Ray connection failed: {e}")
+            # Restore original environment to avoid affecting other nodes
+            if original_visible_devices is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = original_visible_devices
+            elif "CUDA_VISIBLE_DEVICES" in os.environ and gpu_indices.strip():
+                 del os.environ["CUDA_VISIBLE_DEVICES"]
+
+            # ===== OPTIMIZATION: Skip NCCL Test =====
+            # NCCL test spawns/kills separate actors before real workers - saves ~10-15s
+            if not skip_comm_test:
+                print("[Raylight] Running NCCL communication test...")
+                ray_nccl_tester(world_size)
+            else:
+                print("[Raylight] Skipping NCCL test (skip_comm_test=True)")
+            
+            ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
+            ray_actors = ray_actor_fn()
+            
+            # Store GPU indices for later use in samplers (for partial offload matching)
+            if gpu_indices.strip():
+                ray_actors["gpu_indices"] = [int(x.strip()) for x in gpu_indices.split(",") if x.strip()]
+            else:
+                # Default: 0, 1, 2, ...
+                ray_actors["gpu_indices"] = list(range(world_size))
+            
+            return ([ray_actors, ray_actor_fn],)
 
 
 class RayInitializerAdvanced(RayInitializer):
@@ -260,8 +380,8 @@ class RayInitializerAdvanced(RayInitializer):
                     "tooltip": "Address of Ray cluster different than torch distributed address"}),
                 "ray_cluster_namespace": ("STRING", {"default": "default"}),
                 "ray_object_store_gb": ("FLOAT", {
-                    "default": 2.0,
-                    "tooltip": "Ray global object store, default is plenty enough"}),
+                    "default": 0.0,
+                    "tooltip": "Ray shared memory object store size in GB. 0.0 = Auto (Use Ray default ~30% of System RAM). Increase if you see spilling to disk."}),
                 "ray_dashboard_address": ("STRING", {
                     "default": "None",
                     "tooltip": "Same format as torch_dist_address, you need to install ray dashboard to monitor"}),
@@ -289,6 +409,34 @@ class RayInitializerAdvanced(RayInitializer):
                     ],
                     {"default": "TORCH"},
                 ),
+            },
+            "optional": {
+                "gpu_indices": ("STRING", {
+                    "default": "",
+                    "tooltip": "Comma-separated list of GPU indices to use (e.g., '0,1'). Overrides automatic selection."
+                }),
+                "skip_comm_test": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early."
+                }),
+                "pack_qkv": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable combined QKV all-to-all optimization. Only works for self-attention models. Disable for cross-attention (LTXV, SD3, etc.)."
+                }),
+                "use_mmap": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Use memory-mapped (zero-copy) model loading. Enabled: parallel loading with OS page cache sharing. Disabled: sequential leader-follower loading."
+                }),
+                "mmap_cache_size": ("INT", {
+                    "default": 2,
+                    "min": 1,
+                    "max": 10,
+                    "tooltip": "LRU cache size for mmap'd model state dicts."
+                }),
+                "use_fastsafe": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Use fastsafetensors library for accelerated loading (requires pip install fastsafetensors)."
+                }),
             }
         }
 
@@ -321,7 +469,6 @@ class RayUNETLoader:
                     {"tooltip": "Ray Actor to submit the model into"},
                 ),
             },
-            "optional": {"lora": ("RAY_LORA", {"default": None})},
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
@@ -330,8 +477,9 @@ class RayUNETLoader:
 
     CATEGORY = "Raylight"
 
-    def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, lora=None):
-        ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
+    def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype):
+        with monitor_memory("RayUNETLoader.load_ray_unet"):
+            ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
 
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
@@ -351,95 +499,52 @@ class RayUNETLoader:
         loaded_futures = []
         patched_futures = []
 
-        for actor in gpu_actors:
-            loaded_futures.append(actor.set_lora_list.remote(lora))
-        ray.get(loaded_futures)
-        loaded_futures = []
-
         if parallel_dict["is_fsdp"] is True:
             worker0 = ray.get_actor("RayWorker:0")
-            ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
-            meta_model = ray.get(worker0.get_meta_model.remote())
+            cancellable_get(worker0.load_unet.remote(unet_path, model_options=model_options))
+            meta_model = cancellable_get(worker0.get_meta_model.remote())
 
             for actor in gpu_actors:
                 if actor != worker0:
                     loaded_futures.append(actor.set_meta_model.remote(meta_model))
 
-            ray.get(loaded_futures)
+            cancellable_get(loaded_futures)
             loaded_futures = []
 
             for actor in gpu_actors:
                 loaded_futures.append(actor.set_state_dict.remote())
 
-            ray.get(loaded_futures)
+            cancellable_get(loaded_futures)
             loaded_futures = []
         else:
+            # Parallel Loading Mode: All workers load simultaneously
+            # With LazySafetensorsModelPatcher, only mmap refs are cached at this stage
+            # Actual model instantiation is deferred to sampling time
+            print("[Raylight] Parallel UNet Load: Creating lazy wrappers on all workers...")
             for actor in gpu_actors:
                 loaded_futures.append(
                     actor.load_unet.remote(unet_path, model_options=model_options)
                 )
-            ray.get(loaded_futures)
+            cancellable_get(loaded_futures)
             loaded_futures = []
 
-        for actor in gpu_actors:
-            if parallel_dict["is_xdit"]:
-                if (parallel_dict["ulysses_degree"]) > 1 or (parallel_dict["ring_degree"] > 1):
-                    patched_futures.append(actor.patch_usp.remote())
-                if parallel_dict["cfg_degree"] > 1:
-                    patched_futures.append(actor.patch_cfg.remote())
-
-        ray.get(patched_futures)
+        # Patching: Done SEQUENTIALLY to avoid RAM spikes
+        # For safetensors with lazy wrappers, patching triggers model instantiation
+        # Sequential ensures only one worker's RAM usage peaks at a time
+        if parallel_dict["is_xdit"]:
+            if (parallel_dict["ulysses_degree"]) > 1 or (parallel_dict["ring_degree"] > 1):
+                print("[Raylight] Sequential USP Patching: Instantiating workers one at a time...")
+                for actor in gpu_actors:
+                    cancellable_get(actor.patch_usp.remote())
+            if parallel_dict["cfg_degree"] > 1:
+                print("[Raylight] Sequential CFG Patching...")
+                for actor in gpu_actors:
+                    cancellable_get(actor.patch_cfg.remote())
 
         return (ray_actors,)
 
 
-class RayLoraLoader:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "lora_name": (
-                    folder_paths.get_filename_list("loras"),
-                    {"tooltip": "The name of the LoRA."},
-                ),
-                "strength_model": (
-                    "FLOAT",
-                    {
-                        "default": 1.0,
-                        "min": -100.0,
-                        "max": 100.0,
-                        "step": 0.01,
-                        "tooltip": "How strongly to modify the diffusion model. This value can be negative.",
-                    },
-                ),
-            },
-            "optional": {"prev_ray_lora": ("RAY_LORA", {"default": None})},
-        }
 
-    RETURN_TYPES = ("RAY_LORA",)
-    RETURN_NAMES = ("ray_lora",)
-    FUNCTION = "load_lora"
-    CATEGORY = "Raylight"
-
-    def load_lora(self, lora_name, strength_model, prev_ray_lora=None):
-        loras_list = []
-
-        if strength_model == 0.0:
-            if prev_ray_lora is not None:
-                loras_list.extend(prev_ray_lora)
-            return (loras_list,)
-
-        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
-        lora = {
-            "path": lora_path,
-            "strength_model": strength_model,
-        }
-
-        if prev_ray_lora is not None:
-            loras_list.extend(prev_ray_lora)
-
-        loras_list.append(lora)
-        return (loras_list,)
 
 
 class XFuserKSamplerAdvanced:
@@ -480,6 +585,9 @@ class XFuserKSamplerAdvanced:
                 "start_at_step": ("INT", {"default": 0, "min": 0, "max": 10000}),
                 "end_at_step": ("INT", {"default": 10000, "min": 0, "max": 10000}),
                 "return_with_leftover_noise": (["disable", "enable"],),
+            },
+            "optional": {
+                "sigmas": ("SIGMAS",),
             }
         }
 
@@ -504,11 +612,11 @@ class XFuserKSamplerAdvanced:
         end_at_step,
         return_with_leftover_noise,
         denoise=1.0,
+        sigmas=None,
     ):
-        # Clean VRAM for preparation to load model
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
+        with monitor_memory("XFuserKSampler.ray_sample"):
+            # Clean VRAM for preparation to load model
+            pass
         force_full_denoise = True
         if return_with_leftover_noise == "enable":
             force_full_denoise = False
@@ -517,6 +625,14 @@ class XFuserKSamplerAdvanced:
             disable_noise = True
 
         gpu_actors = ray_actors["workers"]
+
+        # Re-apply LoRAs for this branch's config_hash if needed
+        lora_config_hash = ray_actors.get("lora_config_hash")
+        if lora_config_hash is not None:
+            print(f"[XFuserKSamplerAdvanced] Ensuring LoRAs for config_hash={lora_config_hash}...")
+            lora_futures = [actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors]
+            cancellable_get(lora_futures)
+
         futures = [
             actor.common_ksampler.remote(
                 noise_seed,
@@ -532,11 +648,12 @@ class XFuserKSamplerAdvanced:
                 start_step=start_at_step,
                 last_step=end_at_step,
                 force_full_denoise=force_full_denoise,
+                sigmas=sigmas,
             )
             for actor in gpu_actors
         ]
 
-        results = ray.get(futures)
+        results = cancellable_get(futures)
         return (results[0][0],)
 
 
@@ -611,7 +728,8 @@ class DPKSamplerAdvanced:
         return_with_leftover_noise = return_with_leftover_noise[0]
 
         gpu_actors = ray_actors["workers"]
-        parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+
+        parallel_dict = cancellable_get(gpu_actors[0].get_parallel_dict.remote())
         if parallel_dict["is_xdit"] is True:
             raise ValueError(
                 """
@@ -625,15 +743,19 @@ class DPKSamplerAdvanced:
             latent_image = [latent_image[0]] * len(gpu_actors)
 
         # Clean VRAM for preparation to load model
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
         force_full_denoise = True
         if return_with_leftover_noise == "enable":
             force_full_denoise = False
         disable_noise = False
         if add_noise == "disable":
             disable_noise = True
+
+        # Re-apply LoRAs for this branch's config_hash if needed
+        lora_config_hash = ray_actors.get("lora_config_hash")
+        if lora_config_hash is not None:
+            print(f"[DPKSamplerAdvanced] Ensuring LoRAs for config_hash={lora_config_hash}...")
+            lora_futures = [actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors]
+            cancellable_get(lora_futures)
 
         futures = [
             actor.common_ksampler.remote(
@@ -654,7 +776,7 @@ class DPKSamplerAdvanced:
             for i, actor in enumerate(gpu_actors)
         ]
 
-        results = ray.get(futures)
+        results = cancellable_get(futures)
         results = [result[0] for result in results]
         return (results,)
 
@@ -712,6 +834,10 @@ class RayVAEDecodeDistributed:
                 "ray_actors": ("RAY_ACTORS", {"tooltip": "Ray Actor to submit the model into"}),
                 "samples": ("LATENT",),
                 "vae_name": (folder_paths.get_filename_list("vae"),),
+                "vae_dtype": (["auto", "bf16", "fp16", "fp32"], {
+                    "default": "auto",
+                    "tooltip": "VAE precision: auto=bf16 on RTX3000+/fp32 fallback, bf16=bfloat16 (recommended), fp16=half (may cause NaN), fp32=full (stable but 2x memory)"
+                }),
                 "tile_size": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 32},),
                 "overlap": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 32}),
                 "temporal_size": (
@@ -734,6 +860,10 @@ class RayVAEDecodeDistributed:
                         "tooltip": "Only used for video VAEs: Amount of frames to overlap.",
                     },
                 ),
+                "release_vae": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Release VAE from worker RAM after decode. Recommended True to free ~2GB per worker. Set False if you need the VAE for multiple decodes."
+                }),
             }
         }
 
@@ -742,46 +872,351 @@ class RayVAEDecodeDistributed:
 
     CATEGORY = "Raylight"
 
-    def ray_decode(self, ray_actors, vae_name, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8):
+    def ray_decode(self, ray_actors, vae_name, samples, tile_size, vae_dtype="auto", overlap=64, temporal_size=64, temporal_overlap=8, release_vae=True):
         gpu_actors = ray_actors["workers"]
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
 
+        # 1. Load VAE on all workers
         for actor in gpu_actors:
-            ray.get(actor.ray_vae_loader.remote(vae_path))
+            cancellable_get(actor.ray_vae_loader.remote(vae_path))
 
-        futures = [
-            actor.ray_vae_decode.remote(
-                samples,
-                tile_size,
-                overlap=64,
-                temporal_size=64,
-                temporal_overlap=8
-            )
-            for i, actor in enumerate(gpu_actors)
-        ]
+        # 2. Shard samples temporally
+        latents = samples["samples"]
+        num_workers = len(gpu_actors)
+        total_frames = latents.shape[2]
 
-        image = ray.get(futures)
-        return (image[0],)
+        # Core ComfyUI VAEDecodeTiled safety checks
+        if tile_size < overlap * 4:
+            overlap = tile_size // 4
+        if temporal_size < temporal_overlap * 2:
+            temporal_overlap = temporal_overlap // 2
+
+        # Pre-calculate total output size and compression factors early
+        # Retrieve compression factors directly from the worker that just loaded the VAE
+        temporal_compression = cancellable_get(gpu_actors[0].get_vae_temporal_compression.remote()) or 1
+        spatial_compression = cancellable_get(gpu_actors[0].get_vae_spatial_compression.remote()) or 1
+
+        # Causal VAE output formula: (Latent_T - 1) * compression + 1
+        if temporal_compression > 1:
+            total_output_frames = (total_frames - 1) * temporal_compression + 1
+            overlap_latent_frames = 1 # 1 frame overlap is sufficient for continuity in causal VAE
+        else:
+            total_output_frames = total_frames
+            overlap_latent_frames = 0
+            
+        # Calculate Master Output Shape (B, T, H, W, C)
+        # We assume Batch=1 for video usually, but we handle standard (B, T, H, W, C) structure 
+        # or (T, H, W, C) if squeezed. ComfyUI usually expects (TotalFrames, H, W, 3) for video batch.
+        H_out = latents.shape[3] * spatial_compression
+        W_out = latents.shape[4] * spatial_compression
+        # Final shape: (TotalFrames, Height, Width, 3)
+        master_shape = (total_output_frames, H_out, W_out, 3)
+        
+        # 3. Create Shared Memory File (Pre-allocation)
+        mmap_path = f"/dev/shm/raylight_vae_out_{uuid.uuid4().hex}.bin"
+        num_elements = 1
+        for dim in master_shape: num_elements *= dim
+        file_size_bytes = num_elements * 4 # float32 = 4 bytes
+        
+        print(f"[RayVAEDecode] Pre-allocating shared output buffer: {mmap_path} ({file_size_bytes/1024**3:.2f} GB)")
+        print(f"[RayVAEDecode] Output Shape: {master_shape}")
+        
+        full_image = None # Initialize outside try block for finally access
+        try:
+            with open(mmap_path, "wb") as f:
+                f.seek(file_size_bytes - 1)
+                f.write(b"\0")
+                
+            # Create the tensor wrapper immediately
+            full_image = torch.from_file(mmap_path, shared=True, size=num_elements, dtype=torch.float32).reshape(master_shape)
+            
+            # 4. Dispatch Workers
+            # NOTE: Do NOT pre-divide temporal parameters by compression factor.
+            # Original ComfyUI's decode_tiled passes tile_t and overlap_t directly to decode_tiled_3d.
+            
+            frames_per_shard = (total_frames + num_workers - 1) // num_workers
+            
+            futures = []
+            for i, actor in enumerate(gpu_actors):
+                start = i * frames_per_shard
+                end = min((i + 1) * frames_per_shard, total_frames)
+                
+                if start >= total_frames:
+                    continue # No work for this worker
+                    
+                # context_start: Provide 1 frame of context to ensure continuity
+                context_start = max(0, start - 1)
+                # actual_end: Each shard must produce frames up to the START of the next shard.
+                actual_end = min(end + (1 if i < num_workers - 1 else 0), total_frames)
+                
+                shard_samples = {
+                    "samples": latents[:, :, context_start:actual_end].clone()
+                }
+                
+                # Pass how many latent frames to discard from the beginning of the result
+                discard_latent_frames = start - context_start
+                
+                # Calculate Output Offset due to temporal compression
+                # shard index 'start' corresponds to video frame:
+                start_video_frame = start * temporal_compression
+                if temporal_compression == 1:
+                     start_video_frame = start
+                
+                print(f"[RayVAEDecode] Shard {i}: Latents {context_start} to {end} (discard {discard_latent_frames}) -> Video Frame {start_video_frame}")
+                
+                futures.append(actor.ray_vae_decode.remote(
+                    i, # shard_index
+                    shard_samples,
+                    tile_size,
+                    overlap=overlap,
+                    temporal_size=temporal_size,  # Pass raw value, decode_tiled handles scaling
+                    temporal_overlap=temporal_overlap,  # Pass raw value, decode_tiled handles scaling
+                    discard_latent_frames=discard_latent_frames,
+                    vae_dtype=vae_dtype,
+                    mmap_path=mmap_path,     # DIRECT WRITING
+                    mmap_shape=master_shape, # DIRECT WRITING
+                    output_offset=start_video_frame # DIRECT WRITING
+                ))
+    
+            print(f"[RayVAEDecode] Dispatched {len(futures)} shards. Direct-to-disk mode enabled.")
+            
+            # 5. Gather Results (Stats Only)
+            remaining = list(futures)
+            futures_count = len(futures)
+            received_count = 0
+            
+            while remaining:
+                # Check ComfyUI cancel status
+                if comfy.model_management.processing_interrupted():
+                    print("[Raylight] Cancellation detected during VAE decoding! Force-canceling Ray tasks...")
+                    for ref in remaining:
+                        try:
+                            ray.cancel(ref, force=True, recursive=True)
+                        except:
+                            pass
+                    raise Exception("Raylight: VAE Decode canceled by user.")
+
+                ready, remaining = ray.wait(remaining, num_returns=1, timeout=1.0)
+                if not ready:
+                    continue
+                    
+                for ray_ref in ready:
+                    shard_index, result = cancellable_get(ray_ref)
+                    received_count += 1
+                    
+                    if isinstance(result, dict) and result.get("mmap", False):
+                        # Direct write success
+                        shape = result["shape"]
+                        stats = result["stats"]
+                        print(f"[RayVAEDecode] Shard {shard_index} wrote {shape} to mmap. Stats: {stats}")
+                    else:
+                        # Fallback (Legacy / Failure fallback)
+                        shard_data = result
+                        print(f"[RayVAEDecode] Shard {shard_index} returned tensor {shard_data.shape} (Fallback path)")
+                        
+                        # Write to mmap manually
+                        start = shard_index * frames_per_shard
+                        start_video_frame = start * temporal_compression
+                        s_len = shard_data.shape[0]
+                        end_video_frame = start_video_frame + s_len
+                        
+                        # Handle truncation if needed
+                        if end_video_frame > total_output_frames:
+                            s_len = max(0, total_output_frames - start_video_frame)
+                            shard_data = shard_data[:s_len]
+                            end_video_frame = start_video_frame + s_len
+                        
+                        if s_len > 0:
+                            full_image[start_video_frame:end_video_frame] = shard_data.to(torch.float32)
+
+                        del shard_data
+
+            del remaining
+            del futures # Ensure all futures are deleted to release Ray object store references
+
+            # Add batch dimension if needed to match ComfyUI expectation (1, T, H, W, C)?
+            # Usually images are just a list of frames. Tensor shape (T, H, W, C).
+            # ComfyUI "IMAGE" type is (BATCH, H, W, C). For video, BATCH = Frames.
+            # So (T, H, W, 3) is correct.
+            
+            # 6. Cleanup shared file?
+            # If we delete the file now, full_image relies on valid fd/mapping.
+            # Since torch.from_file uses Mmap, we should keep the file until we don't need it?
+            # Or reliance on unlinked file logic (Linux only).
+            # To be safe and cross-platform compatible, we should ideally keep it.
+            # BUT we want to ensure it gets cleaned up.
+            # We can register it with a cleaner or rely on /tmp cleaners.
+            # For now, let's unlink it. On Linux, unlinking an open file keeps it alive for the process.
+            # Torch likely holds the fd.
+            try:
+                os.unlink(mmap_path)
+                print(f"[RayVAEDecode] Unlinked temp mmap file: {mmap_path}")
+            except Exception as e:
+                print(f"[RayVAEDecode] Warning: Could not unlink mmap file: {e}")
+
+            # 7. Release VAE from workers to free RAM for downstream operations (e.g., AudioVAE)
+            if release_vae:
+                print("[RayVAEDecode] Releasing VAE from workers to free RAM...")
+                release_futures = [actor.ray_vae_release.remote() for actor in gpu_actors]
+                cancellable_get(release_futures)
+                print("[RayVAEDecode] VAE released from all workers.")
+
+            return (full_image,)
+            
+        except Exception as e:
+            # Cleanup on failure
+            if os.path.exists(mmap_path):
+                try: 
+                    os.unlink(mmap_path) 
+                except: pass
+            raise e
+
+
+class RayOffloadModel:
+    """
+    Offloads the diffusion model from all Ray workers' VRAM.
+    Place this node after the sampler to free GPU memory.
+    
+    This is an OUTPUT node - it will always execute if connected.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+            },
+            "optional": {
+                "latent": ("LATENT", {"tooltip": "Passthrough for workflow chaining"}),
+            }
+        }
+
+    # Return the latent passthrough for chaining
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "offload"
+    CATEGORY = "Raylight"
+    OUTPUT_NODE = True  # Marks this as an output node - always executes
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Return NaN to force re-execution on every run.
+        # NaN != NaN, so this node is always considered "changed"
+        return float("nan")
+
+    def offload(self, ray_actors, latent=None):
+        import sys
+        print("[RayOffloadModel] ========== OFFLOAD NODE EXECUTING ==========", flush=True)
+        sys.stdout.flush()
+        
+        gpu_actors = ray_actors["workers"]
+        
+        # Offload from all workers SEQUENTIALLY to prevent OOM
+        print(f"[RayOffloadModel] Starting sequential offload for {len(gpu_actors)} workers...", flush=True)
+        for i, actor in enumerate(gpu_actors):
+            try:
+                # Wait for each worker to finish before triggering the next
+                print(f"[RayOffloadModel] Offloading worker {i}...", flush=True)
+                ray.get(actor.offload_and_clear.remote())
+                # Free local memory handles immediately
+                gc.collect()
+                print(f"[RayOffloadModel] Worker {i} offloaded.", flush=True)
+            except Exception as e:
+                print(f"[RayOffloadModel] Error offloading worker {i}: {e}", flush=True)
+
+        print("[RayOffloadModel] ========== ALL WORKERS OFFLOADED ==========", flush=True)
+        return (latent,)
+
+
+
+class RayLoraLoaderModelOnly:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "lora_name": (folder_paths.get_filename_list("loras"),),
+                "strength_model": (
+                    "FLOAT",
+                    {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("RAY_ACTORS",)
+    RETURN_NAMES = ("ray_actors",)
+    FUNCTION = "load_lora_model_only"
+
+    CATEGORY = "Raylight"
+
+    def load_lora_model_only(self, ray_actors, lora_name, strength_model):
+        
+        # 1. Extract existing chain from ray_actors
+        # Default to empty string if this is the first lora in the chain
+        current_chain = ray_actors.get("lora_chain", "")
+        
+        # 2. Append new LoRA to the chain
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        this_lora_sig = f"{lora_name}:{strength_model}"
+        
+        if current_chain:
+            new_chain = current_chain + "|" + this_lora_sig
+        else:
+            new_chain = this_lora_sig
+            
+        # 3. Calculate new hash
+        lora_config_hash = hash(new_chain)
+        
+        if strength_model == 0:
+            # Even if strength is 0, we should probably pass through the actors
+            # But technically it doesn't change the model state relative to the *previous* state?
+            # Actually, standard Comfy behavior is to effectively ignore 0 strength loras.
+            # But if we were stacking, maybe we should preserve the chain?
+            # Let's keep it simple: if strength 0, we just return original actors effectively skipping this one
+            # BUT we need to be careful if we want to support disabling loras mid-chain.
+            # For now, let's just return actors as-is, BUT with the chain un-modified? 
+            # Or should we add it with 0 strength? 
+            # Existing code returned early. Let's return early but we might break the chain if we don't pass the new chain.
+            # If we don't add it to the chain, the next node will append to the OLD chain. This is correct for "skipping".
+            return (ray_actors,)
+
+        gpu_actors = ray_actors["workers"]
+
+        # 4. Dispatch UNET patching to Ray Workers with config hash for branch isolation
+        print(f"[RayLoraLoaderModelOnly] Dispatching LoRA {lora_name} to {len(gpu_actors)} workers (config_hash={lora_config_hash})...")
+        futures = [actor.load_lora.remote(lora_path, strength_model, lora_config_hash) for actor in gpu_actors]
+        cancellable_get(futures)
+
+        # 5. Update ray_actors with new chain and hash
+        updated_ray_actors = {
+            **ray_actors,
+            "lora_config_hash": lora_config_hash,
+            "lora_chain": new_chain,
+        }
+        return (updated_ray_actors,)
 
 
 NODE_CLASS_MAPPINGS = {
     "XFuserKSamplerAdvanced": XFuserKSamplerAdvanced,
     "DPKSamplerAdvanced": DPKSamplerAdvanced,
     "RayUNETLoader": RayUNETLoader,
-    "RayLoraLoader": RayLoraLoader,
+    "RayLoraLoaderModelOnly": RayLoraLoaderModelOnly,
+
     "RayInitializer": RayInitializer,
     "RayInitializerAdvanced": RayInitializerAdvanced,
     "DPNoiseList": DPNoiseList,
-    "RayVAEDecodeDistributed": RayVAEDecodeDistributed
+    "RayVAEDecodeDistributed": RayVAEDecodeDistributed,
+    "RayOffloadModel": RayOffloadModel,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "XFuserKSamplerAdvanced": "XFuser KSampler (Advanced)",
     "DPKSamplerAdvanced": "Data Parallel KSampler (Advanced)",
     "RayUNETLoader": "Load Diffusion Model (Ray)",
-    "RayLoraLoader": "Load Lora Model (Ray)",
+    "RayLoraLoaderModelOnly": "Ray LoRA Loader",
+
     "RayInitializer": "Ray Init Actor",
     "RayInitializerAdvanced": "Ray Init Actor (Advanced)",
     "DPNoiseList": "Data Parallel Noise List",
-    "RayVAEDecodeDistributed": "Distributed VAE (Ray)"
+    "RayVAEDecodeDistributed": "Distributed VAE (Ray)",
+    "RayOffloadModel": "Offload Model (Ray)",
 }

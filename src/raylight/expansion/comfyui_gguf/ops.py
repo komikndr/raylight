@@ -8,6 +8,8 @@ import comfy.lora
 import comfy.model_management
 from .dequant import dequantize_tensor, is_quantized
 
+from raylight.comfy_dist.lora import calculate_weight as ray_calculate_weight
+
 
 def chained_hasattr(obj, chained_attr):
     probe = obj
@@ -70,10 +72,18 @@ class GGMLTensor(torch.Tensor):
         return new
 
     def clone(self, *args, **kwargs):
-        return self
+        new = super().clone(*args, **kwargs)
+        new.tensor_type = getattr(self, "tensor_type", None)
+        new.tensor_shape = getattr(self, "tensor_shape", None)
+        new.patches = getattr(self, "patches", []).copy()
+        return new
 
     def detach(self, *args, **kwargs):
-        return self
+        new = super().detach(*args, **kwargs)
+        new.tensor_type = getattr(self, "tensor_type", None)
+        new.tensor_shape = getattr(self, "tensor_shape", None)
+        new.patches = getattr(self, "patches", []).copy()
+        return new
 
     def copy_(self, *args, **kwargs):
         # fixes .weight.copy_ in comfy/clip_model/CLIPTextModel
@@ -125,8 +135,10 @@ class GGMLLayer(torch.nn.Module):
         weight, bias = state_dict.get(f"{prefix}weight"), state_dict.get(
             f"{prefix}bias"
         )
-        # NOTE: using modified load for linear due to not initializing on creation, see GGMLOps todo
-        if self.is_ggml_quantized(weight=weight, bias=bias) or isinstance(
+        # CRITICAL: Always use pointer swapping (GGML load) if the incoming weight is a GGMLTensor.
+        # This prevents standard load_state_dict from doing a dense copy_ for F16/F32 layers in GGUF.
+        from .ops import GGMLTensor
+        if isinstance(weight, GGMLTensor) or self.is_ggml_quantized(weight=weight, bias=bias) or isinstance(
             self, torch.nn.Linear
         ):
             return self.ggml_load_from_state_dict(state_dict, prefix, *args, **kwargs)
@@ -201,8 +213,15 @@ class GGMLLayer(torch.nn.Module):
         # consolidate and load patches to GPU in async
         patch_list = []
         device = tensor.device
+        key = None
         for patches, key in getattr(tensor, "patches", []):
             patch_list += move_patch_to_device(patches, device)
+
+        # DEBUG: Inspect tensor type before dequant
+        if not hasattr(self, "_logged_debug"):
+            has_patches = len(getattr(tensor, "patches", [])) > 0
+            print(f"[GGUF Forward DEBUG] Layer {self.__class__.__name__} processing weight: class={tensor.__class__.__name__}, dtype={tensor.dtype}, shape={tensor.shape}, tensor_type={getattr(tensor, 'tensor_type', 'NO_ATTR')}, has_patches={has_patches}")
+            self._logged_debug = True
 
         # dequantize tensor while patches load
         weight = dequantize_tensor(tensor, dtype, self.dequant_dtype)
@@ -213,14 +232,21 @@ class GGMLLayer(torch.nn.Module):
 
         # apply patches
         if len(patch_list) > 0:
+            # Log first 3 times per layer to confirm LoRA is being applied
+            if not hasattr(self, "_lora_log_count"):
+                self._lora_log_count = 0
+            if self._lora_log_count < 3:
+                print(f"[GGUF LoRA] Applying {len(patch_list)} patches to key={key}")
+                self._lora_log_count += 1
+            
             if self.patch_dtype is None:
-                weight = comfy.lora.calculate_weight(patch_list, weight, key)
+                weight = ray_calculate_weight(patch_list, weight, key)
             else:
                 # for testing, may degrade image quality
                 patch_dtype = (
                     dtype if self.patch_dtype == "target" else self.patch_dtype
                 )
-                weight = comfy.lora.calculate_weight(
+                weight = ray_calculate_weight(
                     patch_list, weight, key, patch_dtype
                 )
         return weight

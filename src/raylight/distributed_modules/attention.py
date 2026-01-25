@@ -7,6 +7,7 @@ from .sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_ke
 
 _ATTN_TYPE = None
 _SYNC_ULYSSES = None
+_PACK_QKV = False  # Combined QKV all-to-all optimization
 
 
 def set_attn_type(attn):
@@ -33,15 +34,36 @@ def get_sync_ulysses():
         return _SYNC_ULYSSES
 
 
-def make_xfuser_attention(attn_type, sync_ulysses):
-    print(f"Using XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}")
+def set_pack_qkv(enabled: bool):
+    """Enable combined QKV all-to-all optimization (reduces 3 NCCL calls to 1)."""
+    global _PACK_QKV
+    _PACK_QKV = enabled
+
+
+def get_pack_qkv() -> bool:
+    """Returns whether combined QKV all-to-all is enabled."""
+    return _PACK_QKV
+
+
+def make_xfuser_attention(attn_type, sync_ulysses, pack_qkv=None):
+    """Create xFuser attention with optional combined QKV all-to-all.
+    
+    Args:
+        attn_type: Attention backend type (TORCH, FA, SAGE_*, etc.)
+        sync_ulysses: Whether to use synchronous Ulysses parallelism
+        pack_qkv: Enable combined QKV all-to-all (None = use global setting)
+    """
+    if pack_qkv is None:
+        pack_qkv = get_pack_qkv()
+    
+    print(f"Using XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}, Pack QKV: {pack_qkv}")
     attn = AttnType[attn_type]
     if attn_type == "SAGE_FP8_CUDA":
         ensure_hf_fp8_cuda_kernel()
     elif attn_type == "SAGE_FP8_SM90":
         ensure_hf_sm90_kernel
 
-    xfuser_attn = xFuserLongContextAttention(use_sync=sync_ulysses, attn_type=attn)
+    xfuser_attn = xFuserLongContextAttention(use_sync=sync_ulysses, attn_type=attn, use_pack_qkv=pack_qkv)
 
     def _attention_xfuser_unmask(
             q,
