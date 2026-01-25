@@ -10,7 +10,7 @@ from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
 import comfy.utils
 from .ray_patch_decorator import ray_patch_with_return
 
-from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise
+from raylight.utils.common import Noise_EmptyNoise, Noise_RandomNoise
 
 
 class RayBasicScheduler:

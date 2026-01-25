@@ -29,9 +29,12 @@ from raylight.utils.memory import monitor_memory
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 from raylight.comfy_dist.utils import cancellable_get
 from ray.exceptions import RayActorError
-from ray.exceptions import RayActorError
 from contextlib import contextmanager
 import inspect
+
+from raylight.distributed_worker.managers.lora_manager import LoraManager
+from raylight.distributed_worker.managers.vae_manager import VaeManager
+from raylight.distributed_worker.managers.sampler_manager import SamplerManager
 
 
 # Developer reminder, Checking model parameter outside ray actor is very expensive (e.g Comfy main thread)
@@ -50,17 +53,23 @@ class RayWorker:
 
 
     def __init__(self, local_rank, device_id, parallel_dict):
+        self.local_rank = local_rank
+        self.device_id = device_id
+        self.parallel_dict = parallel_dict
+        self.global_world_size = self.parallel_dict["global_world_size"]
+
         self.model = None
-        self.vae_model = None
         self.model_type = None
         self.state_dict = None
-        self.parallel_dict = parallel_dict
         self.overwrite_cast_dtype = None
         
-        self.lora_cache = {} # Cache for Runtime LoRAs
+        # Managers
+        self.lora_manager = LoraManager(self)
+        self.vae_manager = VaeManager(self)
+        self.sampler_manager = SamplerManager(self)
         
         # LRU cache for mmap'd state dicts (replaces worker_mmap_cache)
-        from raylight.distributed_worker.lru_cache import LRUStateCache
+        from raylight.utils.cache import LRUStateCache
         cache_size = parallel_dict.get("mmap_cache_size", 2)
         self.state_cache = LRUStateCache(max_size=cache_size)
         
@@ -72,11 +81,6 @@ class RayWorker:
         # This must happen before any model loading.
         self._apply_global_patches()
 
-        self.local_rank = local_rank
-        self.global_world_size = self.parallel_dict["global_world_size"]
-
-        self.device_id = device_id
-        self.parallel_dict = parallel_dict
         self.device = torch.device(f"cuda:{self.device_id}")
         self.device_mesh = None
         self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
@@ -221,45 +225,8 @@ class RayWorker:
             self.is_model_loaded = False
 
     def _clear_lora_gpu_refs(self):
-        """Clear all GPU tensor references from LoRA/patches to allow proper VRAM release.
-        
-        This clears:
-        - weight_function/bias_function closures on modules (hold patches dict refs)
-        - patches dict on model patcher
-        - .patches attribute on individual GGMLTensor parameters
-        """
-        if self.model is None:
-            return
-        
-        # 1. Clear weight_function/bias_function closures on ALL modules
-        diffusion_model = getattr(self.model, "model", None)
-        if diffusion_model is not None:
-            cleared_funcs = 0
-            for m in diffusion_model.modules():
-                if hasattr(m, "weight_function") and len(m.weight_function) > 0:
-                    m.weight_function = []
-                    cleared_funcs += 1
-                if hasattr(m, "bias_function") and len(m.bias_function) > 0:
-                    m.bias_function = []
-                    cleared_funcs += 1
-            if cleared_funcs > 0:
-                print(f"[RayWorker {self.local_rank}] Cleared {cleared_funcs} weight/bias functions.")
-        
-        # 2. Clear patches dict on model patcher
-        if hasattr(self.model, "patches") and self.model.patches:
-            patch_count = len(self.model.patches)
-            self.model.patches.clear()
-            print(f"[RayWorker {self.local_rank}] Cleared {patch_count} patches from patcher.")
-        
-        # 3. Clear .patches attribute on individual parameters (GGMLTensor carries these)
-        if diffusion_model is not None:
-            cleared_param_patches = 0
-            for name, param in diffusion_model.named_parameters():
-                if hasattr(param, "patches") and param.patches:
-                    param.patches = []
-                    cleared_param_patches += 1
-            if cleared_param_patches > 0:
-                print(f"[RayWorker {self.local_rank}] Cleared .patches on {cleared_param_patches} parameters.")
+        """Clear all GPU tensor references from LoRA/patches to allow proper VRAM release."""
+        self.lora_manager.clear_gpu_refs()
 
     def _offload_standard(self):
         print(f"[RayWorker {self.local_rank}] Offloading model (releasing VRAM)...")
@@ -310,10 +277,7 @@ class RayWorker:
     def _common_offload_cleanup(self):
         """Shared post-offload cleanup for all model formats."""
         # Clear LoRA tracking for fresh re-application after reload
-        if hasattr(self, "_applied_loras"):
-            self._applied_loras.clear()
-        if hasattr(self, "_current_lora_config_hash"):
-            self._current_lora_config_hash = None
+        self.lora_manager.clear_tracking()
         print(f"[RayWorker {self.local_rank}] LoRA tracking cleared.")
         
         # Move buffers to CPU if model still exists
@@ -395,7 +359,7 @@ class RayWorker:
         # Patch comfy.lora.calculate_weight to support LoRAAdapter objects
         comfy.lora.calculate_weight = calculate_weight
         
-        print(f"[RayWorker] Applied global LowVramPatch and LoRA monkey-patches.")
+        print(f"[RayWorker {self.local_rank}] Applied global LowVramPatch and LoRA monkey-patches.")
 
     def _apply_fsdp_patches(self):
         # Monkey patch
@@ -432,7 +396,7 @@ class RayWorker:
 
         import ray
         if self.state_dict is not None:
-            print("[RayWorker] FSDP Mode: Saving base_sd_ref to Object Store...")
+            print(f"[RayWorker {self.local_rank}] FSDP Mode: Saving base_sd_ref to Object Store...")
             self.base_sd_ref = ray.put(self.state_dict)
 
     def _load_model_generic(self, unet_path, model_options, dequant_dtype=None, patch_dtype=None):
@@ -448,7 +412,7 @@ class RayWorker:
             self.reload_params.get("unet_path") == unet_path and
             self.reload_params.get("dequant_dtype") == dequant_dtype and
             self.reload_params.get("patch_dtype") == patch_dtype):
-            print(f"[RayWorker] Idempotent Load: Model {os.path.basename(unet_path)} already loaded. Skipping.")
+            print(f"[RayWorker {self.local_rank}] Idempotent Load: Model {os.path.basename(unet_path)} already loaded. Skipping.")
             
             # Re-apply manual cast if needed (cheap)
             load_options = model_options.copy()
@@ -489,7 +453,7 @@ class RayWorker:
         with monitor_memory(f"RayWorker {self.local_rank} - load_unet", device=self.device):
             # Smart Reload: Skip if already loaded
             if self.model is not None and getattr(self, "reload_params", {}).get("unet_path") == unet_path:
-                    print(f"[RayWorker] Smart Reload: Model {unet_path} already loaded. Skipping.")
+                    print(f"[RayWorker {self.local_rank}] Smart Reload: Model {unet_path} already loaded. Skipping.")
                     self.is_model_loaded = True
                     return
 
@@ -539,7 +503,7 @@ class RayWorker:
 
 
     def _inject_gguf_ops(self, model_options, state_dict):
-        print("[RayWorker] Detected GGUF Reload. Injecting GGMLOps...")
+        print(f"[RayWorker {self.local_rank}] Detected GGUF Reload. Injecting GGMLOps...")
         try:
             from raylight.expansion.comfyui_gguf.ops import GGMLOps
             # Ensure model_options has custom_operations
@@ -655,18 +619,18 @@ class RayWorker:
         if isinstance(state_dict, ray.ObjectRef):
             # Smart Reload: Check Ref Match
             if self.model is not None and getattr(self, "current_sd_ref", None) == state_dict:
-                 print("[RayWorker] Smart Reload: State Dict Ref match. Skipping.")
+                 print(f"[RayWorker {self.local_rank}] Smart Reload: State Dict Ref match. Skipping.")
                  self.is_model_loaded = True
                  return
 
             self.current_sd_ref = state_dict
 
-            print("[RayWorker] Resolving base_sd_ref from Shared Object Store...")
+            print(f"[RayWorker {self.local_rank}] Resolving base_sd_ref from Shared Object Store...")
             state_dict = ray.get(state_dict)
 
             # Check for Parallel Load Mode (Lightweight Ref)
             if isinstance(state_dict, dict) and state_dict.get("parallel_load_mode", False):
-                 print("[RayWorker] Optimization within Load: Parallel Disk Loading detected...")
+                 print(f"[RayWorker {self.local_rank}] Optimization within Load: Parallel Disk Loading detected...")
                  unet_path = state_dict.get("unet_path")
                  
                  # Mmap Optimization: Strip dtype
@@ -691,7 +655,7 @@ class RayWorker:
             # in the current architecture.
             
             # Fallback for unexpected direct state_dict passing:
-            print("[RayWorker] Fallback: Standard Load from State Dict...")
+            print(f"[RayWorker {self.local_rank}] Fallback: Standard Load from State Dict...")
             loader_kwargs = {}
             if self.overwrite_cast_dtype is not None:
                 loader_kwargs["manual_cast_dtype"] = self.overwrite_cast_dtype
@@ -706,7 +670,7 @@ class RayWorker:
             # If successful, the tensors are now Plasma Views (CPU).
             # We must verify they are not Meta anymore.
             if next(self.model.model.parameters()).device.type == 'meta':
-                 print("[RayWorker] Warning: Model parameters are still on Meta device after load. Moving to CPU...")
+                 print(f"[RayWorker {self.local_rank}] Warning: Model parameters are still on Meta device after load. Moving to CPU...")
                  self.model.model.to("cpu")
 
         # GGUF Support: Inject Custom Ops if needed
@@ -724,7 +688,7 @@ class RayWorker:
 
         # GGUF Patcher Upgrade
         if getattr(self, "is_gguf", False):
-            print("[RayWorker] Upgrading to GGUFModelPatcher...")
+            print(f"[RayWorker {self.local_rank}] Upgrading to GGUFModelPatcher...")
             try:
                 from raylight.expansion.comfyui_gguf.nodes import GGUFModelPatcher
                 self.model = GGUFModelPatcher.clone(self.model)
@@ -734,7 +698,7 @@ class RayWorker:
                  print("[RayWorker] Warning: Failed to import GGUFModelPatcher for reload.")
         
         if self.model is None:
-             print("[RayWorker] ERROR: load_diffusion_model_state_dict returned None.")
+             print(f"[RayWorker {self.local_rank}] ERROR: load_diffusion_model_state_dict returned None.")
              if hasattr(state_dict, "keys"):
                  keys = list(state_dict.keys())
                  print(f"[RayWorker Debug] State Dict Keys Sample: {keys[:5]}")
@@ -783,186 +747,16 @@ class RayWorker:
             return True
 
     def load_lora(self, lora_path, strength_model, lora_config_hash=None):
-        """Loads a LoRA into the model on this worker via mmap.
-        
-        Args:
-            lora_path: Path to the LoRA file
-            strength_model: Strength to apply the LoRA
-            lora_config_hash: Optional hash identifying the complete LoRA configuration
-                              for this branch. If this changes from the previous call,
-                              all existing patches are reset before applying new ones.
-                              This enables isolated LoRA branches in workflows.
-        
-        Handles:
-        - Branch isolation: Different lora_config_hash triggers a reset
-        - Idempotency: Same LoRA in same config is not re-applied
-        """
-        filename = os.path.basename(lora_path)
-        if filename.startswith("._") or filename == ".DS_Store":
-            print(f"[RayWorker {self.local_rank}] Skipping hidden/junk file: {filename}")
-            return True
-
-        # Initialize LoRA tracking if needed
-        if not hasattr(self, "_applied_loras"):
-            self._applied_loras = set()
-        if not hasattr(self, "_current_lora_config_hash"):
-            self._current_lora_config_hash = None
-        # NEW: Store LoRA configs per config_hash for branch-aware re-application
-        if not hasattr(self, "_lora_configs"):
-            self._lora_configs = {}  # config_hash -> [(lora_path, strength), ...]
-        
-        # Store this LoRA in the config registry for re-application after offload
-        if lora_config_hash is not None:
-            if lora_config_hash not in self._lora_configs:
-                self._lora_configs[lora_config_hash] = []
-            lora_entry = (lora_path, strength_model)
-            # Avoid duplicate entries in the same config
-            if lora_entry not in self._lora_configs[lora_config_hash]:
-                self._lora_configs[lora_config_hash].append(lora_entry)
-                print(f"[RayWorker {self.local_rank}] Registered LoRA for config {lora_config_hash}: {filename}")
-        
-        # BRANCH ISOLATION: If lora_config_hash changed, reset all LoRAs first
-        if lora_config_hash is not None and lora_config_hash != self._current_lora_config_hash:
-            if self._current_lora_config_hash is not None:
-                print(f"[RayWorker {self.local_rank}] LoRA config changed ('{self._current_lora_config_hash}' -> '{lora_config_hash}'). Resetting patches...")
-                self.reset_loras()
-            self._current_lora_config_hash = lora_config_hash
-        
-        # Create a unique signature for this LoRA
-        lora_sig = (lora_path, strength_model)
-        
-        # IDEMPOTENCY: Skip if this exact LoRA was already applied in this config
-        if lora_sig in self._applied_loras:
-            print(f"[RayWorker {self.local_rank}] LoRA already applied: {filename} (strength={strength_model}). Skipping duplicate.")
-            return True
-
-        print(f"[RayWorker {self.local_rank}] Loading LoRA: {filename} (strength={strength_model})")
-        
-        # 1. Ensure model is loaded/re-hydrated
-        self.reload_model_if_needed()
-        
-        # 2. Apply using core logic (shared with re-apply)
-        self._apply_lora_core(lora_path, strength_model)
-        
-        print(f"[RayWorker {self.local_rank}] LoRA applied successfully.")
-        return True
+        return self.lora_manager.load_lora(lora_path, strength_model, lora_config_hash)
 
     def reset_loras(self):
-        """Clears all applied LoRAs and resets the model patches.
-        
-        Call this before applying a new set of LoRAs to ensure clean state,
-        especially when switching between different LoRA configurations.
-        """
-        import uuid
-        print(f"[RayWorker {self.local_rank}] Resetting LoRAs...")
-        
-        # Clear tracking
-        if hasattr(self, "_applied_loras"):
-            self._applied_loras.clear()
-        
-        # FIX Bug #1: Clear the config hash so next LoRA application is seen as new
-        if hasattr(self, "_current_lora_config_hash"):
-            self._current_lora_config_hash = None
-        
-        # Clear model patches if model exists
-        if self.model is not None:
-            # Clear the patches dict
-            if hasattr(self.model, "patches"):
-                self.model.patches.clear()
-            
-            # FIX Bug #3: Update patches_uuid to signal ComfyUI that patches changed
-            if hasattr(self.model, "patches_uuid"):
-                self.model.patches_uuid = uuid.uuid4()
-            
-            # Restore original weights from backup if any
-            if hasattr(self.model, "backup") and self.model.backup:
-                print(f"[RayWorker {self.local_rank}] Restoring {len(self.model.backup)} backed up weights...")
-                for k, bk in self.model.backup.items():
-                    if bk.inplace_update:
-                        comfy.utils.copy_to_param(self.model.model, k, bk.weight)
-                    else:
-                        comfy.utils.set_attr_param(self.model.model, k, bk.weight)
-                self.model.backup.clear()
-        
-        print(f"[RayWorker {self.local_rank}] LoRAs reset complete.")
+        self.lora_manager.reset_loras()
 
     def reapply_loras_for_config(self, config_hash):
-        """Re-apply all LoRAs for a specific config_hash after model reload.
-        
-        This is called before sampling when the sampler's config_hash differs from
-        the current applied config. It allows different branches to use different
-        LoRA configurations without interference.
-        
-        Args:
-            config_hash: The configuration hash identifying which LoRAs to apply.
-        """
-        # Initialize storage if needed
-        if not hasattr(self, "_lora_configs"):
-            self._lora_configs = {}
-        
-        # Nothing to do if no config stored
-        if config_hash not in self._lora_configs:
-            print(f"[RayWorker {self.local_rank}] No LoRAs registered for config {config_hash}. Skipping re-apply.")
-            return True
-        
-        # Check if we already have the right config applied
-        current_hash = getattr(self, "_current_lora_config_hash", None)
-        if current_hash == config_hash and hasattr(self, "_applied_loras") and self._applied_loras:
-            print(f"[RayWorker {self.local_rank}] Config {config_hash} already applied. Skipping re-apply.")
-            return True
-        
-        print(f"[RayWorker {self.local_rank}] Re-applying LoRAs for config {config_hash}...")
-        
-        # Reset current patches first
-        self.reset_loras()
-        
-        # Ensure model is loaded
-        self.reload_model_if_needed()
-        
-        # Re-apply each LoRA in this config
-        lora_list = self._lora_configs[config_hash]
-        for lora_path, strength in lora_list:
-            filename = os.path.basename(lora_path)
-            print(f"[RayWorker {self.local_rank}] Re-applying LoRA: {filename} (strength={strength})")
-            self._apply_lora_core(lora_path, strength)
-        
-        # Update tracking
-        self._current_lora_config_hash = config_hash
-        
-        print(f"[RayWorker {self.local_rank}] Re-applied {len(lora_list)} LoRAs for config {config_hash}.")
-        return True
-    
+        return self.lora_manager.reapply_loras_for_config(config_hash)
+
     def _apply_lora_core(self, lora_path, strength_model):
-        """Core LoRA application logic without registration/tracking.
-        
-        Used by both load_lora (initial apply) and reapply_loras_for_config (re-apply).
-        """
-        filename = os.path.basename(lora_path)
-        
-        # Load LoRA State Dict (Mmap)
-        lora_sd = comfy.utils.load_torch_file(lora_path)
-        
-        # Resolve Keys & Convert
-        key_map = {}
-        if self.model is not None:
-            key_map = comfy.lora.model_lora_keys_unet(self.model.model, key_map)
-        
-        from comfy.lora_convert import convert_lora
-        lora_patches = convert_lora(lora_sd)
-        
-        # Load Patches using Raylight's distributed lora helper
-        from raylight.comfy_dist.lora import load_lora
-        loaded_patches = load_lora(lora_patches, key_map)
-        
-        # Apply to Model
-        self.model.add_patches(loaded_patches, strength_model)
-        
-        # Track as applied
-        if not hasattr(self, "_applied_loras"):
-            self._applied_loras = set()
-        self._applied_loras.add((lora_path, strength_model))
-        
-        print(f"[RayWorker {self.local_rank}] LoRA core apply complete: {filename}")
+        self.lora_manager._apply_lora_core(lora_path, strength_model)
 
     def barrier_and_evict(self, path):
          """Synchronizes all workers and then evicts page cache."""
@@ -982,7 +776,7 @@ class RayWorker:
         return getattr(self, "gguf_metadata", {})
 
     def init_gguf_from_ref(self, ref, metadata, reload_params=None):
-        print("[RayWorker] Initializing GGUF from Shared Reference (Follower Mode)...")
+        print(f"[RayWorker {self.local_rank}] Initializing GGUF from Shared Reference (Follower Mode)...")
         # Save reload params first so we can use them for fallback
         if reload_params:
              self.reload_params = reload_params
@@ -994,7 +788,7 @@ class RayWorker:
         # Ray Shared Memory transfer for GGUF proved too heavy (OOM) even with deconstruction.
         # Running parallel disk loads allows the OS to use mmap sharing, which is the most memory efficient.
         if reload_params is not None:
-             print("[RayWorker] GGUF Optimization: Using Unified Parallel Disk Loading (Mmap)...")
+             print(f"[RayWorker {self.local_rank}] GGUF Optimization: Using Unified Parallel Disk Loading (Mmap)...")
              self._load_model_generic(
                  reload_params["unet_path"],
                  reload_params["model_options"],
@@ -1075,99 +869,22 @@ class RayWorker:
         ray.actor.exit_actor()
 
     def ray_vae_loader(self, vae_path):
-        from ..comfy_dist.sd import decode_tiled_1d, decode_tiled_, decode_tiled_3d
-        state_dict = {}
-        metadata = None
-        if "pixel_space" in vae_path:
-            state_dict["pixel_space_vae"] = torch.tensor(1.0)
-        else:
-            # Use return_metadata=True to ensure correct versioning (LTX-1 vs LTX-2)
-            res = comfy.utils.load_torch_file(vae_path, return_metadata=True)
-            if isinstance(res, tuple):
-                state_dict, metadata = res
-            else:
-                state_dict = res
-                metadata = None
-
-        # Diagnostics for VAE identification
-        key_check = "decoder.up_blocks.0.res_blocks.0.conv1.conv.weight"
-        if key_check in state_dict:
-            channels = state_dict[key_check].shape[0]
-            print(f"[RayWorker {self.local_rank}] VAE Identification: {key_check} has {channels} channels.")
-            # Replicate ComfyUI logic for clarity in logs
-            version = 0
-            if channels == 512: version = 0
-            elif channels == 1024:
-                version = 1
-                if "encoder.down_blocks.1.conv.conv.bias" in state_dict: version = 2
-            print(f"[RayWorker {self.local_rank}] VAE Identification: Guessed version {version}")
-        
-        if metadata:
-            print(f"[RayWorker {self.local_rank}] VAE Identification: Metadata found, contains 'config': {'config' in metadata}")
-
-        import logging
-        original_level = logging.getLogger().getEffectiveLevel()
-        # logging.getLogger().setLevel(logging.ERROR) # Let's see the warnings for now
-        try:
-            # Pass metadata to VAE constructor to correctly handle configs
-            vae_model = comfy.sd.VAE(sd=state_dict, metadata=metadata)
-            vae_model.throw_exception_if_invalid()
-        finally:
-            logging.getLogger().setLevel(original_level)
-
-        vae_model.decode_tiled_1d = types.MethodType(decode_tiled_1d, vae_model)
-        vae_model.decode_tiled_ = types.MethodType(decode_tiled_, vae_model)
-        vae_model.decode_tiled_3d = types.MethodType(decode_tiled_3d, vae_model)
-
-        if self.local_rank == 0:
-            print(f"VAE loaded in {self.global_world_size} GPUs")
-        self.vae_model = vae_model
+        self.vae_manager.load_vae(vae_path)
+        self.vae_model = self.vae_manager.vae_model
 
     def ray_vae_release(self):
-        """Explicitly release VAE model from memory to free RAM for other operations."""
-        if self.vae_model is not None:
-            print(f"[RayWorker {self.local_rank}] Releasing VAE model from RAM...")
-            del self.vae_model
-            self.vae_model = None
-            
-            # Aggressive cleanup
-            cleanup_memory()
-            
-            # Force OS to reclaim freed memory
-            force_malloc_trim()
-            
-            print(f"[RayWorker {self.local_rank}] VAE released.")
-        return True
+        result = self.vae_manager.release_vae()
+        self.vae_model = None
+        return result
 
     def get_vae_temporal_compression(self):
-        if self.vae_model is None: return None
-        return self.vae_model.temporal_compression_decode()
+        return self.vae_manager.get_temporal_compression()
 
     def get_vae_spatial_compression(self):
-        if self.vae_model is None: return None
-        return self.vae_model.spacial_compression_decode()
+        return self.vae_manager.get_spatial_compression()
 
     def _check_vae_health(self, samples, shard_index):
-        # Diagnostic: Check input latent statistics
-        l_min, l_max, l_mean = samples["samples"].min().item(), samples["samples"].max().item(), samples["samples"].mean().item()
-        print(f"[RayWorker {self.local_rank}] Input Latent Stats (shard {shard_index}): min={l_min:.4f}, max={l_max:.4f}, mean={l_mean:.4f}")
-        if torch.isnan(samples["samples"]).any():
-            print(f"[RayWorker {self.local_rank}] CRITICAL: Input latents for shard {shard_index} contain NaNs!")
-        
-        # Check if overwrite_cast_dtype is set (from patch_temp_fix_ck_ops)
-        if getattr(self, "overwrite_cast_dtype", None) is not None:
-            print(f"[RayWorker {self.local_rank}] Debug: overwrite_cast_dtype is set to {self.overwrite_cast_dtype}")
-        
-        # Check VAE weights for NaNs BEFORE decoding
-        if self.vae_model is not None:
-            nan_params = []
-            for name, p in self.vae_model.first_stage_model.named_parameters():
-                if torch.isnan(p).any():
-                    nan_params.append(name)
-            if nan_params:
-                print(f"[RayWorker {self.local_rank}] CRITICAL: VAE parameters contain NaNs: {nan_params[:5]}...")
-            else:
-                print(f"[RayWorker {self.local_rank}] VAE parameters verified healthy (no NaNs).")
+        self.vae_manager.check_health(samples, shard_index)
 
     def ray_vae_decode(
         self,
@@ -1183,201 +900,20 @@ class RayWorker:
         mmap_shape=None,
         output_offset=0,
     ):
-        with monitor_memory(f"RayWorker {self.local_rank} - ray_vae_decode", device=self.device):
-            print(f"[RayWorker {self.local_rank}] Entering ray_vae_decode (direct method call) for shard {shard_index}...")
-            
-
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
-        
-        if tile_size < overlap * 4:
-            overlap = tile_size // 4
-        if temporal_size < temporal_overlap * 2:
-            temporal_overlap = temporal_overlap // 2
-        temporal_compression = self.vae_model.temporal_compression_decode()
-        if temporal_compression is not None:
-            temporal_size = max(2, temporal_size // temporal_compression)
-            temporal_overlap = max(
-                1, min(temporal_size // 2, temporal_overlap // temporal_compression)
-            )
-        else:
-            temporal_size = None
-            temporal_overlap = None
-
-        compression = self.vae_model.spacial_compression_decode()
-
-        # Determine VAE dtype based on user selection
-        if vae_dtype == "auto":
-            # Auto: Use bfloat16 if supported (RTX 3000+), else fall back to float32
-            if torch.cuda.is_bf16_supported():
-                dtype = torch.bfloat16
-                print(f"[RayWorker {self.local_rank}] Using bfloat16 VAE (auto: bf16 supported)")
-            else:
-                dtype = torch.float32
-                print(f"[RayWorker {self.local_rank}] Using float32 VAE (auto: bf16 not supported)")
-        elif vae_dtype == "bf16":
-            dtype = torch.bfloat16
-            print(f"[RayWorker {self.local_rank}] Using bfloat16 VAE (user selected)")
-        elif vae_dtype == "fp16":
-            dtype = torch.float16
-            print(f"[RayWorker {self.local_rank}] Using float16 VAE (user selected - may cause NaN on some models)")
-        else:  # fp32
-            dtype = torch.float32
-            print(f"[RayWorker {self.local_rank}] Using float32 VAE (user selected - stable but 2x memory)")
-        
-        self.vae_model.first_stage_model.to(dtype)
-        self.vae_model.vae_dtype = dtype
-        
-        latents_to_decode = samples["samples"].to(dtype)
-        print(f"[RayWorker {self.local_rank}] latents_to_decode shape: {latents_to_decode.shape}")
-        print(f"[RayWorker {self.local_rank}] tiling: tile_t={temporal_size}, overlap_t={temporal_overlap}")
-
-        images = self.vae_model.decode_tiled(
-            latents_to_decode,
-            tile_x=tile_size // compression,
-            tile_y=tile_size // compression,
-            overlap=overlap // compression,
-            tile_t=temporal_size,
-            overlap_t=temporal_overlap,
+        return self.vae_manager.decode(
+            shard_index,
+            samples,
+            tile_size,
+            overlap,
+            temporal_size,
+            temporal_overlap,
+            discard_latent_frames,
+            vae_dtype,
+            mmap_path,
+            mmap_shape,
+            output_offset,
         )
-        print(f"[RayWorker {self.local_rank}] decode_tiled complete. Shape: {images.shape}")
-        
-        if torch.isnan(images).any():
-            print(f"[RayWorker {self.local_rank}] CRITICAL: VAE output STILL contains NaNs even in float32!")
-        
-        if len(images.shape) == 5:
-            # VAE.decode_tiled returns [B, T, H, W, C]
-            # Reshape to [B*T, H, W, C] and squeeze leading dim if B=1
-            images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
-        elif len(images.shape) == 4:
-            # Already [T, H, W, C]
-            pass
-        else:
-            # Fallback for unexpected shapes
-            while len(images.shape) > 4 and images.shape[0] == 1:
-                images = images.squeeze(0)
-            if len(images.shape) == 3: # H, W, C -> 1, H, W, C
-                images = images.unsqueeze(0)
-            
-        # If we have overlap, discard the warmup frames
-        if discard_latent_frames > 0:
-            # 1 latent frame = 8 video frames
-            temporal_compression = self.vae_model.temporal_compression_decode() or 8
-            discard_video_frames = discard_latent_frames * temporal_compression
-            print(f"[RayWorker {self.local_rank}] Discarding {discard_video_frames} redundant warmup frames")
-            images = images[discard_video_frames:]
-            
-        # Move to CPU explicitly before transport to avoid Ray GPU serialization issues
-        # and print stats to troubleshoot "Black Video" issues.
-        stats_min, stats_max, stats_mean = images.min().item(), images.max().item(), images.mean().item()
-        print(f"[RayWorker {self.local_rank}] Shard {shard_index} statistics: min={stats_min:.4f}, max={stats_max:.4f}, mean={stats_mean:.4f}")
-        
-        if mmap_path and mmap_shape:
-            # Direct write to shared memory optimization
-            print(f"[RayWorker {self.local_rank}] Writing directly to shared mmap: {mmap_path} (offset={output_offset})...")
-            
-            # Open shared mmap
-            num_elements = 1
-            for dim in mmap_shape: num_elements *= dim
-            
-            # We assume float32 output
-            out_buffer = torch.from_file(mmap_path, shared=True, size=num_elements, dtype=torch.float32).reshape(mmap_shape)
-            
-            # Write slice
-            write_len = images.shape[0]
-            if output_offset + write_len > out_buffer.shape[0]:
-                 # Safety clip
-                 write_len = out_buffer.shape[0] - output_offset
-                 images = images[:write_len]
 
-            # Write (auto-cast to float32 if needed)
-            out_buffer[output_offset : output_offset + write_len] = images.to(torch.float32).cpu()
-            
-            # Return stats only
-            result_payload = {
-                "mmap": True,
-                "shape": images.shape,
-                "stats": (stats_min, stats_max, stats_mean)
-            }
-            del out_buffer
-            
-        else:
-            # Fallback: serializing large tensor over Ray Object Store (high RAM usage)
-            print(f"[RayWorker {self.local_rank}] Moving to CPU and converting to float16 for transport...")
-            images = images.cpu().to(torch.float16)
-            result_payload = images
-
-        # Proactive memory cleanup - release decoded images tensor
-        del images
-        del latents_to_decode
-        
-        # Release VAE from GPU VRAM (keep in CPU RAM for potential reuse within same prompt)
-        # This is critical to avoid VRAM accumulation across shards
-        if self.vae_model is not None and hasattr(self.vae_model, 'first_stage_model'):
-            self.vae_model.first_stage_model.to('cpu')
-        
-        print(f"[RayWorker {self.local_rank}] Shard {shard_index} complete. Cleanup and return.")
-        cleanup_memory()
-
-        # Force OS to reclaim freed memory (fixes RSS creep on Worker 0)
-        force_malloc_trim()
-            
-        return (shard_index, result_payload)
-
-    def _prepare_for_sampling(self, latent):
-        """Common setup for sampling methods."""
-        if self.model is None:
-             raise RuntimeError("[RayWorker] Model not loaded! Please use a Load node first.")
-        work_model = self.model
-
-        latent_image = latent["samples"]
-        # Handle dict copy in caller if needed, or here if we want to be safe
-        # common_ksampler makes a copy of latent later (out = latent.copy())
-        # custom_sampler makes a copy of latent early. 
-        # For now, we return modified latent_image.
-
-        latent_image = comfy.sample.fix_empty_latent_channels(work_model, latent_image)
-
-        if self.parallel_dict["is_fsdp"] is True:
-            work_model.patch_fsdp()
-            # FSDP cleanup
-            if hasattr(self, "state_dict") and self.state_dict is not None:
-                del self.state_dict
-                self.state_dict = None
-                cleanup_memory()
-
-        disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
-        if self.local_rank == 0:
-            disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-
-        # CRITICAL: Ensure model device references are valid for this worker
-        if hasattr(work_model, 'load_device') and work_model.load_device != self.device:
-            work_model.load_device = self.device
-            
-        noise_mask = latent.get("noise_mask", None)
-            
-        return work_model, latent_image, noise_mask, disable_pbar
-    
-    @contextmanager
-    def sampling_context(self, latent):
-        """Context manager for sampling operations to ensure cleanup."""
-        try:
-            # 1. Common Setup (FSDP, Pbar, Device, Latent Fix)
-            # We need a copy of latent because _prepare modifies it
-            # The caller passes the original dict, we copy it here
-            work_latent = latent.copy()
-            
-            setup_result = self._prepare_for_sampling(work_latent)
-            # setup_result is (work_model, latent_image, noise_mask, disable_pbar)
-            
-            # We yield the setup results along with the work_latent dict 
-            # so the caller can update it with samples
-            yield setup_result + (work_latent,)
-            
-        finally:
-            # Always clean up memory, even if sampling fails
-            cleanup_memory()
 
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
@@ -1392,39 +928,9 @@ class RayWorker:
         sigmas,
         latent_image,
     ):
-        # NOTE: Reload is now handled by coordinator (sampler node) BEFORE dispatching.
-
-        with self.sampling_context(latent_image) as (work_model, final_samples, noise_mask, disable_pbar, work_latent):
-            # 2. Noise Generation
-            if not add_noise:
-                noise = Noise_EmptyNoise().generate_noise(work_latent)
-            else:
-                noise = Noise_RandomNoise(noise_seed).generate_noise(work_latent)
-
-            # 3. Sampling
-            # Use utility for consistent memory logging
-            with monitor_memory(f"RayWorker {self.local_rank} - custom_sampler", device=self.device):
-                if hasattr(self.model, "mmap_cache"):
-                     print(f"[RayWorker {self.local_rank}] Mmap Cache Len: {len(self.model.mmap_cache) if self.model.mmap_cache else 0}")
-                
-                with torch.no_grad():
-                    samples = comfy.sample.sample_custom(
-                        work_model,
-                        noise,
-                        cfg,
-                        sampler,
-                        sigmas,
-                        positive,
-                    negative,
-                    final_samples,
-                    noise_mask=noise_mask,
-                    disable_pbar=disable_pbar,
-                    seed=noise_seed,
-                )
-                out = work_latent.copy()
-                out["samples"] = samples
-
-        return out
+        return self.sampler_manager.custom_sampler(
+            add_noise, noise_seed, cfg, positive, negative, sampler, sigmas, latent_image
+        )
 
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
@@ -1445,71 +951,11 @@ class RayWorker:
         force_full_denoise=False,
         sigmas=None,
     ):
-        with monitor_memory(f"RayWorker {self.local_rank} - common_ksampler", device=self.device):
-            # NOTE: Reload is now handled by coordinator (sampler node) BEFORE dispatching.
-            
-            with self.sampling_context(latent) as (work_model, final_samples, noise_mask, disable_pbar, work_latent):
-                # 2. Noise Generation
-                if disable_noise:
-                    noise = torch.zeros(
-                        final_samples.size(),
-                        dtype=final_samples.dtype,
-                        layout=final_samples.layout,
-                        device="cpu",
-                    )
-                else:
-                    batch_inds = work_latent.get("batch_index", None)
-                    noise = comfy.sample.prepare_noise(
-                        final_samples, seed, batch_inds
-                    )
-
-                # 3. Sampler resolution logic for custom sigmas
-                sampler_obj = sampler_name
-                if sigmas is not None:
-                     if isinstance(sampler_name, str):
-                         sampler_obj = comfy.samplers.ksampler(sampler_name)
-
-                # 4. Sampling
-                with torch.no_grad():
-                    if sigmas is None:
-                        samples = comfy.sample.sample(
-                            work_model,
-                            noise,
-                            steps,
-                            cfg,
-                            sampler_name,
-                            scheduler,
-                            positive,
-                            negative,
-                            final_samples,
-                            denoise=denoise,
-                            disable_noise=disable_noise,
-                            start_step=start_step,
-                            last_step=last_step,
-                            force_full_denoise=force_full_denoise,
-                            noise_mask=noise_mask,
-                            disable_pbar=disable_pbar,
-                            seed=seed,
-                       )
-                    else:
-                         samples = comfy.sample.sample_custom(
-                            work_model,
-                            noise,
-                            cfg,
-                            sampler_obj,
-                            sigmas,
-                            positive,
-                            negative,
-                            final_samples,
-                            noise_mask=noise_mask,
-                            disable_pbar=disable_pbar,
-                            seed=seed,
-                        )
-                    
-                    out = work_latent.copy()
-                    out["samples"] = samples
-
-        return (out,)
+        return self.sampler_manager.common_ksampler(
+            seed, steps, cfg, sampler_name, scheduler, positive, negative,
+            latent, denoise, disable_noise, start_step, last_step,
+            force_full_denoise, sigmas
+        )
 
 
 class RayCOMMTester:

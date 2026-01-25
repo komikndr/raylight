@@ -184,7 +184,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             if device_to is not None:
                 self.current_device = device_to
                 
-            from raylight.distributed_worker.utils import cleanup_memory
+            from raylight.utils.common import cleanup_memory
             cleanup_memory()
             print(f"[GGUFModelPatcher] Offload Complete.")
 
