@@ -1140,49 +1140,59 @@ class RayLoraLoaderModelOnly:
                     {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01},
                 ),
             },
-            "optional": {
-                "prev_ray_lora": ("RAY_LORA", {"tooltip": "Chain from previous RayLoraLoader for stacking. Creates isolated config per branch."}),
-            },
         }
 
-    RETURN_TYPES = ("RAY_ACTORS", "RAY_LORA")
-    RETURN_NAMES = ("ray_actors", "ray_lora")
+    RETURN_TYPES = ("RAY_ACTORS",)
+    RETURN_NAMES = ("ray_actors",)
     FUNCTION = "load_lora_model_only"
 
     CATEGORY = "Raylight"
 
-    def load_lora_model_only(self, ray_actors, lora_name, strength_model, prev_ray_lora=None):
-        # Build config chain for branch isolation
+    def load_lora_model_only(self, ray_actors, lora_name, strength_model):
+        
+        # 1. Extract existing chain from ray_actors
+        # Default to empty string if this is the first lora in the chain
+        current_chain = ray_actors.get("lora_chain", "")
+        
+        # 2. Append new LoRA to the chain
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         this_lora_sig = f"{lora_name}:{strength_model}"
         
-        # Build config hash from chain
-        if prev_ray_lora is not None:
-            config_chain = prev_ray_lora.get("chain", "") + "|" + this_lora_sig
+        if current_chain:
+            new_chain = current_chain + "|" + this_lora_sig
         else:
-            config_chain = this_lora_sig
-        
-        # Create output lora object for chaining
-        ray_lora = {"chain": config_chain, "hash": hash(config_chain)}
+            new_chain = this_lora_sig
+            
+        # 3. Calculate new hash
+        lora_config_hash = hash(new_chain)
         
         if strength_model == 0:
-            return (ray_actors, ray_lora)
+            # Even if strength is 0, we should probably pass through the actors
+            # But technically it doesn't change the model state relative to the *previous* state?
+            # Actually, standard Comfy behavior is to effectively ignore 0 strength loras.
+            # But if we were stacking, maybe we should preserve the chain?
+            # Let's keep it simple: if strength 0, we just return original actors effectively skipping this one
+            # BUT we need to be careful if we want to support disabling loras mid-chain.
+            # For now, let's just return actors as-is, BUT with the chain un-modified? 
+            # Or should we add it with 0 strength? 
+            # Existing code returned early. Let's return early but we might break the chain if we don't pass the new chain.
+            # If we don't add it to the chain, the next node will append to the OLD chain. This is correct for "skipping".
+            return (ray_actors,)
 
         gpu_actors = ray_actors["workers"]
-        lora_config_hash = ray_lora["hash"]
 
-        # Dispatch UNET patching to Ray Workers with config hash for branch isolation
+        # 4. Dispatch UNET patching to Ray Workers with config hash for branch isolation
         print(f"[RayLoraLoaderModelOnly] Dispatching LoRA {lora_name} to {len(gpu_actors)} workers (config_hash={lora_config_hash})...")
         futures = [actor.load_lora.remote(lora_path, strength_model, lora_config_hash) for actor in gpu_actors]
         cancellable_get(futures)
 
-        # Embed config_hash in ray_actors for samplers to use
-        # This allows samplers to know which LoRA configuration to apply
+        # 5. Update ray_actors with new chain and hash
         updated_ray_actors = {
-            **ray_actors,  # Preserve existing keys (workers, etc.)
+            **ray_actors,
             "lora_config_hash": lora_config_hash,
+            "lora_chain": new_chain,
         }
-        return (updated_ray_actors, ray_lora)
+        return (updated_ray_actors,)
 
 
 NODE_CLASS_MAPPINGS = {
