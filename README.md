@@ -4,8 +4,10 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
-## WARNING
-Bug on Comfy mixed precision model, if you use any `model_name_fp8mixed.safetensors`, you will get dequantized error
+## INFO: Currently adding ops for model sharding for Comfy Kitchen:
+https://github.com/komikndr/comfy-kitchen-distributed
+
+
 
 ## UPDATE
 - LTX-2 USP
