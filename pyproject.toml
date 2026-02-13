@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "raylight"
-version = "0.16.0"
+version = "0.16.1"
 description = "Enable tensor split multi gpu capability in Comfy UI"
 authors = [
   {name = "Micko Lesmana", email = "mickolesmana@gmail.com"}

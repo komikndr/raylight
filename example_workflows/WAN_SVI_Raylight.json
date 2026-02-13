@@ -1,0 +1,1855 @@
+{
+  "id": "b590dcc4-90de-4786-b0a4-6b9020fb3eb3",
+  "revision": 0,
+  "last_node_id": 75,
+  "last_link_id": 100,
+  "nodes": [
+    {
+      "id": 46,
+      "type": "XFuserKSamplerAdvanced",
+      "pos": [
+        1610.9528415770092,
+        76.70804320820113
+      ],
+      "size": [
+        304.748046875,
+        334
+      ],
+      "flags": {},
+      "order": 21,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 43
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 70
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 71
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 74
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            65
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "XFuserKSamplerAdvanced"
+      },
+      "widgets_values": [
+        "enable",
+        420103976418937,
+        "randomize",
+        6,
+        1,
+        "euler",
+        "simple",
+        0,
+        3,
+        "disable"
+      ]
+    },
+    {
+      "id": 23,
+      "type": "SaveVideo",
+      "pos": [
+        3409.7232737335526,
+        476.0367893932262
+      ],
+      "size": [
+        432.9290466308594,
+        453.8443908691406
+      ],
+      "flags": {},
+      "order": 30,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 22
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveVideo",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55"
+      },
+      "widgets_values": [
+        "raylight/gen_",
+        "auto",
+        "auto"
+      ]
+    },
+    {
+      "id": 53,
+      "type": "WanImageToVideoSVIPro",
+      "pos": [
+        1231.250374938946,
+        299.60527135525587
+      ],
+      "size": [
+        281.1305236816406,
+        142.62576293945312
+      ],
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "positive",
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 66
+        },
+        {
+          "label": "negative",
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 100
+        },
+        {
+          "label": "anchor_samples",
+          "name": "anchor_samples",
+          "type": "LATENT",
+          "link": 69
+        },
+        {
+          "label": "prev_samples",
+          "name": "prev_samples",
+          "shape": 7,
+          "type": "LATENT",
+          "link": null
+        },
+        {
+          "label": "length",
+          "name": "length",
+          "type": "INT",
+          "widget": {
+            "name": "length"
+          },
+          "link": null
+        },
+        {
+          "label": "motion_latent_count",
+          "name": "motion_latent_count",
+          "type": "INT",
+          "widget": {
+            "name": "motion_latent_count"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "label": "positive",
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            70,
+            72,
+            76
+          ]
+        },
+        {
+          "label": "negative",
+          "name": "negative",
+          "type": "CONDITIONING",
+          "links": [
+            71,
+            73,
+            77
+          ]
+        },
+        {
+          "label": "latent",
+          "name": "latent",
+          "type": "LATENT",
+          "links": [
+            74
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "WanImageToVideoSVIPro",
+        "cnr_id": "comfyui-kjnodes",
+        "ver": "79f529a84a8c20fe5dcdfa984c6be7a94102c014",
+        "widget_ue_connectable": {}
+      },
+      "widgets_values": [
+        81,
+        1
+      ]
+    },
+    {
+      "id": 58,
+      "type": "XFuserKSamplerAdvanced",
+      "pos": [
+        1590.0495276039132,
+        491.0516867600682
+      ],
+      "size": [
+        304.748046875,
+        334
+      ],
+      "flags": {},
+      "order": 22,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 62
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 72
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 73
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 65
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            75,
+            79
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "XFuserKSamplerAdvanced"
+      },
+      "widgets_values": [
+        "enable",
+        1000855546954606,
+        "randomize",
+        6,
+        1,
+        "euler",
+        "simple",
+        3,
+        10000,
+        "disable"
+      ]
+    },
+    {
+      "id": 66,
+      "type": "VAEDecode",
+      "pos": [
+        2094.3034817416788,
+        188.751963170551
+      ],
+      "size": [
+        210,
+        46
+      ],
+      "flags": {},
+      "order": 23,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 75
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 92
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            81
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 68,
+      "type": "XFuserKSamplerAdvanced",
+      "pos": [
+        2443.016150991797,
+        45.99819912436471
+      ],
+      "size": [
+        304.748046875,
+        334
+      ],
+      "flags": {},
+      "order": 25,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 93
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 83
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 84
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 87
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            82
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "XFuserKSamplerAdvanced"
+      },
+      "widgets_values": [
+        "enable",
+        845541653160847,
+        "randomize",
+        6,
+        1,
+        "euler",
+        "simple",
+        0,
+        3,
+        "disable"
+      ]
+    },
+    {
+      "id": 67,
+      "type": "WanImageToVideoSVIPro",
+      "pos": [
+        2039.7175759778752,
+        307.84619184971257
+      ],
+      "size": [
+        281.1305236816406,
+        142.62576293945312
+      ],
+      "flags": {},
+      "order": 24,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "positive",
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 76
+        },
+        {
+          "label": "negative",
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 77
+        },
+        {
+          "label": "anchor_samples",
+          "name": "anchor_samples",
+          "type": "LATENT",
+          "link": 80
+        },
+        {
+          "label": "prev_samples",
+          "name": "prev_samples",
+          "shape": 7,
+          "type": "LATENT",
+          "link": 79
+        },
+        {
+          "label": "length",
+          "name": "length",
+          "type": "INT",
+          "widget": {
+            "name": "length"
+          },
+          "link": null
+        },
+        {
+          "label": "motion_latent_count",
+          "name": "motion_latent_count",
+          "type": "INT",
+          "widget": {
+            "name": "motion_latent_count"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "label": "positive",
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            83,
+            85
+          ]
+        },
+        {
+          "label": "negative",
+          "name": "negative",
+          "type": "CONDITIONING",
+          "links": [
+            84,
+            86
+          ]
+        },
+        {
+          "label": "latent",
+          "name": "latent",
+          "type": "LATENT",
+          "links": [
+            87
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "WanImageToVideoSVIPro",
+        "cnr_id": "comfyui-kjnodes",
+        "ver": "79f529a84a8c20fe5dcdfa984c6be7a94102c014",
+        "widget_ue_connectable": {}
+      },
+      "widgets_values": [
+        77,
+        1
+      ]
+    },
+    {
+      "id": 69,
+      "type": "XFuserKSamplerAdvanced",
+      "pos": [
+        2439.9500723815986,
+        474.61160601721025
+      ],
+      "size": [
+        304.748046875,
+        334
+      ],
+      "flags": {},
+      "order": 26,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 94
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 85
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 86
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 82
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            88
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "XFuserKSamplerAdvanced"
+      },
+      "widgets_values": [
+        "enable",
+        122454785311085,
+        "randomize",
+        6,
+        1,
+        "euler",
+        "simple",
+        3,
+        10000,
+        "disable"
+      ]
+    },
+    {
+      "id": 22,
+      "type": "CreateVideo",
+      "pos": [
+        3133.872253127095,
+        392.3225570644984
+      ],
+      "size": [
+        210,
+        78
+      ],
+      "flags": {},
+      "order": 29,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 90
+        },
+        {
+          "name": "audio",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            22
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CreateVideo",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55"
+      },
+      "widgets_values": [
+        16
+      ]
+    },
+    {
+      "id": 16,
+      "type": "VAELoader",
+      "pos": [
+        1432.4906869813371,
+        1157.8277220393911
+      ],
+      "size": [
+        295.85809326171875,
+        61.84592056274414
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "slot_index": 0,
+          "links": [
+            24,
+            91,
+            92
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAELoader",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55",
+        "models": [
+          {
+            "name": "wan_2.1_vae.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors?download=true",
+            "directory": "vae"
+          }
+        ]
+      },
+      "widgets_values": [
+        "wan_2.1_vae.safetensors"
+      ]
+    },
+    {
+      "id": 45,
+      "type": "RayModelSamplingSD3",
+      "pos": [
+        1255.4881168461247,
+        175.98246458262537
+      ],
+      "size": [
+        270,
+        58
+      ],
+      "flags": {},
+      "order": 20,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 60
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "links": [
+            43,
+            93
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayModelSamplingSD3"
+      },
+      "widgets_values": [
+        8
+      ]
+    },
+    {
+      "id": 21,
+      "type": "VAEDecode",
+      "pos": [
+        2803.457646568565,
+        412.9607031186449
+      ],
+      "size": [
+        210,
+        46
+      ],
+      "flags": {},
+      "order": 27,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 88
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 24
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            89
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 65,
+      "type": "ImageBatchExtendWithOverlap",
+      "pos": [
+        3135.080460650979,
+        197.4145906434347
+      ],
+      "size": [
+        321.6236267089844,
+        146
+      ],
+      "flags": {},
+      "order": 28,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "source_images",
+          "name": "source_images",
+          "type": "IMAGE",
+          "link": 81
+        },
+        {
+          "label": "new_images",
+          "name": "new_images",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 89
+        },
+        {
+          "label": "overlap",
+          "name": "overlap",
+          "type": "INT",
+          "widget": {
+            "name": "overlap"
+          },
+          "link": null
+        },
+        {
+          "label": "overlap_side",
+          "name": "overlap_side",
+          "type": "COMBO",
+          "widget": {
+            "name": "overlap_side"
+          },
+          "link": null
+        },
+        {
+          "label": "overlap_mode",
+          "name": "overlap_mode",
+          "type": "COMBO",
+          "widget": {
+            "name": "overlap_mode"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "label": "source_images",
+          "name": "source_images",
+          "type": "IMAGE"
+        },
+        {
+          "label": "start_images",
+          "name": "start_images",
+          "type": "IMAGE"
+        },
+        {
+          "label": "extended_images",
+          "name": "extended_images",
+          "type": "IMAGE",
+          "links": [
+            90
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ImageBatchExtendWithOverlap",
+        "cnr_id": "comfyui-kjnodes",
+        "ver": "79f529a84a8c20fe5dcdfa984c6be7a94102c014",
+        "widget_ue_connectable": {}
+      },
+      "widgets_values": [
+        5,
+        "source",
+        "linear_blend"
+      ]
+    },
+    {
+      "id": 70,
+      "type": "ImageResizeKJv2",
+      "pos": [
+        250.77213890726233,
+        733.7228411162881
+      ],
+      "size": [
+        270,
+        336
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 95
+        },
+        {
+          "name": "mask",
+          "shape": 7,
+          "type": "MASK",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            96
+          ]
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "name": "mask",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ImageResizeKJv2"
+      },
+      "widgets_values": [
+        720,
+        480,
+        "bicubic",
+        "crop",
+        "0, 0, 0",
+        "center",
+        2,
+        "cpu"
+      ]
+    },
+    {
+      "id": 71,
+      "type": "CLIPTextEncode",
+      "pos": [
+        671.4754329032612,
+        1178.1060649659476
+      ],
+      "size": [
+        424.6909484863281,
+        88
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 98
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            100
+          ]
+        }
+      ],
+      "title": "CLIP Text Encode (Positive Prompt)",
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55"
+      },
+      "widgets_values": [
+        "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 61,
+      "type": "RayModelSamplingSD3",
+      "pos": [
+        1237.5445248666958,
+        544.7134197581958
+      ],
+      "size": [
+        270,
+        58
+      ],
+      "flags": {},
+      "order": 19,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 61
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "links": [
+            62,
+            94
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayModelSamplingSD3"
+      },
+      "widgets_values": [
+        8
+      ]
+    },
+    {
+      "id": 38,
+      "type": "RayInitializer",
+      "pos": [
+        244.58809869794354,
+        399.7839546810171
+      ],
+      "size": [
+        270.17230224609375,
+        274
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "ray_actors_init",
+          "type": "RAY_ACTORS_INIT",
+          "links": [
+            40,
+            50
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayInitializer"
+      },
+      "widgets_values": [
+        "local",
+        "default",
+        2,
+        2,
+        1,
+        1,
+        false,
+        false,
+        false,
+        "TORCH_FLASH"
+      ]
+    },
+    {
+      "id": 63,
+      "type": "LoadImage",
+      "pos": [
+        -68.49429698836198,
+        738.0409188295878
+      ],
+      "size": [
+        303.6073701989185,
+        326
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            95
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "UcXeK6DWKBWdc3Ao4TZ9nU.jpg",
+        "image"
+      ]
+    },
+    {
+      "id": 17,
+      "type": "CLIPTextEncode",
+      "pos": [
+        671.748746193789,
+        1031.8141396962067
+      ],
+      "size": [
+        424.6909484863281,
+        88
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 15
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            66
+          ]
+        }
+      ],
+      "title": "CLIP Text Encode (Positive Prompt)",
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55"
+      },
+      "widgets_values": [
+        "Car moving in cyberpunk era style city"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 62,
+      "type": "VAEEncode",
+      "pos": [
+        1384.9632347946558,
+        981.4103068895643
+      ],
+      "size": [
+        140,
+        46
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "pixels",
+          "type": "IMAGE",
+          "link": 96
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 91
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            69,
+            80
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEEncode"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 57,
+      "type": "RayLoraLoader",
+      "pos": [
+        575.3292901680037,
+        806.0385365876731
+      ],
+      "size": [
+        416.59442773266755,
+        82
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "prev_ray_lora",
+          "shape": 7,
+          "type": "RAY_LORA",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_lora",
+          "type": "RAY_LORA",
+          "links": [
+            52
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayLoraLoader",
+        "cnr_id": "raylight",
+        "ver": "0.2.0"
+      },
+      "widgets_values": [
+        "lightx2v_I2V_14B_480p_cfg_step_distill_rank128_bf16.safetensors",
+        1
+      ]
+    },
+    {
+      "id": 56,
+      "type": "RayLoraLoader",
+      "pos": [
+        575.6326450347526,
+        678.2617618398451
+      ],
+      "size": [
+        374.0427615814167,
+        82
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "prev_ray_lora",
+          "shape": 7,
+          "type": "RAY_LORA",
+          "link": 52
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_lora",
+          "type": "RAY_LORA",
+          "links": [
+            53
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayLoraLoader",
+        "cnr_id": "raylight",
+        "ver": "0.2.0"
+      },
+      "widgets_values": [
+        "SVI_v2_PRO_Wan2.2-I2V-A14B_LOW_lora_rank_128_fp16.safetensors",
+        1
+      ]
+    },
+    {
+      "id": 54,
+      "type": "RayUNETLoader",
+      "pos": [
+        583.8582488345427,
+        523.4751478710642
+      ],
+      "size": [
+        270,
+        102
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors_init",
+          "type": "RAY_ACTORS_INIT",
+          "link": 50
+        },
+        {
+          "name": "lora",
+          "shape": 7,
+          "type": "RAY_LORA",
+          "link": 53
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "links": [
+            61
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayUNETLoader",
+        "cnr_id": "raylight",
+        "ver": "0.2.0"
+      },
+      "widgets_values": [
+        "Wan2_2-I2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors",
+        "default"
+      ]
+    },
+    {
+      "id": 8,
+      "type": "RayUNETLoader",
+      "pos": [
+        593.6276150969786,
+        295.40606813489103
+      ],
+      "size": [
+        270,
+        102
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors_init",
+          "type": "RAY_ACTORS_INIT",
+          "link": 40
+        },
+        {
+          "name": "lora",
+          "shape": 7,
+          "type": "RAY_LORA",
+          "link": 49
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "links": [
+            60
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayUNETLoader",
+        "cnr_id": "raylight",
+        "ver": "0.2.0"
+      },
+      "widgets_values": [
+        "Wan2_2-I2V-A14B-HIGH_fp8_e4m3fn_scaled_KJ.safetensors",
+        "default"
+      ]
+    },
+    {
+      "id": 35,
+      "type": "RayLoraLoader",
+      "pos": [
+        598.3098281198634,
+        161.69952065078053
+      ],
+      "size": [
+        308.27753738568026,
+        84.21899564858558
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "prev_ray_lora",
+          "shape": 7,
+          "type": "RAY_LORA",
+          "link": 51
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_lora",
+          "type": "RAY_LORA",
+          "links": [
+            49
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayLoraLoader",
+        "cnr_id": "raylight",
+        "ver": "0.2.0"
+      },
+      "widgets_values": [
+        "Wan_2_2_I2V_A14B_HIGH_lightx2v_4step_lora_v1030_rank_64_bf16.safetensors",
+        1
+      ]
+    },
+    {
+      "id": 55,
+      "type": "RayLoraLoader",
+      "pos": [
+        597.2219577274005,
+        22.686351360658733
+      ],
+      "size": [
+        358.6374466129396,
+        82
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "prev_ray_lora",
+          "shape": 7,
+          "type": "RAY_LORA",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_lora",
+          "type": "RAY_LORA",
+          "links": [
+            51
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayLoraLoader",
+        "cnr_id": "raylight",
+        "ver": "0.2.0"
+      },
+      "widgets_values": [
+        "SVI_v2_PRO_Wan2.2-I2V-A14B_HIGH_lora_rank_128_fp16.safetensors",
+        1
+      ]
+    },
+    {
+      "id": 15,
+      "type": "CLIPLoader",
+      "pos": [
+        -63.06335513272365,
+        1117.8794743536719
+      ],
+      "size": [
+        429.68731689453125,
+        106
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "slot_index": 0,
+          "links": [
+            15,
+            98
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55",
+        "models": [
+          {
+            "name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors?download=true",
+            "directory": "text_encoders"
+          }
+        ]
+      },
+      "widgets_values": [
+        "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+        "wan",
+        "default"
+      ]
+    },
+    {
+      "id": 73,
+      "type": "Note",
+      "pos": [
+        -81.80425046817535,
+        128.82210858495725
+      ],
+      "size": [
+        221.074128638272,
+        189.35890875820826
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Rule of thumb",
+      "properties": {},
+      "widgets_values": [
+        "Just jack up more ulysses per number of GPUs, and set ring only 1.\n\nNo need FSDP if all of your model can be fitted into individual card. Especially image model who has low sequence length.\n\nFor SDXL and SD1.5 only CFG parallel"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 75,
+      "type": "MarkdownNote",
+      "pos": [
+        -504.9812521807543,
+        363.08341153652174
+      ],
+      "size": [
+        403.4657275075731,
+        1054.769169761564
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Introduction",
+      "properties": {},
+      "widgets_values": [
+        "## Raylight Overview\n\nAs the name implies, **Raylight** uses Ray workers, called *Actors*.  \nEach worker is its own Python process. While this allows splitting across multiple VRAMs,  \nit does increase overall RAM usage.  \n\nThat said, RAM is generally much cheaper than VRAM, so this trade-off is acceptable in most cases.  \n\n---\n\n## More info: \n\n### [Raylight on GitHub](https://github.com/komikndr/raylight)\n### [Raylight guide on Youtube](https://youtu.be/KQxrkJAV4eI?si=hAFY1rKD6Y2UHXqY)\n\n\n## Supported Models\n\n| Model               | USP | FSDP | CFG |\n|---------------------|-----|------|-----|\n| Wan2.X 14B T2V      | ✅  | ✅   | ✅  |\n| Wan2.X 14B I2V      | ✅  | ✅   | ✅  |\n| Wan2.1 1.3B T2V     | ✅  | ✅   | ✅  |\n| Wan2.2 5B TI2V      | ✅  | ✅   | ✅  |\n| Flux Dev            | ✅  | ✅   | ❌  |\n| Flux Konteks        | ✅  | ✅   | ❌  |\n| Flux Krea           | ✅  | ✅   | ❌  |\n| Flux 2              | ✅  | ✅   | ❌  |\n| Chroma              | ✅  | ✅   | ✅  |\n| Chroma Radiance     | ✅  | ✅   | ✅  |\n| Qwen Image/Edit     | ✅  | ✅   | ✅  |\n| Z Image             | ✅  | ✅   | ✅  |\n| Lumina 2            | ✅  | ✅   | ✅  |\n| Hunyuan Video       | ✅  | ❌   | ❌  |\n| Hunyuan 1.5         | ✅  | ❌   | ❌  |\n| SD1.5 (UNet)        | ❌  | ❌   | ✅  |\n| SDXL (UNet)         | ❌  | ❌   | ✅  |\n\n**Legend:**\n- ✅ = Supported  \n- ❌ = Not supported  \n\n**Notes:**\n- Non standard Wan variant (Phantom, S2V, etc...) is not tested\n\n## Scaled vs Non-Scaled Models\n\n| Model       | USP | FSDP |\n|-------------|-----|------|\n| Non-Scaled  | ✅  | ✅   |\n| Scaled      | ✅  | ⚠️ |\n\n**Notes:**\n- Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.\n- Only Ada Lovelace and newer GPUs support **FP8 scaled FSDP2**.\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 72,
+      "type": "MarkdownNote",
+      "pos": [
+        -496.64919111895887,
+        134.99500846794666
+      ],
+      "size": [
+        385.26349810726197,
+        184.87935303020652
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "\nRaylight uses **FSDP2** to shard the model across GPUs.\n\nIn rare cases, a memory leak may occur when switching from one LoRA to another while using FSDP. However, in most tests this issue does not appear, even with the same Docker setup....\n\nIf memory leak cases continue to grow, I will force a reinitialization of the Ray worker.\n\nIn the meantime, if you encounter this issue, please restart Comfy.\nOpen Issue on [Raylight Issue](https://github.com/komikndr/raylight/issues)\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 74,
+      "type": "Note",
+      "pos": [
+        -75.52503691623247,
+        370.8884921570524
+      ],
+      "size": [
+        210,
+        178.59762243597055
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Glosarry",
+      "properties": {},
+      "widgets_values": [
+        "rank = id assigned to the GPU\nworld_size = number of GPUs\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    }
+  ],
+  "links": [
+    [
+      15,
+      15,
+      0,
+      17,
+      0,
+      "CLIP"
+    ],
+    [
+      22,
+      22,
+      0,
+      23,
+      0,
+      "VIDEO"
+    ],
+    [
+      24,
+      16,
+      0,
+      21,
+      1,
+      "VAE"
+    ],
+    [
+      40,
+      38,
+      0,
+      8,
+      0,
+      "RAY_ACTORS_INIT"
+    ],
+    [
+      43,
+      45,
+      0,
+      46,
+      0,
+      "RAY_ACTORS"
+    ],
+    [
+      49,
+      35,
+      0,
+      8,
+      1,
+      "RAY_LORA"
+    ],
+    [
+      50,
+      38,
+      0,
+      54,
+      0,
+      "RAY_ACTORS_INIT"
+    ],
+    [
+      51,
+      55,
+      0,
+      35,
+      0,
+      "RAY_LORA"
+    ],
+    [
+      52,
+      57,
+      0,
+      56,
+      0,
+      "RAY_LORA"
+    ],
+    [
+      53,
+      56,
+      0,
+      54,
+      1,
+      "RAY_LORA"
+    ],
+    [
+      60,
+      8,
+      0,
+      45,
+      0,
+      "RAY_ACTORS"
+    ],
+    [
+      61,
+      54,
+      0,
+      61,
+      0,
+      "RAY_ACTORS"
+    ],
+    [
+      62,
+      61,
+      0,
+      58,
+      0,
+      "RAY_ACTORS"
+    ],
+    [
+      65,
+      46,
+      0,
+      58,
+      3,
+      "LATENT"
+    ],
+    [
+      66,
+      17,
+      0,
+      53,
+      0,
+      "CONDITIONING"
+    ],
+    [
+      69,
+      62,
+      0,
+      53,
+      2,
+      "LATENT"
+    ],
+    [
+      70,
+      53,
+      0,
+      46,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      71,
+      53,
+      1,
+      46,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      72,
+      53,
+      0,
+      58,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      73,
+      53,
+      1,
+      58,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      74,
+      53,
+      2,
+      46,
+      3,
+      "LATENT"
+    ],
+    [
+      75,
+      58,
+      0,
+      66,
+      0,
+      "LATENT"
+    ],
+    [
+      76,
+      53,
+      0,
+      67,
+      0,
+      "CONDITIONING"
+    ],
+    [
+      77,
+      53,
+      1,
+      67,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      79,
+      58,
+      0,
+      67,
+      3,
+      "LATENT"
+    ],
+    [
+      80,
+      62,
+      0,
+      67,
+      2,
+      "LATENT"
+    ],
+    [
+      81,
+      66,
+      0,
+      65,
+      0,
+      "IMAGE"
+    ],
+    [
+      82,
+      68,
+      0,
+      69,
+      3,
+      "LATENT"
+    ],
+    [
+      83,
+      67,
+      0,
+      68,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      84,
+      67,
+      1,
+      68,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      85,
+      67,
+      0,
+      69,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      86,
+      67,
+      1,
+      69,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      87,
+      67,
+      2,
+      68,
+      3,
+      "LATENT"
+    ],
+    [
+      88,
+      69,
+      0,
+      21,
+      0,
+      "LATENT"
+    ],
+    [
+      89,
+      21,
+      0,
+      65,
+      1,
+      "IMAGE"
+    ],
+    [
+      90,
+      65,
+      2,
+      22,
+      0,
+      "IMAGE"
+    ],
+    [
+      91,
+      16,
+      0,
+      62,
+      1,
+      "VAE"
+    ],
+    [
+      92,
+      16,
+      0,
+      66,
+      1,
+      "VAE"
+    ],
+    [
+      93,
+      45,
+      0,
+      68,
+      0,
+      "RAY_ACTORS"
+    ],
+    [
+      94,
+      61,
+      0,
+      69,
+      0,
+      "RAY_ACTORS"
+    ],
+    [
+      95,
+      63,
+      0,
+      70,
+      0,
+      "IMAGE"
+    ],
+    [
+      96,
+      70,
+      0,
+      62,
+      0,
+      "IMAGE"
+    ],
+    [
+      98,
+      15,
+      0,
+      71,
+      0,
+      "CLIP"
+    ],
+    [
+      100,
+      71,
+      0,
+      53,
+      1,
+      "CONDITIONING"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.611590904484152,
+      "offset": [
+        660.59761766494,
+        -154.699612918251
+      ]
+    },
+    "frontendVersion": "1.38.13",
+    "workflowRendererVersion": "LG"
+  },
+  "version": 0.4
+}

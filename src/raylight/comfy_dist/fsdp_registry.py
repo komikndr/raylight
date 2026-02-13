@@ -8,6 +8,7 @@ from ..diffusion_models.chroma_radiance.fsdp import shard_model_fsdp2 as chroma_
 from ..diffusion_models.qwen_image.fsdp import shard_model_fsdp2 as qwen_shard
 from ..diffusion_models.hunyuan_video.fsdp import shard_model_fsdp2 as hunyuan_shard
 from ..diffusion_models.lumina.fsdp import shard_model_fsdp2 as lumina_shard
+from ..diffusion_models.lightricks.fsdp_ltxav import shard_model_fsdp2 as lightricks_av_shard
 
 
 class FSDPShardRegistry:
@@ -86,6 +87,11 @@ if hasattr(model_base, "Lumina2"):
     @FSDPShardRegistry.register(model_base.Lumina2)
     def _wrap_lumina(model, sd, cpu_offload):
         return lumina_shard(model, sd, True)
+
+if hasattr(model_base, "LTXAV"):
+    @FSDPShardRegistry.register(model_base.LTXAV)
+    def _wrap_ltxav(model, sd, cpu_offload):
+        return lightricks_av_shard(model, sd, True)
 
 
 def patch_fsdp(self):
