@@ -4,18 +4,11 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
-<<<<<<< HEAD
-## INFO: Currently adding ops for model sharding for Comfy Kitchen:
-https://github.com/komikndr/comfy-kitchen-distributed
-
-
-=======
 ## WARNING
 Comfy new mixed precision model is not available for FSD2, use old Fp8 or BF16 dtype
 
 ## INFO: Currently adding ops for model sharding for Comfy Kitchen:
 https://github.com/komikndr/comfy-kitchen-distributed
->>>>>>> dev
 
 ## UPDATE
 - LTX-2 USP, FSDP2 BF16
