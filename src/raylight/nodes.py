@@ -128,7 +128,7 @@ class RayInitializer:
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
                 "XFuser_attention": (
                     [member.name for member in AttnType],
-                    {"default": "TORCH"},
+                    {"default": "TORCH_FLASH"},
                 ),
             }
         }
@@ -145,7 +145,7 @@ class RayInitializer:
         ray_cluster_namespace: str,
         GPU: int,
         ulysses_degree: int,
-        ring_degree: int ,
+        ring_degree: int,
         cfg_degree: int,
         sync_ulysses: bool,
         FSDP: bool,
@@ -276,18 +276,8 @@ class RayInitializerAdvanced(RayInitializer):
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
                 "XFuser_attention": (
-                    [
-                        "TORCH",
-                        "FLASH_ATTN",
-                        "FLASH_ATTN_3",
-                        "SAGE_AUTO_DETECT",
-                        "SAGE_FP16_TRITON",
-                        "SAGE_FP16_CUDA",
-                        "SAGE_FP8_CUDA",
-                        "SAGE_FP8_SM90",
-                        "AITER_ROCM",
-                    ],
-                    {"default": "TORCH"},
+                    [member.name for member in AttnType],
+                    {"default": "TORCH_FLASH"},
                 ),
             }
         }

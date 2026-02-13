@@ -13,7 +13,6 @@ sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
 
 
-
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0
@@ -24,6 +23,7 @@ def sinusoidal_embedding_1d(dim, position):
     sinusoid = torch.outer(position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     return x
+
 
 @torch.compiler.disable
 def usp_dit_forward(
@@ -39,6 +39,16 @@ def usp_dit_forward(
     x = self.patch_embedding(x.float()).to(x.dtype)
     grid_sizes = x.shape[2:]
     x = x.flatten(2).transpose(1, 2)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    sp_world = get_sequence_parallel_world_size()
+    sp_rank = get_sequence_parallel_rank()
+
+    x, orig_size = pad_to_world_size(x, dim=1)
+    freqs, _ = pad_to_world_size(freqs, dim=1)
+
+    x = torch.chunk(x, sp_world, dim=1)[sp_rank]
+    freqs = torch.chunk(freqs, sp_world, dim=1)[sp_rank]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     # time embeddings
     e = self.time_embedding(
@@ -62,16 +72,6 @@ def usp_dit_forward(
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
         context_img_len = clip_fea.shape[-2]
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
-    sp_world = get_sequence_parallel_world_size()
-    sp_rank = get_sequence_parallel_rank()
-
-    x, orig_size = pad_to_world_size(x, dim=1)
-    freqs, _ = pad_to_world_size(freqs, dim=1)
-
-    x = torch.chunk(x, sp_world, dim=1)[sp_rank]
-    freqs = torch.chunk(freqs, sp_world, dim=1)[sp_rank]
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
@@ -518,3 +518,4 @@ def usp_t2v_cross_attn_gather_forward(self, x, context, transformer_options={}, 
     x = x.flatten(2)
     x = self.o(x)
     return x
+
