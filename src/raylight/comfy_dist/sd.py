@@ -214,33 +214,28 @@ def decode_tiled_3d(self, samples, tile_t=999, tile_x=32, tile_y=32, overlap=(1,
 def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options={}, metadata=None):
     dtype = model_options.get("dtype", None)
     diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
-    temp_sd = comfy.utils.state_dict_prefix_replace(
-        sd, {diffusion_model_prefix: ""}, filter_keys=True
-    )
+    temp_sd = comfy.utils.state_dict_prefix_replace(sd, {diffusion_model_prefix: ""}, filter_keys=True)
     if len(temp_sd) > 0:
         sd = temp_sd
 
-    try:
-        custom_operations = model_options.get("custom_operations", None)
-        if custom_operations is None and hasattr(comfy.utils, "convert_old_quants"):
-            sd, metadata = comfy.utils.convert_old_quants(sd, "", metadata=metadata)
-    finally:
-        parameters = comfy.utils.calculate_parameters(sd)
-        weight_dtype = comfy.utils.weight_dtype(sd)
-
+    custom_operations = model_options.get("custom_operations", None)
+    if custom_operations is None:
+        sd, metadata = comfy.utils.convert_old_quants(sd, "", metadata=metadata)
+    parameters = comfy.utils.calculate_parameters(sd)
+    weight_dtype = comfy.utils.weight_dtype(sd)
 
     load_device = model_management.get_torch_device()
-    model_config = model_detection.model_config_from_unet(sd, "")
+    model_config = model_detection.model_config_from_unet(sd, "", metadata=metadata)
 
     if model_config is not None:
         new_sd = sd
     else:
         new_sd = model_detection.convert_diffusers_mmdit(sd, "")
-        if new_sd is not None:  # diffusers mmdit
+        if new_sd is not None: #diffusers mmdit
             model_config = model_detection.model_config_from_unet(new_sd, "")
             if model_config is None:
                 return None
-        else:  # diffusers unet
+        else: #diffusers unet
             model_config = model_detection.model_config_from_diffusers_unet(sd)
             if model_config is None:
                 return None
@@ -256,63 +251,28 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
 
     offload_device = model_management.unet_offload_device()
     unet_weight_dtype = list(model_config.supported_inference_dtypes)
+    if model_config.quant_config is not None:
+        weight_dtype = None
 
-    try:
-        if getattr(model_config, "quant_config", None) is not None:
-            weight_dtype = None
+    if dtype is None:
+        unet_dtype = model_management.unet_dtype(model_params=parameters, supported_dtypes=unet_weight_dtype, weight_dtype=weight_dtype)
+    else:
+        unet_dtype = dtype
 
-        unet_dtype = (
-            model_management.unet_dtype(
-                model_params=parameters,
-                supported_dtypes=unet_weight_dtype,
-                weight_dtype=weight_dtype,
-            )
-            if dtype is None
-            else dtype
-        )
-        manual_cast_dtype = model_management.unet_manual_cast(
-            None if model_config.quant_config is not None else unet_dtype,
-            load_device,
-            model_config.supported_inference_dtypes,
-        )
-
-        model_config.set_inference_dtype(unet_dtype, manual_cast_dtype)
-
-        if custom_operations is not None:
-            model_config.custom_operations = custom_operations
-
-    except Exception as e:
-        logging.warning(f"FSDP: Falling back to old Comfy (< 0.3.77). Reason: {str(e)}")
-        if getattr(model_config, "scaled_fp8", None) is not None:
-            weight_dtype = None
-        unet_dtype = (
-            model_management.unet_dtype(
-                model_params=parameters,
-                supported_dtypes=unet_weight_dtype,
-                weight_dtype=weight_dtype,
-            )
-            if dtype is None
-            else dtype
-        )
-
-    manual_cast_dtype = model_management.unet_manual_cast(
-        unet_dtype, load_device, model_config.supported_inference_dtypes
-    )
+    if model_config.quant_config is not None:
+        manual_cast_dtype = model_management.unet_manual_cast(None, load_device, model_config.supported_inference_dtypes)
+    else:
+        manual_cast_dtype = model_management.unet_manual_cast(unet_dtype, load_device, model_config.supported_inference_dtypes)
     model_config.set_inference_dtype(unet_dtype, manual_cast_dtype)
 
-    # Old fallback: custom ops taken from model_options
-    model_config.custom_operations = model_options.get(
-        "custom_operations", getattr(model_config, "custom_operations", None)
-    )
+    if custom_operations is not None:
+        model_config.custom_operations = custom_operations
 
     if model_options.get("fp8_optimizations", False):
         model_config.optimizations["fp8"] = True
 
     model = model_config.get_model(new_sd, "")
     model.load_model_weights(new_sd, "")
-    left_over = sd.keys()
-    if len(left_over) > 0:
-        logging.info("left over keys in diffusion model: {}".format(left_over))
 
     model_patcher = comfy_dist.model_patcher.FSDPModelPatcher(
         model,
@@ -322,7 +282,11 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
         device_mesh=device_mesh,
         is_cpu_offload=is_cpu_offload,
     )
+    if not model_management.is_device_cpu(offload_device):
+        model.to(offload_device)
+    left_over = sd.keys()
+    if len(left_over) > 0:
+        logging.info("left over keys in diffusion model: {}".format(left_over))
     state_dict = model_patcher.model_state_dict()
     model_patcher.model.to("meta")
-
     return model_patcher, state_dict
