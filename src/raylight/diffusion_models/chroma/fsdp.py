@@ -11,7 +11,7 @@ from comfy.quant_ops import (
     TensorCoreFP8Layout,
     get_layout_class,
 )
-from raylight.diffusion_models.quant_fsdp_loader import load_from_full_model_state_dict
+from raylight.diffusion_models.quant_fsdp_loader import rebuild_into_quantized_tensor
 
 try:
     import comfy_kitchen as ck
@@ -171,7 +171,7 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
     # print("SD PARAMS")
     # for k, v in model_state_dict.items():
     #     print(k,":",v)
-    load_from_full_model_state_dict(model,
+    model_state_dict = rebuild_into_quantized_tensor(model,
                                     model_state_dict,
                                     torch.device("cuda"),
                                     strict=False,
@@ -179,14 +179,14 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
                                     use_distributed_state_dict=False,
                                     release_sd=False)
 
-    # set_model_state_dict(
-    #     model=model,
-    #     model_state_dict=model_state_dict,
-    #     options=StateDictOptions(
-    #         full_state_dict=True,
-    #         broadcast_from_rank0=True,
-    #         cpu_offload=enable_cpu_offload
-    #     ),
-    # )
+    set_model_state_dict(
+        model=model,
+        model_state_dict=model_state_dict,
+        options=StateDictOptions(
+            full_state_dict=True,
+            broadcast_from_rank0=True,
+            cpu_offload=enable_cpu_offload
+        ),
+    )
 
     return model

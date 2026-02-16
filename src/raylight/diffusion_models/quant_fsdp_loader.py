@@ -201,4 +201,60 @@ def load_from_full_model_state_dict(
         if release_sd:
             full_sd[param_name] = None
 
-    return model.load_state_dict(sharded_sd, strict=strict, assign=True)
+    model.load_state_dict(sharded_sd, strict=strict, assign=True)
+
+
+def rebuild_into_quantized_tensor(
+    model,
+    full_sd,
+    device,
+    strict,
+    cpu_offload,
+    use_distributed_state_dict,
+    release_sd,
+):
+    meta_sharded_sd = model.state_dict()
+    sharded_sd = {}
+
+    for param_name, sharded_meta_param in meta_sharded_sd.items():
+        quant_tensor = _build_quantized_tensor(
+            param_name, full_sd, sharded_meta_param, device
+        )
+
+        if quant_tensor is not None:
+            sharded_tensor = quant_tensor
+
+            if cpu_offload:
+                sharded_tensor = sharded_tensor.cpu()
+
+            sharded_sd[param_name] = torch.nn.Parameter(sharded_tensor)
+
+            if release_sd:
+                prefix = param_name[: -len("weight")]
+                for key in (
+                    param_name,
+                    f"{prefix}weight_scale",
+                    f"{prefix}weight_scale_2",
+                    f"{prefix}comfy_quant",
+                ):
+                    if key in full_sd:
+                        full_sd[key] = None
+            continue
+
+        full_tensor = full_sd.get(param_name)
+        if full_tensor is None:
+            raise ValueError(f"Missing parameter {param_name} in state_dict")
+
+        full_tensor = full_tensor.to(sharded_meta_param.dtype).to(device)
+
+        sharded_tensor = full_tensor
+
+        if cpu_offload:
+            sharded_tensor = sharded_tensor.cpu()
+
+        sharded_sd[param_name] = torch.nn.Parameter(sharded_tensor)
+
+        if release_sd:
+            full_sd[param_name] = None
+
+    return sharded_sd
