@@ -5,8 +5,17 @@ from dataclasses import replace
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 _PATCHED = False
+_MISSING = object()
+_ORIG_ALL_GATHER_INTO_TENSOR = None
+_ORIG_ALL_GATHER = None
+_ORIG_SCATTER = None
+_ORIG_LAYOUT_PRE = _MISSING
+_ORIG_LAYOUT_POST = _MISSING
+_ORIG_QT_PRE = _MISSING
+_ORIG_QT_POST = _MISSING
 
 
 def _get_op(path: str):
@@ -19,7 +28,11 @@ def _get_op(path: str):
 
 
 def install_fp8_patches() -> None:
+    # Doing all of this bullshit since, c10d for all_gather only available only on dynamo somehow and not eager??
+    # next to do i guess, meh....
     global _PATCHED
+    global _ORIG_ALL_GATHER_INTO_TENSOR, _ORIG_ALL_GATHER, _ORIG_SCATTER
+    global _ORIG_LAYOUT_PRE, _ORIG_LAYOUT_POST, _ORIG_QT_PRE, _ORIG_QT_POST
     if _PATCHED:
         return
 
@@ -96,6 +109,10 @@ def install_fp8_patches() -> None:
         )
         return QuantizedTensor(data, qtensor._layout_cls, params), (data,)
 
+    if _ORIG_LAYOUT_PRE is _MISSING:
+        _ORIG_LAYOUT_PRE = getattr(TensorCoreFP8Layout, "pre_all_gather", _MISSING)
+    if _ORIG_LAYOUT_POST is _MISSING:
+        _ORIG_LAYOUT_POST = getattr(TensorCoreFP8Layout, "post_all_gather", _MISSING)
     TensorCoreFP8Layout.pre_all_gather = pre_all_gather
     TensorCoreFP8Layout.post_all_gather = post_all_gather
 
@@ -111,8 +128,129 @@ def install_fp8_patches() -> None:
             out=out,
         )
 
+    if _ORIG_QT_PRE is _MISSING:
+        _ORIG_QT_PRE = getattr(QuantizedTensor, "fsdp_pre_all_gather", _MISSING)
+    if _ORIG_QT_POST is _MISSING:
+        _ORIG_QT_POST = getattr(QuantizedTensor, "fsdp_post_all_gather", _MISSING)
     QuantizedTensor.fsdp_pre_all_gather = fsdp_pre_all_gather
     QuantizedTensor.fsdp_post_all_gather = fsdp_post_all_gather
+
+    if _ORIG_ALL_GATHER_INTO_TENSOR is None:
+        _ORIG_ALL_GATHER_INTO_TENSOR = dist.all_gather_into_tensor
+
+        def all_gather_into_tensor_patched(output_tensor, input_tensor, group=None, async_op=False):
+            output_qt = output_tensor if isinstance(output_tensor, QuantizedTensor) else None
+            input_qt = input_tensor if isinstance(input_tensor, QuantizedTensor) else None
+
+            use_byte_transport = output_qt is not None or input_qt is not None
+
+            if not use_byte_transport:
+                return _ORIG_ALL_GATHER_INTO_TENSOR(
+                    output_tensor,
+                    input_tensor,
+                    group=group,
+                    async_op=async_op,
+                )
+
+            output_arg = output_tensor
+            input_arg = input_tensor
+            if output_qt is not None:
+                output_arg = output_qt._qdata.contiguous().view(torch.uint8)
+            if input_qt is not None:
+                input_arg = input_qt._qdata.contiguous().view(torch.uint8)
+
+            work = _ORIG_ALL_GATHER_INTO_TENSOR(
+                output_arg,
+                input_arg,
+                group=group,
+                async_op=async_op,
+            )
+
+            if output_qt is not None and not async_op:
+                output_qt._params = replace(output_qt._params, orig_shape=tuple(output_qt._qdata.shape))
+
+            return work
+
+        dist.all_gather_into_tensor = all_gather_into_tensor_patched
+
+    if _ORIG_ALL_GATHER is None:
+        _ORIG_ALL_GATHER = dist.all_gather
+
+        def all_gather_patched(tensor_list, tensor, group=None, async_op=False):
+            input_qt = tensor if isinstance(tensor, QuantizedTensor) else None
+            output_qt_flags = [isinstance(t, QuantizedTensor) for t in tensor_list]
+
+            if input_qt is None and not any(output_qt_flags):
+                return _ORIG_ALL_GATHER(
+                    tensor_list,
+                    tensor,
+                    group=group,
+                    async_op=async_op,
+                )
+
+            input_arg = input_qt._qdata.contiguous().view(torch.uint8) if input_qt is not None else tensor
+            output_arg = [t._qdata.contiguous().view(torch.uint8) if is_qt else t for t, is_qt in zip(tensor_list, output_qt_flags)]
+
+            work = _ORIG_ALL_GATHER(
+                output_arg,
+                input_arg,
+                group=group,
+                async_op=async_op,
+            )
+
+            if not async_op:
+                for t, is_qt in zip(tensor_list, output_qt_flags):
+                    if is_qt:
+                        t._params = replace(t._params, orig_shape=tuple(t._qdata.shape))
+
+            return work
+
+        dist.all_gather = all_gather_patched
+
+    if _ORIG_SCATTER is None:
+        _ORIG_SCATTER = dist.scatter
+
+        def scatter_patched(
+            tensor: torch.Tensor,
+            scatter_list=None,
+            src=None,
+            group=None,
+            async_op=False,
+            group_src=None,
+        ):
+            output_qt = tensor if isinstance(tensor, QuantizedTensor) else None
+            has_qt_input = bool(scatter_list) and any(isinstance(t, QuantizedTensor) for t in scatter_list)
+
+            if output_qt is None and not has_qt_input:
+                return _ORIG_SCATTER(
+                    tensor,
+                    scatter_list=scatter_list,
+                    src=src,
+                    group=group,
+                    async_op=async_op,
+                    group_src=group_src,
+                )
+
+            output_arg = output_qt._qdata.contiguous().view(torch.uint8) if output_qt is not None else tensor
+            scatter_arg = scatter_list
+            if scatter_list is not None:
+                scatter_arg = [t._qdata.contiguous().view(torch.uint8) if isinstance(t, QuantizedTensor) else t for t in scatter_list]
+
+            work = _ORIG_SCATTER(
+                output_arg,
+                scatter_list=scatter_arg,
+                src=src,
+                group=group,
+                async_op=async_op,
+                group_src=group_src,
+            )
+
+            if output_qt is not None and not async_op:
+                output_qt._params = replace(output_qt._params, orig_shape=tuple(output_qt._qdata.shape))
+
+            return work
+
+        dist.scatter = scatter_patched
 
     op_all_gather = _get_op("torch.ops._c10d_functional.all_gather_into_tensor.default")
     op_wait_tensor = _get_op("torch.ops._c10d_functional.wait_tensor.default")
@@ -121,25 +259,58 @@ def install_fp8_patches() -> None:
 
     @maybe_register(op_all_gather)
     def handle_all_gather(qt, args, kwargs):
-        input_tensor = None
-        input_idx = None
-        for idx, arg in enumerate(args):
-            if isinstance(arg, QuantizedTensor):
-                input_tensor = arg
-                input_idx = idx
-                break
-
-        if input_tensor is None:
+        if len(args) == 0:
             return op_all_gather(*args, **kwargs)
 
-        qdata = input_tensor._qdata
         new_args = list(args)
-        new_args[input_idx] = qdata.contiguous().view(torch.uint8)
+        out_idx = None
+        in_idx = None
+        out_qt = None
+        in_qt = None
 
-        gathered_bytes = op_all_gather(*new_args, **kwargs)
-        gathered_qdata = gathered_bytes.view(qdata.dtype)
-        gathered_params = replace(input_tensor._params, orig_shape=tuple(gathered_qdata.shape))
-        return QuantizedTensor(gathered_qdata, input_tensor._layout_cls, gathered_params)
+        for idx, arg in enumerate(args):
+            if isinstance(arg, QuantizedTensor):
+                if out_qt is None:
+                    out_qt = arg
+                    out_idx = idx
+                elif in_qt is None:
+                    in_qt = arg
+                    in_idx = idx
+                    break
+
+        if in_qt is None and out_qt is not None:
+            in_qt = out_qt
+            in_idx = out_idx
+            out_qt = None
+            out_idx = None
+
+        if in_qt is None:
+            return op_all_gather(*args, **kwargs)
+
+        new_args[in_idx] = in_qt._qdata.contiguous().view(torch.uint8)
+        if out_qt is not None:
+            new_args[out_idx] = out_qt._qdata.contiguous().view(torch.uint8)
+
+        ret = op_all_gather(*new_args, **kwargs)
+        if isinstance(ret, torch.Tensor):
+            gathered_bytes = ret
+        elif out_qt is not None:
+            gathered_bytes = new_args[out_idx]
+        else:
+            return ret
+
+        if op_wait_tensor is not None:
+            gathered_bytes = op_wait_tensor(gathered_bytes)
+
+        if out_qt is not None:
+            gathered_qdata = gathered_bytes.view(out_qt._qdata.dtype)
+            out_qt._qdata.copy_(gathered_qdata)
+            out_qt._params = replace(out_qt._params, orig_shape=tuple(out_qt._qdata.shape))
+            return out_qt
+
+        gathered_qdata = gathered_bytes.view(in_qt._qdata.dtype)
+        gathered_params = replace(in_qt._params, orig_shape=tuple(gathered_qdata.shape))
+        return QuantizedTensor(gathered_qdata, in_qt._layout_cls, gathered_params)
 
     @maybe_register(op_wait_tensor)
     def handle_wait_tensor(qt, args, kwargs):
@@ -307,3 +478,52 @@ def install_fp8_patches() -> None:
             return wrap_fp8_tensor(input_tensor, new_qdata)
 
     _PATCHED = True
+
+
+def restore_fp8_patches() -> None:
+    global _PATCHED
+    global _ORIG_ALL_GATHER_INTO_TENSOR, _ORIG_ALL_GATHER, _ORIG_SCATTER
+    global _ORIG_LAYOUT_PRE, _ORIG_LAYOUT_POST, _ORIG_QT_PRE, _ORIG_QT_POST
+
+    from comfy_kitchen.tensor.base import QuantizedTensor
+    from comfy_kitchen.tensor.fp8 import TensorCoreFP8Layout
+
+    if _ORIG_ALL_GATHER_INTO_TENSOR is not None:
+        dist.all_gather_into_tensor = _ORIG_ALL_GATHER_INTO_TENSOR
+        _ORIG_ALL_GATHER_INTO_TENSOR = None
+    if _ORIG_ALL_GATHER is not None:
+        dist.all_gather = _ORIG_ALL_GATHER
+        _ORIG_ALL_GATHER = None
+    if _ORIG_SCATTER is not None:
+        dist.scatter = _ORIG_SCATTER
+        _ORIG_SCATTER = None
+
+    if _ORIG_LAYOUT_PRE is _MISSING:
+        if hasattr(TensorCoreFP8Layout, "pre_all_gather"):
+            delattr(TensorCoreFP8Layout, "pre_all_gather")
+    else:
+        TensorCoreFP8Layout.pre_all_gather = _ORIG_LAYOUT_PRE
+
+    if _ORIG_LAYOUT_POST is _MISSING:
+        if hasattr(TensorCoreFP8Layout, "post_all_gather"):
+            delattr(TensorCoreFP8Layout, "post_all_gather")
+    else:
+        TensorCoreFP8Layout.post_all_gather = _ORIG_LAYOUT_POST
+
+    if _ORIG_QT_PRE is _MISSING:
+        if hasattr(QuantizedTensor, "fsdp_pre_all_gather"):
+            delattr(QuantizedTensor, "fsdp_pre_all_gather")
+    else:
+        QuantizedTensor.fsdp_pre_all_gather = _ORIG_QT_PRE
+
+    if _ORIG_QT_POST is _MISSING:
+        if hasattr(QuantizedTensor, "fsdp_post_all_gather"):
+            delattr(QuantizedTensor, "fsdp_post_all_gather")
+    else:
+        QuantizedTensor.fsdp_post_all_gather = _ORIG_QT_POST
+
+    _ORIG_LAYOUT_PRE = _MISSING
+    _ORIG_LAYOUT_POST = _MISSING
+    _ORIG_QT_PRE = _MISSING
+    _ORIG_QT_POST = _MISSING
+    _PATCHED = False

@@ -27,12 +27,17 @@ from comfy_kitchen.tensor import (
     register_layout_op,
 )
 
-from .kitchen_patches.fp8 import install_fp8_patches
+from .kitchen_patches.fp8 import install_fp8_patches, restore_fp8_patches
 
 
 def install_sitepkg_ck_patches(layouts=("fp8",)):
     if "fp8" in layouts:
         install_fp8_patches()
+
+
+def restore_sitepkg_ck_patches(layouts=("fp8",)):
+    if "fp8" in layouts:
+        restore_fp8_patches()
 
 
 __all__ = [
@@ -58,4 +63,5 @@ __all__ = [
     "register_layout_class",
     "get_layout_class",
     "install_sitepkg_ck_patches",
+    "restore_sitepkg_ck_patches",
 ]
