@@ -20,6 +20,7 @@ import raylight.distributed_modules.attention as xfuser_attn
 
 from raylight.distributed_modules.usp import USPInjectRegistry
 from raylight.distributed_modules.cfg import CFGParallelInjectRegistry
+from raylight.comfy_dist.kitchen_distributed import install_fp8_patches, restore_fp8_patches
 
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
@@ -430,6 +431,7 @@ class RayWorker:
         latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
 
         if self.parallel_dict["is_fsdp"] is True:
+            install_fp8_patches()
             self.model.patch_fsdp()
 
         if disable_noise:
@@ -475,6 +477,8 @@ class RayWorker:
             )
             out = latent.copy()
             out["samples"] = samples
+
+        restore_fp8_patches()
 
         if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
             self.model.detach()

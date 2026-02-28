@@ -90,6 +90,21 @@ def install_fp8_patches() -> None:
     ):
         (data,) = all_gather_outputs
         (scale,) = metadata
+        orig_shape = tuple(qtensor._params.orig_shape)
+
+        expected_numel = 1
+        for dim in orig_shape:
+            expected_numel *= int(dim)
+
+        actual_numel = int(data.numel())
+        if actual_numel < expected_numel:
+            raise RuntimeError(
+                "FP8 FSDP post_all_gather produced insufficient storage for the upcoming "
+                "as_strided materialization. "
+                f"expected_numel={expected_numel}, actual_numel={actual_numel}, "
+                f"orig_shape={orig_shape}, gathered_shape={tuple(data.shape)}, "
+                f"dtype={data.dtype}, device={data.device}"
+            )
 
         if out is not None:
             if not isinstance(out, QuantizedTensor):
@@ -98,14 +113,14 @@ def install_fp8_patches() -> None:
             out._params = cls.Params(
                 scale=scale,
                 orig_dtype=param_dtype,
-                orig_shape=tuple(data.shape),
+                orig_shape=orig_shape,
             )
             return None
 
         params = cls.Params(
             scale=scale,
             orig_dtype=param_dtype,
-            orig_shape=tuple(data.shape),
+            orig_shape=orig_shape,
         )
         return QuantizedTensor(data, qtensor._layout_cls, params), (data,)
 
@@ -412,6 +427,7 @@ def install_fp8_patches() -> None:
     op_split_with_sizes = _get_op("torch.ops.aten.split_with_sizes.default")
     op_cat = _get_op("torch.ops.aten.cat.default")
     op_new_zeros = _get_op("torch.ops.aten.new_zeros.default")
+    op_as_strided = _get_op("torch.ops.aten.as_strided.default")
 
     @maybe_register(op_slice)
     def handle_slice(qt, args, kwargs):
@@ -458,11 +474,43 @@ def install_fp8_patches() -> None:
         new_qdata = op_new_zeros(input_tensor._qdata, *args[1:], **kwargs)
         return wrap_fp8_tensor(input_tensor, new_qdata)
 
+    @maybe_register(op_as_strided)
+    def handle_as_strided(qt, args, kwargs):
+        input_tensor = args[0]
+        if not isinstance(input_tensor, QuantizedTensor):
+            return op_as_strided(*args, **kwargs)
+
+        try:
+            new_qdata = op_as_strided(input_tensor._qdata, *args[1:], **kwargs)
+        except RuntimeError as e:
+            msg = str(e)
+            if "out of bounds for storage" in msg or "setStorage" in msg:
+                size = args[1] if len(args) > 1 else kwargs.get("size")
+                stride = args[2] if len(args) > 2 else kwargs.get("stride")
+                storage_offset = args[3] if len(args) > 3 else kwargs.get("storage_offset", 0)
+
+                qdata = input_tensor._qdata
+                storage_nbytes = qdata.untyped_storage().nbytes()
+                itemsize = qdata.element_size()
+                storage_elems = storage_nbytes // itemsize if itemsize > 0 else 0
+
+                raise RuntimeError(
+                    "FP8 as_strided storage OOB on QuantizedTensor._qdata. "
+                    "This usually means FSDP unshard reconstruction produced insufficient "
+                    "backing storage for the requested logical parameter view. "
+                    f"requested_size={size}, requested_stride={stride}, "
+                    f"storage_offset={storage_offset}, qdata_shape={tuple(qdata.shape)}, "
+                    f"qdata_dtype={qdata.dtype}, qdata_storage_elems={storage_elems}, "
+                    f"qdata_storage_nbytes={storage_nbytes}"
+                ) from e
+            raise
+
+        return wrap_fp8_tensor(input_tensor, new_qdata)
+
     for path in (
         "torch.ops.aten.view.default",
         "torch.ops.aten.reshape.default",
         "torch.ops.aten.t.default",
-        "torch.ops.aten.as_strided.default",
         "torch.ops.aten.alias.default",
     ):
         op = _get_op(path)
