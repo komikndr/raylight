@@ -347,13 +347,17 @@ class RayUNETLoader:
         loaded_futures = []
 
         if parallel_dict["is_fsdp"] is True:
-            worker0 = ray.get_actor("RayWorker:0")
-            ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
-            meta_model = ray.get(worker0.get_meta_model.remote())
+            # Temporary for QT tensor loader
+            #worker0 = ray.get_actor("RayWorker:0")
+            #ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
+            #meta_model = ray.get(worker0.get_meta_model.remote())
+
+            #for actor in gpu_actors:
+            #    if actor != worker0:
+            #        loaded_futures.append(actor.set_meta_model.remote(meta_model))
 
             for actor in gpu_actors:
-                if actor != worker0:
-                    loaded_futures.append(actor.set_meta_model.remote(meta_model))
+                loaded_futures.append(actor.load_unet.remote(unet_path, model_options=model_options))
 
             ray.get(loaded_futures)
             loaded_futures = []
