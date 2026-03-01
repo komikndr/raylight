@@ -2,6 +2,7 @@ import logging
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 import comfy.model_management
 from .base import (
@@ -21,11 +22,7 @@ class LoraDiff(WeightAdapterTrainBase):
         rank, in_dim = mat2.shape[0], mat2.shape[1]
         if mid is not None:
             convdim = mid.ndim - 2
-            layer = (
-                torch.nn.Conv1d,
-                torch.nn.Conv2d,
-                torch.nn.Conv3d
-            )[convdim]
+            layer = (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)[convdim]
         else:
             layer = torch.nn.Linear
         self.lora_up = layer(rank, out_dim, bias=False)
@@ -45,12 +42,48 @@ class LoraDiff(WeightAdapterTrainBase):
         if self.lora_mid is None:
             diff = self.lora_up.weight @ self.lora_down.weight
         else:
-            diff = tucker_weight_from_conv(
-                self.lora_up.weight, self.lora_down.weight, self.lora_mid.weight
-            )
+            diff = tucker_weight_from_conv(self.lora_up.weight, self.lora_down.weight, self.lora_mid.weight)
         scale = self.alpha / self.rank
         weight = w + scale * diff.reshape(w.shape)
         return weight.to(org_dtype)
+
+    def h(self, x: torch.Tensor, base_out: torch.Tensor) -> torch.Tensor:
+        scale = (self.alpha / self.rank) * getattr(self, "multiplier", 1.0)
+
+        is_conv = getattr(self, "is_conv", False)
+        conv_dim = getattr(self, "conv_dim", 0)
+        kw_dict = getattr(self, "kw_dict", {})
+
+        down_weight = self.lora_down.weight
+        up_weight = self.lora_up.weight
+
+        if is_conv:
+            conv_fn = (F.conv1d, F.conv2d, F.conv3d)[conv_dim - 1]
+            if down_weight.dim() == 2:
+                kernel_size = getattr(self, "kernel_size", (1,) * conv_dim)
+                in_channels = getattr(self, "in_channels", None)
+                if in_channels is not None:
+                    down_weight = down_weight.view(down_weight.shape[0], in_channels, *kernel_size)
+                else:
+                    down_weight = down_weight.view(*down_weight.shape, *([1] * conv_dim))
+            if up_weight.dim() == 2:
+                up_weight = up_weight.view(*up_weight.shape, *([1] * conv_dim))
+
+            hidden = conv_fn(x, down_weight, **kw_dict)
+            if self.lora_mid is not None:
+                mid_weight = self.lora_mid.weight
+                if mid_weight.dim() == 2:
+                    mid_weight = mid_weight.view(*mid_weight.shape, *([1] * conv_dim))
+                hidden = conv_fn(hidden, mid_weight)
+
+            out = conv_fn(hidden, up_weight)
+        else:
+            hidden = F.linear(x, down_weight)
+            if self.lora_mid is not None:
+                hidden = F.linear(hidden, self.lora_mid.weight)
+            out = F.linear(hidden, up_weight)
+
+        return out * scale
 
     def passive_memory_usage(self):
         return sum(param.numel() * param.element_size() for param in self.parameters())
@@ -67,13 +100,11 @@ class LoRAAdapter(WeightAdapterBase):
     def create_train(cls, weight, rank=1, alpha=1.0):
         out_dim = weight.shape[0]
         in_dim = weight.shape[1:].numel()
-        mat1 = torch.empty(out_dim, rank, device=weight.device, dtype=weight.dtype)
-        mat2 = torch.empty(rank, in_dim, device=weight.device, dtype=weight.dtype)
+        mat1 = torch.empty(out_dim, rank, device=weight.device, dtype=torch.float32)
+        mat2 = torch.empty(rank, in_dim, device=weight.device, dtype=torch.float32)
         torch.nn.init.kaiming_uniform_(mat1, a=5**0.5)
         torch.nn.init.constant_(mat2, 0.0)
-        return LoraDiff(
-            (mat1, mat2, alpha, None, None, None)
-        )
+        return LoraDiff((mat1, mat2, alpha, None, None, None))
 
     def to_train(self):
         return LoraDiff(self.weights)
@@ -85,7 +116,7 @@ class LoRAAdapter(WeightAdapterBase):
         lora: dict[str, torch.Tensor],
         alpha: float,
         dora_scale: torch.Tensor,
-        loaded_keys: set[str] = None,
+        loaded_keys: Optional[set[str]] = None,
     ) -> Optional["LoRAAdapter"]:
         if loaded_keys is None:
             loaded_keys = set()
@@ -97,7 +128,10 @@ class LoRAAdapter(WeightAdapterBase):
         diffusers3_lora = "{}.lora.up.weight".format(x)
         mochi_lora = "{}.lora_B".format(x)
         transformers_lora = "{}.lora_linear_layer.up.weight".format(x)
+        qwen_default_lora = "{}.lora_B.default.weight".format(x)
         A_name = None
+        B_name = None
+        mid_name = None
 
         if regular_lora in lora.keys():
             A_name = regular_lora
@@ -122,6 +156,10 @@ class LoRAAdapter(WeightAdapterBase):
         elif transformers_lora in lora.keys():
             A_name = transformers_lora
             B_name = "{}.lora_linear_layer.down.weight".format(x)
+            mid_name = None
+        elif qwen_default_lora in lora.keys():
+            A_name = qwen_default_lora
+            B_name = "{}.lora_A.default.weight".format(x)
             mid_name = None
 
         if A_name is not None:
@@ -153,15 +191,11 @@ class LoRAAdapter(WeightAdapterBase):
         function,
         intermediate_dtype=torch.float32,
         original_weight=None,
-        device_mesh=None
+        device_mesh=None,
     ):
         v = self.weights
-        mat1 = comfy.model_management.cast_to_device(
-            v[0], weight.device, intermediate_dtype
-        )
-        mat2 = comfy.model_management.cast_to_device(
-            v[1], weight.device, intermediate_dtype
-        )
+        mat1 = comfy.model_management.cast_to_device(v[0], weight.device, intermediate_dtype)
+        mat2 = comfy.model_management.cast_to_device(v[1], weight.device, intermediate_dtype)
         dora_scale = v[4]
         reshape = v[5]
 
@@ -175,9 +209,7 @@ class LoRAAdapter(WeightAdapterBase):
 
         if v[3] is not None:
             # locon mid weights, hopefully the math is fine because I didn't properly test it
-            mat3 = comfy.model_management.cast_to_device(
-                v[3], weight.device, intermediate_dtype
-            )
+            mat3 = comfy.model_management.cast_to_device(v[3], weight.device, intermediate_dtype)
             final_shape = [mat2.shape[1], mat2.shape[0], mat3.shape[2], mat3.shape[3]]
             mat2 = (
                 torch.mm(
@@ -188,9 +220,7 @@ class LoRAAdapter(WeightAdapterBase):
                 .transpose(0, 1)
             )
         try:
-            lora_diff = torch.mm(
-                mat1.flatten(start_dim=1), mat2.flatten(start_dim=1)
-            ).reshape(weight.shape)
+            lora_diff = torch.mm(mat1.flatten(start_dim=1), mat2.flatten(start_dim=1)).reshape(weight.shape)
             del mat1, mat2
             if dora_scale is not None:
                 weight = weight_decompose(
@@ -204,9 +234,74 @@ class LoRAAdapter(WeightAdapterBase):
                 )
             else:
                 if isinstance(weight, DTensor):
-                    weight += DTensor.from_local(function(((strength * alpha) * lora_diff).type(weight.dtype)), device_mesh)
+                    if device_mesh is not None:
+                        weight += DTensor.from_local(function(((strength * alpha) * lora_diff).type(weight.dtype)), device_mesh)
+                    else:
+                        weight += function(((strength * alpha) * lora_diff).type(weight.dtype))
                 else:
                     weight += function(((strength * alpha) * lora_diff).type(weight.dtype))
         except Exception as e:
             logging.error("ERROR {} {} {}".format(self.name, key, e))
         return weight
+
+    def h(self, x: torch.Tensor, base_out: torch.Tensor = None) -> torch.Tensor:
+        """Additive bypass component for LoRA: h(x) = up(down(x)) * scale
+
+        This method is used in bypass mode where LoRA is applied via forward hooks
+        without modifying the original model weights. Works with QuantizedTensor.
+
+        Args:
+            x: Input tensor
+            base_out: Base output (optional, for g() function support)
+
+        Returns:
+            LoRA contribution: up(down(x)) * scale
+        """
+        FUNC_LIST = [None, None, F.linear, F.conv1d, F.conv2d, F.conv3d]
+
+        v = self.weights
+        up = v[0]
+        down = v[1]
+        alpha = v[2]
+        mid = v[3]
+
+        rank = down.shape[0]
+        scale = alpha / rank if alpha is not None else 1.0
+        scale *= getattr(self, "multiplier", 1.0)
+
+        up = up.to(dtype=x.dtype)
+        down = down.to(dtype=x.dtype)
+
+        is_conv = getattr(self, "is_conv", False)
+        conv_dim = getattr(self, "conv_dim", 0)
+        kw_dict = getattr(self, "kw_dict", {})
+
+        if is_conv:
+            op = FUNC_LIST[conv_dim + 2]
+            kernel_size = getattr(self, "kernel_size", (1,) * conv_dim)
+            in_channels = getattr(self, "in_channels", None)
+
+            if down.dim() == 2:
+                if in_channels is not None:
+                    down = down.view(down.shape[0], in_channels, *kernel_size)
+                else:
+                    down = down.view(*down.shape, *([1] * conv_dim))
+            if up.dim() == 2:
+                up = up.view(*up.shape, *([1] * conv_dim))
+            if mid is not None:
+                mid = mid.to(dtype=x.dtype)
+                if mid.dim() == 2:
+                    mid = mid.view(*mid.shape, *([1] * conv_dim))
+        else:
+            op = F.linear
+            kw_dict = {}
+
+        if mid is not None:
+            hidden = op(x, down)
+            hidden = op(hidden, mid, **kw_dict)
+            out = op(hidden, up)
+        else:
+            hidden = op(x, down, **kw_dict)
+            out = op(hidden, up)
+
+        return out * scale

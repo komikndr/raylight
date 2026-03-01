@@ -46,7 +46,7 @@ def load_lora(lora, to_load, log_missing=True):
             patch_dict[to_load[x]] = ("diff", (w_norm,))
             if b_norm is not None:
                 loaded_keys.add(b_norm_name)
-                patch_dict["{}.bias".format(to_load[x][:-len(".weight")])] = ("diff", (b_norm,))
+                patch_dict["{}.bias".format(to_load[x][: -len(".weight")])] = ("diff", (b_norm,))
 
         diff_name = "{}.diff".format(x)
         diff_weight = lora.get(diff_name, None)
@@ -57,7 +57,7 @@ def load_lora(lora, to_load, log_missing=True):
         diff_bias_name = "{}.diff_b".format(x)
         diff_bias = lora.get(diff_bias_name, None)
         if diff_bias is not None:
-            patch_dict["{}.bias".format(to_load[x][:-len(".weight")])] = ("diff", (diff_bias,))
+            patch_dict["{}.bias".format(to_load[x][: -len(".weight")])] = ("diff", (diff_bias,))
             loaded_keys.add(diff_bias_name)
 
         set_weight_name = "{}.set_weight".format(x)
@@ -93,10 +93,20 @@ def calculate_weight(patches, weight, key, intermediate_dtype=torch.float32, ori
             weight *= strength_model
 
         if isinstance(v, list):
-            v = (calculate_weight(v[1:], v[0][1](comfy.model_management.cast_to_device(v[0][0], weight.device, intermediate_dtype, copy=True), inplace=True), key, intermediate_dtype=intermediate_dtype, device_mesh=device_mesh),)
+            v = (
+                calculate_weight(
+                    v[1:],
+                    v[0][1](comfy.model_management.cast_to_device(v[0][0], weight.device, intermediate_dtype, copy=True), inplace=True),
+                    key,
+                    intermediate_dtype=intermediate_dtype,
+                    device_mesh=device_mesh,
+                ),
+            )
 
         if isinstance(v, weight_adapter.WeightAdapterBase):
-            output = v.calculate_weight(weight, key, strength, strength_model, offset, function, intermediate_dtype, original_weights, device_mesh)
+            output = v.calculate_weight(
+                weight, key, strength, strength_model, offset, function, intermediate_dtype, original_weights, device_mesh
+            )
             if output is None:
                 logging.warning("Calculate Weight Failed: {} {}".format(v.name, key))
             else:
@@ -114,7 +124,7 @@ def calculate_weight(patches, weight, key, intermediate_dtype=torch.float32, ori
         if patch_type == "diff":
             diff: torch.Tensor = v[0]
             # An extra flag to pad the weight if the diff's shape is larger than the weight
-            do_pad_weight = len(v) > 1 and v[1]['pad_weight']
+            do_pad_weight = len(v) > 1 and v[1]["pad_weight"]
             if do_pad_weight and diff.shape != weight.shape:
                 logging.info("Pad weight {} from {} to shape: {}".format(key, weight.shape, diff.shape))
                 weight = pad_tensor_to_shape(weight, diff.shape)
@@ -123,22 +133,31 @@ def calculate_weight(patches, weight, key, intermediate_dtype=torch.float32, ori
                 if diff.shape != weight.shape:
                     logging.warning("WARNING SHAPE MISMATCH {} WEIGHT NOT MERGED {} != {}".format(key, diff.shape, weight.shape))
                 else:
+                    add_term = function(strength * comfy.model_management.cast_to_device(diff, weight.device, weight.dtype))
                     if isinstance(weight, DTensor):
-                        weight += DTensor.from_local(function(strength * comfy.model_management.cast_to_device(diff, weight.device, weight.dtype)), device_mesh)
+                        if device_mesh is not None:
+                            weight += DTensor.from_local(add_term, device_mesh)
+                        else:
+                            weight += add_term
                     else:
-                        weight += function(strength * comfy.model_management.cast_to_device(diff, weight.device, weight.dtype))
+                        weight += add_term
         elif patch_type == "set":
             weight.copy_(v[0])
         elif patch_type == "model_as_lora":
             target_weight: torch.Tensor = v[0]
-            diff_weight = comfy.model_management.cast_to_device(target_weight, weight.device, intermediate_dtype) - \
-                          comfy.model_management.cast_to_device(original_weights[key][0][0], weight.device, intermediate_dtype)
+            diff_weight = comfy.model_management.cast_to_device(
+                target_weight, weight.device, intermediate_dtype
+            ) - comfy.model_management.cast_to_device(original_weights[key][0][0], weight.device, intermediate_dtype)
+
+            add_term = function(strength * comfy.model_management.cast_to_device(diff_weight, weight.device, weight.dtype))
 
             if isinstance(weight, DTensor):
-                weight += DTensor.from_local(function(strength * comfy.model_management.cast_to_device(diff_weight, weight.device, weight.dtype)), device_mesh)
+                if device_mesh is not None:
+                    weight += DTensor.from_local(add_term, device_mesh)
+                else:
+                    weight += add_term
             else:
-                weight += function(strength * comfy.model_management.cast_to_device(diff_weight, weight.device, weight.dtype))
-                weight = DTensor.from_local(weight, device_mesh)
+                weight += add_term
         else:
             logging.warning("patch type not recognized {} {}".format(patch_type, key))
 

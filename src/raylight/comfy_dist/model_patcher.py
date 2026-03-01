@@ -11,26 +11,31 @@ from torch.distributed.tensor import DTensor
 
 import comfy
 from comfy.patcher_extension import CallbacksMP
-from comfy.model_patcher import (get_key_weight,
-                                 string_to_seed,
-                                 move_weight_functions)
+from comfy.model_patcher import get_key_weight, string_to_seed, move_weight_functions
 
 from raylight import comfy_dist
 from .fsdp_registry import patch_fsdp
 
+try:
+    from comfy_kitchen.tensor.base import QuantizedTensor as _CKQuantizedTensor
+except Exception:
+    _CKQuantizedTensor = ()
+
 
 class LowVramPatch:
-    def __init__(self, key, patches):
+    def __init__(self, key, patches, convert_func=None, set_func=None):
         self.key = key
         self.patches = patches
+        self.convert_func = convert_func
+        self.set_func = set_func
 
     def __call__(self, weight):
-        intermediate_dtype = weight.dtype
-        if intermediate_dtype not in [torch.float32, torch.float16, torch.bfloat16]:   # intermediate_dtype has to be one that is supported in math ops
-            intermediate_dtype = torch.float32
-            return comfy.float.stochastic_rounding(comfy.lora.calculate_weight(self.patches[self.key], weight.to(intermediate_dtype), self.key, intermediate_dtype=intermediate_dtype), weight.dtype, seed=string_to_seed(self.key))
-
-        return comfy_dist.lora.calculate_weight(self.patches[self.key], weight, self.key, intermediate_dtype=intermediate_dtype)
+        return comfy_dist.lora.calculate_weight(
+            self.patches[self.key],
+            weight,
+            self.key,
+            intermediate_dtype=weight.dtype,
+        )
 
 
 def wipe_lowvram_weight(m):
@@ -43,6 +48,35 @@ def wipe_lowvram_weight(m):
 
     if hasattr(m, "bias_function"):
         m.bias_function = []
+
+
+def _safe_free_storage(tensor: torch.Tensor) -> None:
+    if not isinstance(tensor, torch.Tensor):
+        return
+
+    try:
+        if tensor.device.type == "meta":
+            return
+    except Exception:
+        return
+
+    try:
+        _free_storage(tensor)
+    except RuntimeError as e:
+        msg = str(e)
+        if "invalid python storage" in msg:
+            return
+        if "out of bounds for storage" in msg:
+            return
+        raise
+
+
+def _is_quantized_tensor_like(tensor: torch.Tensor) -> bool:
+    if not isinstance(tensor, torch.Tensor):
+        return False
+    if _CKQuantizedTensor and isinstance(tensor, _CKQuantizedTensor):
+        return True
+    return hasattr(tensor, "_qdata") and hasattr(tensor, "_layout_cls") and hasattr(tensor, "_params")
 
 
 class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
@@ -69,6 +103,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         self.fsdp_state_dict = fsdp_state_dict
         self.device_mesh = device_mesh
         self.is_cpu_offload = is_cpu_offload
+        self._has_quantized_dtensor_shards: bool | None = None
         self.patch_fsdp = patch_fsdp.__get__(self, FSDPModelPatcher)
 
     def config_fsdp(self, rank, device_mesh):
@@ -79,34 +114,46 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
     def set_fsdp_state_dict(self, sd):
         self.fsdp_state_dict = sd
 
-    def patch_weight_to_device(self, key, device_to=None, inplace_update=False, convert_dtensor=False):
-        inplace_update = True
-        if key not in self.patches:
-            return
+    def patch_weight_to_device(self, key, device_to=None, inplace_update=False, return_weight=False, convert_dtensor=False):
         weight, set_func, convert_func = get_key_weight(self.model, key)
+        if key not in self.patches:
+            return weight
+
         inplace_update = self.weight_inplace_update or inplace_update
 
-        if key not in self.backup:
-            self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(weight.to(device=self.offload_device, copy=inplace_update), inplace_update)
+        if key not in self.backup and not return_weight:
+            self.backup[key] = collections.namedtuple("Dimension", ["weight", "inplace_update"])(
+                weight.to(device=self.offload_device, copy=inplace_update), inplace_update
+            )
 
+        temp_dtype = comfy.model_management.lora_compute_dtype(device_to)
         if device_to is not None:
-            temp_weight = comfy.model_management.cast_to_device(weight, device_to, torch.float32, copy=True)
+            temp_weight = comfy.model_management.cast_to_device(weight, device_to, temp_dtype, copy=True)
         else:
-            temp_weight = weight.to(torch.float32, copy=True)
+            temp_weight = weight.to(temp_dtype, copy=True)
         if convert_func is not None:
             temp_weight = convert_func(temp_weight, inplace=True)
 
         out_weight = comfy_dist.lora.calculate_weight(self.patches[key], temp_weight, key, device_mesh=self.device_mesh)
         if set_func is None:
-            out_weight = comfy_dist.float.stochastic_rounding(out_weight, weight.dtype, seed=string_to_seed(key), device_mesh=self.device_mesh)
+            out_weight = comfy_dist.float.stochastic_rounding(
+                out_weight, weight.dtype, seed=string_to_seed(key), device_mesh=self.device_mesh
+            )
 
+            if return_weight:
+                return out_weight
             if inplace_update:
                 comfy.utils.copy_to_param(self.model, key, out_weight)
             else:
                 comfy.utils.set_attr_param(self.model, key, out_weight)
 
         else:
-            set_func(out_weight, inplace_update=inplace_update, seed=string_to_seed(key))
+            return set_func(
+                out_weight,
+                inplace_update=inplace_update,
+                seed=string_to_seed(key),
+                return_weight=return_weight,
+            )
 
     def clone(self, *args, **kwargs):
         # Call parent clone normally (keeps init signature correct)
@@ -117,10 +164,11 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         n.fsdp_state_dict = self.fsdp_state_dict
         n.device_mesh = self.device_mesh
         n.is_cpu_offload = self.is_cpu_offload
+        n._has_quantized_dtensor_shards = self._has_quantized_dtensor_shards
 
         return n
 
-    def _load_list(self):
+    def _load_list(self, prio_comfy_cast_weights=False):
         loading = []
         for n, m in self.model.named_modules():
             params = []
@@ -132,28 +180,23 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
                     skip = True  # skip random weights in non leaf modules
                     break
             if not skip and (hasattr(m, "comfy_cast_weights") or len(params) > 0):
-                loading.append((comfy.model_management.module_size(m), n, m, params))
+                prepend = (not hasattr(m, "comfy_cast_weights"),) if prio_comfy_cast_weights else ()
+                loading.append(prepend + (comfy.model_management.module_size(m), n, m, params))
         return loading
 
     def load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False):
         with self.use_ejected():
             if not isinstance(self.model.diffusion_model, FSDPModule):
                 self.patch_fsdp()
-            else:
-                pass
             self.unpatch_hooks()
             mem_counter = 0
             patch_counter = 0
             lowvram_counter = 0
             loading = self._load_list()
 
-            load_completely = []
             loading.sort(reverse=True)
             for x in loading:
-                n = x[1]
-                m = x[2]
-                params = x[3]
-                module_mem = x[0]
+                module_mem, n, m, params = x
 
                 weight_key = "{}.weight".format(n)
                 bias_key = "{}.bias".format(n)
@@ -164,8 +207,9 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
                         if hasattr(m, "prev_comfy_cast_weights"):  # Already lowvramed
                             continue
 
-                # This single line, take my entire week, TOUCH THIS will cause 0 tensor on model output
                 cast_weight = self.force_cast_weights
+                m.comfy_force_cast_weights = self.force_cast_weights
+
                 if hasattr(m, "comfy_cast_weights"):
                     m.weight_function = []
                     m.bias_function = []
@@ -174,13 +218,15 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
                     if force_patch_weights:
                         self.patch_weight_to_device(weight_key)
                     else:
-                        m.weight_function = [LowVramPatch(weight_key, self.patches)]
+                        _, set_func, convert_func = get_key_weight(self.model, weight_key)
+                        m.weight_function = [LowVramPatch(weight_key, self.patches, convert_func, set_func)]
                         patch_counter += 1
                 if bias_key in self.patches:
                     if force_patch_weights:
                         self.patch_weight_to_device(bias_key)
                     else:
-                        m.bias_function = [LowVramPatch(bias_key, self.patches)]
+                        _, set_func, convert_func = get_key_weight(self.model, bias_key)
+                        m.bias_function = [LowVramPatch(bias_key, self.patches, convert_func, set_func)]
                         patch_counter += 1
 
                 cast_weight = True
@@ -197,29 +243,15 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
                 mem_counter += move_weight_functions(m, device_to)
 
-            load_completely.sort(reverse=True)
-            for x in load_completely:
-                n = x[1]
-                m = x[2]
-                params = x[3]
-                if hasattr(m, "comfy_patched_weights"):
-                    if m.comfy_patched_weights is True:
-                        continue
-
-                for param in params:
-                    self.patch_weight_to_device("{}.{}".format(n, param), device_to=device_to)
-
-                logging.debug("lowvram: loaded module regularly {} {}".format(n, m))
-                m.comfy_patched_weights = True
-
-            for x in load_completely:
-                x[2].to(device_to)
-
             if lowvram_counter > 0:
-                logging.info("loaded partially {} {} {}".format(lowvram_model_memory / (1024 * 1024), mem_counter / (1024 * 1024), patch_counter))
+                logging.info(
+                    "loaded partially {} {} {}".format(lowvram_model_memory / (1024 * 1024), mem_counter / (1024 * 1024), patch_counter)
+                )
                 self.model.model_lowvram = True
             else:
-                logging.info("loaded completely {} {} {}".format(lowvram_model_memory / (1024 * 1024), mem_counter / (1024 * 1024), full_load))
+                logging.info(
+                    "loaded completely {} {} {}".format(lowvram_model_memory / (1024 * 1024), mem_counter / (1024 * 1024), full_load)
+                )
                 self.model.model_lowvram = False
                 if full_load:
                     self.model.to(device_to)
@@ -228,6 +260,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
             self.model.lowvram_patch_counter += patch_counter
             self.model.device = device_to
             self.model.model_loaded_weight_memory = mem_counter
+            self.model.model_offload_buffer_memory = 0
             self.model.current_weight_patches_uuid = self.patches_uuid
 
             for callback in self.get_all_callbacks(CallbacksMP.ON_LOAD):
@@ -273,6 +306,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
                     self.model.to(device_to)
                     self.model.device = device_to
             self.model.model_loaded_weight_memory = 0
+            self.model.model_offload_buffer_memory = 0
 
             for m in self.model.modules():
                 if hasattr(m, "comfy_patched_weights"):
@@ -285,16 +319,54 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         self.object_patches_backup.clear()
 
     def __del__(self):
-        self.detach(unpatch_all=False)
-        for m in self.model.modules():
-            for p in m.parameters(recurse=False):
-                if isinstance(p, DTensor):
-                    local = p.to_local()
-                    _free_storage(local.data)
-                elif isinstance(p, torch.Tensor):
-                    _free_storage(p.data)
+        try:
+            self.detach(unpatch_all=False)
+        except Exception:
+            pass
 
-        del self.model
+        model = getattr(self, "model", None)
+        if model is not None:
+            try:
+                has_qt_hint = self._has_quantized_dtensor_shards
+                for m in model.modules():
+                    for p in m.parameters(recurse=False):
+                        try:
+                            tensor = p.data if isinstance(p, torch.Tensor) else None
+                            if tensor is None:
+                                continue
+
+                            if isinstance(tensor, DTensor):
+                                if has_qt_hint is True:
+                                    continue
+
+                                try:
+                                    local = getattr(tensor, "_local_tensor", None)
+                                    if local is None:
+                                        local = tensor.to_local()
+                                except Exception:
+                                    continue
+
+                                if has_qt_hint is None:
+                                    has_qt_hint = _is_quantized_tensor_like(local)
+                                    self._has_quantized_dtensor_shards = has_qt_hint
+
+                                if has_qt_hint is True:
+                                    continue
+                                _safe_free_storage(local.data)
+                                continue
+
+                            if _is_quantized_tensor_like(tensor):
+                                continue
+
+                            _safe_free_storage(tensor.data)
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
         self.model = None
-        comfy.model_management.soft_empty_cache()
-        gc.collect()
+        try:
+            comfy.model_management.soft_empty_cache()
+            gc.collect()
+        except Exception:
+            pass
