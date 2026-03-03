@@ -20,7 +20,7 @@ import raylight.distributed_modules.attention as xfuser_attn
 
 from raylight.distributed_modules.usp import USPInjectRegistry
 from raylight.distributed_modules.cfg import CFGParallelInjectRegistry
-from raylight.comfy_dist.kitchen_distributed import install_fp8_patches, restore_fp8_patches
+from raylight.comfy_dist.kitchen_distributed import patch_enable_comfy_kitchen_fsdp
 
 from raylight.comfy_dist.sd import (
     load_lora_for_models as ray_load_lora_for_models,
@@ -65,23 +65,13 @@ class RayWorker:
         os.environ["NCCL_DEBUG"] = "WARN"
         os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
 
-        if sys.platform.startswith("linux"):
-            dist.init_process_group(
-                "nccl",
-                rank=local_rank,
-                world_size=self.global_world_size,
-                timeout=timedelta(minutes=1),
-                # device_id=self.device
-            )
-        elif sys.platform.startswith("win"):
-            os.environ["USE_LIBUV"] = "0"
-            dist.init_process_group(
-                "gloo",
-                rank=local_rank,
-                world_size=self.global_world_size,
-                timeout=timedelta(minutes=1),
-                # device_id=self.device
-            )
+        dist.init_process_group(
+            "nccl",
+            rank=local_rank,
+            world_size=self.global_world_size,
+            timeout=timedelta(minutes=1),
+            # device_id=self.device
+        )
 
         # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
@@ -347,6 +337,7 @@ class RayWorker:
 
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
+    @patch_enable_comfy_kitchen_fsdp
     def custom_sampler(
         self,
         add_noise,
@@ -412,6 +403,7 @@ class RayWorker:
 
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
+    @patch_enable_comfy_kitchen_fsdp
     def common_ksampler(
         self,
         seed,
@@ -432,7 +424,6 @@ class RayWorker:
         latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
 
         if self.parallel_dict["is_fsdp"] is True:
-            install_fp8_patches()
             self.model.patch_fsdp()
 
         if disable_noise:
@@ -477,8 +468,6 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        restore_fp8_patches()
-
         if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
             self.model.detach()
 
@@ -495,25 +484,13 @@ class RayCOMMTester:
         device = torch.device(f"cuda:{device_id}")
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
 
-        if sys.platform.startswith("linux"):
-            dist.init_process_group(
-                "nccl",
-                rank=local_rank,
-                world_size=world_size,
-                timeout=timedelta(minutes=1),
-                # device_id=self.device
-            )
-        elif sys.platform.startswith("win"):
-            os.environ["USE_LIBUV"] = "0"
-            if local_rank == 0:
-                print("Windows detected, falling back to GLOO backend, consider using WSL, GLOO is slower than NCCL")
-            dist.init_process_group(
-                "gloo",
-                rank=local_rank,
-                world_size=world_size,
-                timeout=timedelta(minutes=1),
-                # device_id=self.device
-            )
+        dist.init_process_group(
+            "nccl",
+            rank=local_rank,
+            world_size=world_size,
+            timeout=timedelta(minutes=1),
+            # device_id=self.device
+        )
         print("Running COMM pre-run")
 
         # Each rank contributes rank+1
