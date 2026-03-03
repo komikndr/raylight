@@ -12,7 +12,7 @@ import folder_paths
 from yunchang.kernels import AttnType
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
-from comfy import sd, sample, utils # type: ignore
+from comfy import sd, sample, utils  # type: ignore
 
 from .distributed_worker.ray_worker import (
     make_ray_actor_fn,
@@ -26,6 +26,7 @@ from .distributed_worker.ray_worker import (
 def _monkey():
     from raylight.comfy_dist.supported_models_base import BASE as PatchedBASE
     import comfy.supported_models_base as supported_models_base
+
     OriginalBASE = supported_models_base.BASE
 
     if hasattr(PatchedBASE, "__getattr__"):
@@ -33,13 +34,13 @@ def _monkey():
 
 
 def _resolve_module_dir(module):
-    module_file = getattr(module, '__file__', None)
+    module_file = getattr(module, "__file__", None)
     if module_file:
         path = Path(module_file).resolve()
         if path.is_file():
             return path.parent
 
-    module_paths = getattr(module, '__path__', None)
+    module_paths = getattr(module, "__path__", None)
     if module_paths:
         for path in module_paths:
             if path:
@@ -53,63 +54,61 @@ def _resolve_module_dir(module):
 def _resolve_repo_root():
     current = Path(__file__).resolve()
     for parent in current.parents:
-        if (parent / 'main.py').exists() and (parent / 'execution.py').exists():
+        if (parent / "main.py").exists() and (parent / "execution.py").exists():
             return parent
-    raise RuntimeError('Unable to locate ComfyUI repository root')
+    raise RuntimeError("Unable to locate ComfyUI repository root")
 
 
 def _ensure_runtime_workdir(module_dir: Path) -> Path:
-    runtime_dir = module_dir.parent / '_ray_runtime_env'
+    runtime_dir = module_dir.parent / "_ray_runtime_env"
     runtime_dir.mkdir(parents=True, exist_ok=True)
     return runtime_dir
 
 
 def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir: Path):
     python_path_entries = [str(repo_root)]
-    existing = os.environ.get('PYTHONPATH')
+    existing = os.environ.get("PYTHONPATH")
     if existing:
         python_path_entries.extend(part for part in existing.split(os.pathsep) if part)
     python_path = os.pathsep.join(dict.fromkeys(python_path_entries))
 
     env_vars = {
-        'PYTHONPATH': python_path,
-        'COMFYUI_BASE_DIRECTORY': str(repo_root),
+        "PYTHONPATH": python_path,
+        "COMFYUI_BASE_DIRECTORY": str(repo_root),
     }
 
     return {
-        'py_modules': [str(module_dir)],
-        'working_dir': str(runtime_workdir),
-        'env_vars': env_vars,
+        "py_modules": [str(module_dir)],
+        "working_dir": str(runtime_workdir),
+        "env_vars": env_vars,
     }
 
 
 def _build_remote_runtime_env(module_dir: Path, repo_root: Path):
     excludes = [
-        '.git',
-        '.git/**',
-        '__pycache__',
-        '**/__pycache__',
-        '*.pyc',
+        ".git",
+        ".git/**",
+        "__pycache__",
+        "**/__pycache__",
+        "*.pyc",
     ]
 
     return {
-        'py_modules': [str(module_dir)],
-        'working_dir': str(repo_root),
-        'env_vars': {
-            'COMFYUI_BASE_DIRECTORY': '.',
+        "py_modules": [str(module_dir)],
+        "working_dir": str(repo_root),
+        "env_vars": {
+            "COMFYUI_BASE_DIRECTORY": ".",
         },
-        'excludes': excludes,
+        "excludes": excludes,
     }
 
 
 _RAYLIGHT_MODULE_PATH = _resolve_module_dir(raylight)
 _COMFY_ROOT_PATH = _resolve_repo_root()
 _RAYLIGHT_RUNTIME_WORKDIR = _ensure_runtime_workdir(_RAYLIGHT_MODULE_PATH)
-_RAY_RUNTIME_ENV_LOCAL = _build_local_runtime_env(
-    _RAYLIGHT_MODULE_PATH, _COMFY_ROOT_PATH, _RAYLIGHT_RUNTIME_WORKDIR
-)
+_RAY_RUNTIME_ENV_LOCAL = _build_local_runtime_env(_RAYLIGHT_MODULE_PATH, _COMFY_ROOT_PATH, _RAYLIGHT_RUNTIME_WORKDIR)
 _RAY_RUNTIME_ENV_REMOTE = _build_remote_runtime_env(_RAYLIGHT_MODULE_PATH, _COMFY_ROOT_PATH)
-_LOCAL_CLUSTER_ADDRESSES = {None, '', 'local', 'LOCAL'}
+_LOCAL_CLUSTER_ADDRESSES = {None, "", "local", "LOCAL"}
 
 
 class RayInitializer:
@@ -153,7 +152,7 @@ class RayInitializer:
         XFuser_attention: int,
         ray_object_store_gb: float = 2.0,
         ray_dashboard_address: str = "None",
-        torch_dist_address: str = "None"
+        torch_dist_address: str = "None",
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
@@ -179,24 +178,16 @@ class RayInitializer:
         if world_size == 0:
             raise ValueError("Num of cuda/cudalike device is 0")
         if world_size < ulysses_degree * ring_degree * cfg_degree:
-            raise ValueError(
-                f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} x {ring_degree=} x {cfg_degree=}"
-            )
+            raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} x {ring_degree=} x {cfg_degree=}")
         if cfg_degree > 2:
-            raise ValueError(
-                "CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2"
-            )
+            raise ValueError("CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2")
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
         self.parallel_dict["sync_ulysses"] = False
         self.parallel_dict["global_world_size"] = world_size
 
-        if (
-            ulysses_degree > 0
-            or ring_degree > 0
-            or cfg_degree > 0
-        ):
+        if ulysses_degree > 0 or ring_degree > 0 or cfg_degree > 0:
             if ulysses_degree * ring_degree * cfg_degree == 0:
                 raise ValueError(f"""ERROR, parallel product of {ulysses_degree=} x {ring_degree=} x {cfg_degree=} is 0.
                  Please make sure to set any parallel degree to be greater than 0,
@@ -235,13 +226,11 @@ class RayInitializer:
                 object_store_memory=ray_object_store_gb,
                 include_dashboard=enable_dashboard,
                 dashboard_host=dashboard_host,
-                dashboard_port=dashboard_port
+                dashboard_port=dashboard_port,
             )
         except Exception as e:
             ray.shutdown()
-            ray.init(
-                runtime_env=deepcopy(runtime_env_base)
-            )
+            ray.init(runtime_env=deepcopy(runtime_env_base))
             raise RuntimeError(f"Ray connection failed: {e}")
 
         ray_nccl_tester(world_size)
@@ -255,19 +244,17 @@ class RayInitializerAdvanced(RayInitializer):
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_cluster_address": ("STRING", {
-                    "default": "local",
-                    "tooltip": "Address of Ray cluster different than torch distributed address"}),
+                "ray_cluster_address": (
+                    "STRING",
+                    {"default": "local", "tooltip": "Address of Ray cluster different than torch distributed address"},
+                ),
                 "ray_cluster_namespace": ("STRING", {"default": "default"}),
-                "ray_object_store_gb": ("FLOAT", {
-                    "default": 2.0,
-                    "tooltip": "Ray global object store, default is plenty enough"}),
-                "ray_dashboard_address": ("STRING", {
-                    "default": "None",
-                    "tooltip": "Same format as torch_dist_address, you need to install ray dashboard to monitor"}),
-                "torch_dist_address": ("STRING", {
-                    "default": "127.0.0.1:29500",
-                    "tooltip": "Might need to restart ComfyUI to apply"}),
+                "ray_object_store_gb": ("FLOAT", {"default": 2.0, "tooltip": "Ray global object store, default is plenty enough"}),
+                "ray_dashboard_address": (
+                    "STRING",
+                    {"default": "None", "tooltip": "Same format as torch_dist_address, you need to install ray dashboard to monitor"},
+                ),
+                "torch_dist_address": ("STRING", {"default": "127.0.0.1:29500", "tooltip": "Might need to restart ComfyUI to apply"}),
                 "GPU": ("INT", {"default": 2}),
                 "ulysses_degree": ("INT", {"default": 2}),
                 "ring_degree": ("INT", {"default": 1}),
@@ -294,8 +281,7 @@ class RayUNETLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "unet_name": (folder_paths.get_filename_list("diffusion_models")
-                              + folder_paths.get_filename_list("checkpoints"),),
+                "unet_name": (folder_paths.get_filename_list("diffusion_models") + folder_paths.get_filename_list("checkpoints"),),
                 "weight_dtype": (
                     [
                         "default",
@@ -337,7 +323,6 @@ class RayUNETLoader:
         except:
             unet_path = folder_paths.get_full_path_or_raise("checkpoints", unet_name)
 
-
         loaded_futures = []
         patched_futures = []
 
@@ -348,11 +333,11 @@ class RayUNETLoader:
 
         if parallel_dict["is_fsdp"] is True:
             # Temporary for QT tensor loader
-            #worker0 = ray.get_actor("RayWorker:0")
-            #ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
-            #meta_model = ray.get(worker0.get_meta_model.remote())
+            # worker0 = ray.get_actor("RayWorker:0")
+            # ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
+            # meta_model = ray.get(worker0.get_meta_model.remote())
 
-            #for actor in gpu_actors:
+            # for actor in gpu_actors:
             #    if actor != worker0:
             #        loaded_futures.append(actor.set_meta_model.remote(meta_model))
 
@@ -369,9 +354,7 @@ class RayUNETLoader:
             loaded_futures = []
         else:
             for actor in gpu_actors:
-                loaded_futures.append(
-                    actor.load_unet.remote(unet_path, model_options=model_options)
-                )
+                loaded_futures.append(actor.load_unet.remote(unet_path, model_options=model_options))
             ray.get(loaded_futures)
             loaded_futures = []
 
@@ -427,6 +410,56 @@ class RayLoraLoader:
         lora = {
             "path": lora_path,
             "strength_model": strength_model,
+        }
+
+        if prev_ray_lora is not None:
+            loras_list.extend(prev_ray_lora)
+
+        loras_list.append(lora)
+        return (loras_list,)
+
+
+class RayLoraLoaderQuantized:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "lora_name": (
+                    folder_paths.get_filename_list("loras"),
+                    {"tooltip": "The name of the LoRA."},
+                ),
+                "strength_model": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": -100.0,
+                        "max": 100.0,
+                        "step": 0.01,
+                        "tooltip": "How strongly to modify the diffusion model. This value can be negative.",
+                    },
+                ),
+            },
+            "optional": {"prev_ray_lora": ("RAY_LORA", {"default": None})},
+        }
+
+    RETURN_TYPES = ("RAY_LORA",)
+    RETURN_NAMES = ("ray_lora",)
+    FUNCTION = "load_lora"
+    CATEGORY = "Raylight"
+
+    def load_lora(self, lora_name, strength_model, prev_ray_lora=None):
+        loras_list = []
+
+        if strength_model == 0.0:
+            if prev_ray_lora is not None:
+                loras_list.extend(prev_ray_lora)
+            return (loras_list,)
+
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        lora = {
+            "path": lora_path,
+            "strength_model": strength_model,
+            "mode": "quantized",
         }
 
         if prev_ray_lora is not None:
@@ -591,7 +624,6 @@ class DPKSamplerAdvanced:
         return_with_leftover_noise,
         denoise=1.0,
     ):
-
         ray_actors = ray_actors[0]
         add_noise = add_noise[0]
         steps = steps[0]
@@ -659,9 +691,7 @@ class Noise_RandomNoise:
 
     def generate_noise(self, input_latent):
         latent_image = input_latent["samples"]
-        batch_inds = (
-            input_latent["batch_index"] if "batch_index" in input_latent else None
-        )
+        batch_inds = input_latent["batch_index"] if "batch_index" in input_latent else None
         return comfy.sample.prepare_noise(latent_image, self.seed, batch_inds)
 
 
@@ -706,7 +736,10 @@ class RayVAEDecodeDistributed:
                 "ray_actors": ("RAY_ACTORS", {"tooltip": "Ray Actor to submit the model into"}),
                 "samples": ("LATENT",),
                 "vae_name": (folder_paths.get_filename_list("vae"),),
-                "tile_size": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 32},),
+                "tile_size": (
+                    "INT",
+                    {"default": 512, "min": 64, "max": 4096, "step": 32},
+                ),
                 "overlap": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 32}),
                 "temporal_size": (
                     "INT",
@@ -744,13 +777,7 @@ class RayVAEDecodeDistributed:
             ray.get(actor.ray_vae_loader.remote(vae_path))
 
         futures = [
-            actor.ray_vae_decode.remote(
-                samples,
-                tile_size,
-                overlap=64,
-                temporal_size=64,
-                temporal_overlap=8
-            )
+            actor.ray_vae_decode.remote(samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8)
             for i, actor in enumerate(gpu_actors)
         ]
 
@@ -763,10 +790,11 @@ NODE_CLASS_MAPPINGS = {
     "DPKSamplerAdvanced": DPKSamplerAdvanced,
     "RayUNETLoader": RayUNETLoader,
     "RayLoraLoader": RayLoraLoader,
+    "RayLoraLoaderQuantized": RayLoraLoaderQuantized,
     "RayInitializer": RayInitializer,
     "RayInitializerAdvanced": RayInitializerAdvanced,
     "DPNoiseList": DPNoiseList,
-    "RayVAEDecodeDistributed": RayVAEDecodeDistributed
+    "RayVAEDecodeDistributed": RayVAEDecodeDistributed,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -774,8 +802,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DPKSamplerAdvanced": "Data Parallel KSampler (Advanced)",
     "RayUNETLoader": "Load Diffusion Model (Ray)",
     "RayLoraLoader": "Load Lora Model (Ray)",
+    "RayLoraLoaderQuantized": "Load Lora Quantized (Ray)",
     "RayInitializer": "Ray Init Actor",
     "RayInitializerAdvanced": "Ray Init Actor (Advanced)",
     "DPNoiseList": "Data Parallel Noise List",
-    "RayVAEDecodeDistributed": "Distributed VAE (Ray)"
+    "RayVAEDecodeDistributed": "Distributed VAE (Ray)",
 }

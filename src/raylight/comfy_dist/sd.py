@@ -33,6 +33,43 @@ def load_lora_for_models(model, lora, strength_model):
     return new_modelpatcher
 
 
+def load_lora_for_models_quantized(model, lora, strength_model):
+    key_map = {}
+    if model is not None:
+        key_map = comfy.lora.model_lora_keys_unet(model.model, key_map)
+
+    lora = comfy.lora_convert.convert_lora(lora)
+    loaded = comfy.lora.load_lora(lora, key_map)
+
+    if model is None:
+        return None
+
+    new_modelpatcher = model.clone()
+
+    lora_only = {}
+    for key, patch_data in loaded.items():
+        if isinstance(patch_data, comfy.weight_adapter.WeightAdapterBase) and getattr(patch_data, "name", None) == "lora":
+            lora_only[key] = patch_data
+
+    bypass_patches = {}
+    for key, patch_data in lora_only.items():
+        bypass_patches[key] = [(strength_model, patch_data, 1.0, None, None)]
+
+    injections = comfy.weight_adapter.create_bypass_injections_from_patches(
+        new_modelpatcher.model,
+        bypass_patches,
+        strength=1.0,
+    )
+    new_modelpatcher.set_injections("quantized_lora_bypass", injections)
+
+    loaded_keys = set(lora_only.keys())
+    for key in loaded:
+        if key not in loaded_keys:
+            logging.warning("NOT LOADED IN QUANTIZED BYPASS MODE {}".format(key))
+
+    return new_modelpatcher
+
+
 def fsdp_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload, model_options={}):
     sd = comfy.utils.load_torch_file(unet_path)
     model, state_dict = fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options=model_options)
@@ -104,10 +141,32 @@ def decode_tiled_(self, samples, tile_x=64, tile_y=64, overlap=16):
     decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
     output = self.process_output(
         (
-            comfy_dist.utils.tiled_scale(samples, decode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device, pbar=pbar) +
-            comfy_dist.utils.tiled_scale(samples, decode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device, pbar=pbar) +
-            comfy_dist.utils.tiled_scale(samples, decode_fn, tile_x, tile_y, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device, pbar=pbar))
-        / 3.0)
+            comfy_dist.utils.tiled_scale(
+                samples,
+                decode_fn,
+                tile_x // 2,
+                tile_y * 2,
+                overlap,
+                upscale_amount=self.upscale_ratio,
+                output_device=self.output_device,
+                pbar=pbar,
+            )
+            + comfy_dist.utils.tiled_scale(
+                samples,
+                decode_fn,
+                tile_x * 2,
+                tile_y // 2,
+                overlap,
+                upscale_amount=self.upscale_ratio,
+                output_device=self.output_device,
+                pbar=pbar,
+            )
+            + comfy_dist.utils.tiled_scale(
+                samples, decode_fn, tile_x, tile_y, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device, pbar=pbar
+            )
+        )
+        / 3.0
+    )
     return output
 
 
@@ -117,14 +176,37 @@ def decode_tiled_1d(self, samples, tile_x=128, overlap=32):
     else:
         og_shape = samples.shape
         samples = samples.reshape((og_shape[0], og_shape[1] * og_shape[2], -1))
-        decode_fn = lambda a: self.first_stage_model.decode(a.reshape((-1, og_shape[1], og_shape[2], a.shape[-1])).to(self.vae_dtype).to(self.device)).float()
+        decode_fn = lambda a: self.first_stage_model.decode(
+            a.reshape((-1, og_shape[1], og_shape[2], a.shape[-1])).to(self.vae_dtype).to(self.device)
+        ).float()
 
-    return self.process_output(comfy_dist.utils.tiled_scale_multidim(samples, decode_fn, tile=(tile_x,), overlap=overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, output_device=self.output_device))
+    return self.process_output(
+        comfy_dist.utils.tiled_scale_multidim(
+            samples,
+            decode_fn,
+            tile=(tile_x,),
+            overlap=overlap,
+            upscale_amount=self.upscale_ratio,
+            out_channels=self.output_channels,
+            output_device=self.output_device,
+        )
+    )
 
 
 def decode_tiled_3d(self, samples, tile_t=999, tile_x=32, tile_y=32, overlap=(1, 8, 8)):
     decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
-    return self.process_output(comfy_dist.utils.tiled_scale_multidim(samples, decode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, index_formulas=self.upscale_index_formula, output_device=self.output_device))
+    return self.process_output(
+        comfy_dist.utils.tiled_scale_multidim(
+            samples,
+            decode_fn,
+            tile=(tile_t, tile_x, tile_y),
+            overlap=overlap,
+            upscale_amount=self.upscale_ratio,
+            out_channels=self.output_channels,
+            index_formulas=self.upscale_index_formula,
+            output_device=self.output_device,
+        )
+    )
 
 
 ##################################################
@@ -150,11 +232,11 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
         new_sd = sd
     else:
         new_sd = model_detection.convert_diffusers_mmdit(sd, "")
-        if new_sd is not None: #diffusers mmdit
+        if new_sd is not None:  # diffusers mmdit
             model_config = model_detection.model_config_from_unet(new_sd, "")
             if model_config is None:
                 return None
-        else: #diffusers unet
+        else:  # diffusers unet
             model_config = model_detection.model_config_from_diffusers_unet(sd)
             if model_config is None:
                 return None

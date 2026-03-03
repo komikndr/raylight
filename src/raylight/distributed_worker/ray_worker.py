@@ -22,7 +22,10 @@ from raylight.distributed_modules.usp import USPInjectRegistry
 from raylight.distributed_modules.cfg import CFGParallelInjectRegistry
 from raylight.comfy_dist.kitchen_distributed import install_fp8_patches, restore_fp8_patches
 
-from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
+from raylight.comfy_dist.sd import (
+    load_lora_for_models as ray_load_lora_for_models,
+    load_lora_for_models_quantized as ray_load_lora_for_models_quantized,
+)
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 from ray.exceptions import RayActorError
@@ -34,6 +37,7 @@ from ray.exceptions import RayActorError
 
 # If ray actor function being called from outside, ray.get([task in actor task]) will become sync between rank
 # If called from ray actor within. dist.barrier() become the sync.
+
 
 # Comfy cli args, does not get pass through into ray actor
 class RayWorker:
@@ -91,6 +95,7 @@ class RayWorker:
                 init_distributed_environment,
                 initialize_model_parallel,
             )
+
             xfuser_attn.set_attn_type(self.parallel_dict["attention"])
             xfuser_attn.set_sync_ulysses(self.parallel_dict["sync_ulysses"])
 
@@ -107,11 +112,9 @@ class RayWorker:
                 sequence_parallel_degree=self.cp_degree,
                 classifier_free_guidance_degree=self.cfg_degree,
                 ring_degree=self.ring_degree,
-                ulysses_degree=self.ulysses_degree
+                ulysses_degree=self.ulysses_degree,
             )
-            print(
-                f"Parallel Degree: Ulysses={self.ulysses_degree}, Ring={self.ring_degree}, CFG={self.cfg_degree}"
-            )
+            print(f"Parallel Degree: Ulysses={self.ulysses_degree}, Ring={self.ring_degree}, CFG={self.cfg_degree}")
 
     def get_meta_model(self):
         first_param_device = next(self.model.model.parameters()).device
@@ -153,10 +156,7 @@ class RayWorker:
         return self.is_model_loaded
 
     def patch_cfg(self):
-        self.model.add_wrapper(
-            pe.WrappersMP.DIFFUSION_MODEL,
-            CFGParallelInjectRegistry.inject(self.model)
-        )
+        self.model.add_wrapper(pe.WrappersMP.DIFFUSION_MODEL, CFGParallelInjectRegistry.inject(self.model))
 
     def patch_usp(self):
         self.model.add_callback(
@@ -200,7 +200,8 @@ class RayWorker:
             gc.collect()
         else:
             self.model = comfy.sd.load_diffusion_model(
-                unet_path, model_options={},
+                unet_path,
+                model_options={},
             )
 
         if self.lora_list is not None:
@@ -214,11 +215,8 @@ class RayWorker:
             raise ValueError("FSDP Sharding for GGUF is not supported")
         else:
             from raylight.comfy_dist.sd import gguf_load_diffusion_model
-            self.model = gguf_load_diffusion_model(
-                unet_path,
-                dequant_dtype=dequant_dtype,
-                patch_dtype=patch_dtype
-            )
+
+            self.model = gguf_load_diffusion_model(unet_path, dequant_dtype=dequant_dtype, patch_dtype=patch_dtype)
 
         if self.lora_list is not None:
             self.load_lora()
@@ -235,6 +233,7 @@ class RayWorker:
 
             from raylight.comfy_dist.sd import fsdp_bnb_load_diffusion_model
             from torch.distributed.fsdp import FSDPModule
+
             model_patcher.LowVramPatch = LowVramPatch
             model_management.cleanup_models_gc = cleanup_models_gc
 
@@ -250,6 +249,7 @@ class RayWorker:
             )
         else:
             from raylight.comfy_dist.sd import bnb_load_diffusion_model
+
             self.model = bnb_load_diffusion_model(
                 unet_path,
             )
@@ -262,23 +262,35 @@ class RayWorker:
     def set_lora_list(self, lora):
         self.lora_list = lora
 
-    def get_lora_list(self,):
+    def get_lora_list(
+        self,
+    ):
         return self.lora_list
 
-    def load_lora(self,):
+    def load_lora(
+        self,
+    ):
         for lora in self.lora_list:
             lora_path = lora["path"]
             strength_model = lora["strength_model"]
+            lora_mode = lora.get("mode", "default")
             lora_model = comfy.utils.load_torch_file(lora_path, safe_load=True)
 
             if self.parallel_dict["is_fsdp"] is True:
-                self.model = ray_load_lora_for_models(
-                    self.model, lora_model, strength_model
-                )
+                if lora_mode == "quantized":
+                    self.model = ray_load_lora_for_models_quantized(
+                        self.model,
+                        lora_model,
+                        strength_model,
+                    )
+                else:
+                    self.model = ray_load_lora_for_models(
+                        self.model,
+                        lora_model,
+                        strength_model,
+                    )
             else:
-                self.model = comfy.sd.load_lora_for_models(
-                    self.model, None, lora_model, strength_model, 0
-                )[0]
+                self.model = comfy.sd.load_lora_for_models(self.model, None, lora_model, strength_model, 0)[0]
             del lora_model
 
     def kill(self):
@@ -288,6 +300,7 @@ class RayWorker:
 
     def ray_vae_loader(self, vae_path):
         from ..comfy_dist.sd import decode_tiled_1d, decode_tiled_, decode_tiled_3d
+
         state_dict = {}
         if "pixel_space" in vae_path:
             state_dict["pixel_space_vae"] = torch.tensor(1.0)
@@ -306,14 +319,7 @@ class RayWorker:
         self.vae_model = vae_model
 
     @patch_ray_tqdm
-    def ray_vae_decode(
-        self,
-        samples,
-        tile_size,
-        overlap=64,
-        temporal_size=64,
-        temporal_overlap=8
-    ):
+    def ray_vae_decode(self, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8):
         if tile_size < overlap * 4:
             overlap = tile_size // 4
         if temporal_size < temporal_overlap * 2:
@@ -321,9 +327,7 @@ class RayWorker:
         temporal_compression = self.vae_model.temporal_compression_decode()
         if temporal_compression is not None:
             temporal_size = max(2, temporal_size // temporal_compression)
-            temporal_overlap = max(
-                1, min(temporal_size // 2, temporal_overlap // temporal_compression)
-            )
+            temporal_overlap = max(1, min(temporal_size // 2, temporal_overlap // temporal_compression))
         else:
             temporal_size = None
             temporal_overlap = None
@@ -339,9 +343,7 @@ class RayWorker:
             overlap_t=temporal_overlap,
         )
         if len(images.shape) == 5:
-            images = images.reshape(
-                -1, images.shape[-3], images.shape[-2], images.shape[-1]
-            )
+            images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
         return images
 
     @patch_temp_fix_ck_ops
@@ -443,9 +445,7 @@ class RayWorker:
             )
         else:
             batch_inds = latent["batch_index"] if "batch_index" in latent else None
-            noise = comfy.sample.prepare_noise(
-                latent_image, seed, batch_inds
-            )
+            noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
 
         noise_mask = None
         if "noise_mask" in latent:
@@ -526,11 +526,7 @@ class RayCOMMTester:
         expected = world_size * (world_size + 1) // 2
 
         if abs(result - expected) > 1e-3:
-            raise RuntimeError(
-                f"[Rank {local_rank}] COMM test failed: "
-                f"got {result}, expected {expected}. "
-                f"world_size may be mismatched!"
-            )
+            raise RuntimeError(f"[Rank {local_rank}] COMM test failed: got {result}, expected {expected}. world_size may be mismatched!")
         else:
             print(f"[Rank {local_rank}] COMM test passed ✅ (result={result})")
 
@@ -558,14 +554,8 @@ def ray_nccl_tester(world_size):
         actor.kill.remote()
 
 
-def make_ray_actor_fn(
-    world_size,
-    parallel_dict
-):
-    def _init_ray_actor(
-        world_size=world_size,
-        parallel_dict=parallel_dict
-    ):
+def make_ray_actor_fn(world_size, parallel_dict):
+    def _init_ray_actor(world_size=world_size, parallel_dict=parallel_dict):
         ray_actors = dict()
         gpu_actor = ray.remote(RayWorker)
         gpu_actors = []
