@@ -6,6 +6,7 @@ import gc
 
 import torch
 from torch.distributed.fsdp import FSDPModule
+from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 from torch.distributed.utils import _free_storage
 from torch.distributed.tensor import DTensor
 
@@ -14,7 +15,7 @@ from comfy.patcher_extension import CallbacksMP
 from comfy.model_patcher import get_key_weight, string_to_seed, move_weight_functions
 
 from raylight import comfy_dist
-from .fsdp_registry import patch_fsdp
+from .fsdp_utils import freeze_and_detect_qt, fully_shard_bottom_up, load_from_full_model_state_dict
 
 try:
     from comfy_kitchen.tensor.base import QuantizedTensor as _CKQuantizedTensor
@@ -77,6 +78,43 @@ def _is_quantized_tensor_like(tensor: torch.Tensor) -> bool:
     if _CKQuantizedTensor and isinstance(tensor, _CKQuantizedTensor):
         return True
     return hasattr(tensor, "_qdata") and hasattr(tensor, "_layout_cls") and hasattr(tensor, "_params")
+
+
+def patch_fsdp(self):
+    print(f"[Rank {self.rank}] Applying FSDP to {type(self.model.diffusion_model).__name__}")
+
+    if isinstance(self.model.diffusion_model, FSDPModule):
+        print("FSDP already registered, skip wrapping...")
+        return self.model
+
+    if self.fsdp_state_dict is None:
+        raise ValueError("FSDP state_dict is None. Call set_fsdp_state_dict before patch_fsdp.")
+
+    diffusion_model = self.model.diffusion_model
+    fsdp_kwargs = {"reshard_after_forward": True}
+    has_qt = freeze_and_detect_qt(diffusion_model)
+    fully_shard_bottom_up(diffusion_model, fsdp_kwargs=fsdp_kwargs, native_ignore_scale=not has_qt)
+
+    if has_qt:
+        load_from_full_model_state_dict(
+            model=diffusion_model,
+            full_sd=self.fsdp_state_dict,
+            device=torch.device(f"cuda:{self.rank}"),
+            strict=False,
+            cpu_offload=self.is_cpu_offload,
+            release_sd=False,
+        )
+    else:
+        options = StateDictOptions(
+            full_state_dict=True,
+            strict=False,
+            cpu_offload=self.is_cpu_offload,
+            broadcast_from_rank0=True,
+        )
+        set_model_state_dict(diffusion_model, self.fsdp_state_dict, options=options)
+
+    print("FSDP registered successfully.")
+    return self.model
 
 
 class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
