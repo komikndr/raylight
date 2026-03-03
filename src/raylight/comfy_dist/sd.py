@@ -9,6 +9,82 @@ from comfy import model_detection, model_management
 import comfy
 
 
+# I dont really want to implement this, 0.2s / step in Chroma TensorCoreFP8 FSDP
+# The correct way maybe custom sharded lora and then share it
+class OffsetBypassAdapter(comfy.weight_adapter.WeightAdapterBase):
+    name = "lora_offset_bypass"
+
+    def __init__(self, entries):
+        self.entries = entries
+        self.loaded_keys = set()
+        self.weights = []
+        self._warned_shapes = set()
+
+    def _warn_shape(self, base_key, offset, delta_shape, base_shape):
+        warn_key = (base_key, offset, tuple(delta_shape), tuple(base_shape))
+        if warn_key in self._warned_shapes:
+            return
+        self._warned_shapes.add(warn_key)
+        logging.warning(
+            "BYPASS OFFSET SHAPE MISMATCH key=%s offset=%s delta=%s base=%s",
+            base_key,
+            offset,
+            tuple(delta_shape),
+            tuple(base_shape),
+        )
+
+    def h(self, x: torch.Tensor, base_out: torch.Tensor) -> torch.Tensor:
+        total = torch.zeros_like(base_out)
+        out_dim = 1 if getattr(self, "is_conv", False) else base_out.ndim - 1
+
+        for item in self.entries:
+            adapter = item["adapter"]
+            offset = item["offset"]
+            strength = item["strength"]
+            base_key = item["key"]
+
+            prev_multiplier = getattr(adapter, "multiplier", 1.0)
+            adapter.multiplier = strength
+            try:
+                delta = adapter.h(x, base_out)
+            finally:
+                adapter.multiplier = prev_multiplier
+
+            if offset is None:
+                if delta.shape == base_out.shape:
+                    total = total + delta
+                else:
+                    self._warn_shape(base_key, offset, delta.shape, base_out.shape)
+                continue
+
+            if not isinstance(offset, tuple) or len(offset) != 3:
+                self._warn_shape(base_key, offset, delta.shape, base_out.shape)
+                continue
+
+            shard_dim, start, length = offset
+            if shard_dim != 0:
+                self._warn_shape(base_key, offset, delta.shape, base_out.shape)
+                continue
+
+            if out_dim >= base_out.ndim:
+                self._warn_shape(base_key, offset, delta.shape, base_out.shape)
+                continue
+
+            slicer = [slice(None)] * base_out.ndim
+            slicer[out_dim] = slice(start, start + length)
+            view = total[tuple(slicer)]
+
+            if delta.shape == view.shape:
+                view = view + delta
+                total[tuple(slicer)] = view
+            elif delta.shape == base_out.shape:
+                total = total + delta
+            else:
+                self._warn_shape(base_key, offset, delta.shape, base_out.shape)
+
+        return total
+
+
 def load_lora_for_models(model, lora, strength_model):
     key_map = {}
     if model is not None:
@@ -46,25 +122,61 @@ def load_lora_for_models_quantized(model, lora, strength_model):
 
     new_modelpatcher = model.clone()
 
-    lora_only = {}
-    for key, patch_data in loaded.items():
+    grouped_lora = {}
+    unsupported_keys = []
+    for loaded_key, patch_data in loaded.items():
+        key = loaded_key
+        offset = None
+        function = None
+        if isinstance(loaded_key, tuple):
+            key = loaded_key[0]
+            if len(loaded_key) > 1:
+                offset = loaded_key[1]
+            if len(loaded_key) > 2:
+                function = loaded_key[2]
+
+        if not isinstance(key, str):
+            continue
+
         if isinstance(patch_data, comfy.weight_adapter.WeightAdapterBase) and getattr(patch_data, "name", None) == "lora":
-            lora_only[key] = patch_data
+            if function is not None:
+                unsupported_keys.append(loaded_key)
+                continue
+            grouped_lora.setdefault(key, []).append(
+                {
+                    "adapter": patch_data,
+                    "offset": offset,
+                }
+            )
 
-    bypass_patches = {}
-    for key, patch_data in lora_only.items():
-        bypass_patches[key] = [(strength_model, patch_data, 1.0, None, None)]
+    manager = comfy.weight_adapter.BypassInjectionManager()
+    loaded_keys = set()
+    for key, entries in grouped_lora.items():
+        loaded_keys.add(key)
+        if len(entries) == 1 and entries[0]["offset"] is None:
+            manager.add_adapter(key, entries[0]["adapter"], strength=strength_model)
+            continue
 
-    injections = comfy.weight_adapter.create_bypass_injections_from_patches(
-        new_modelpatcher.model,
-        bypass_patches,
-        strength=1.0,
-    )
+        wrapper_entries = []
+        for item in entries:
+            wrapper_entries.append(
+                {
+                    "adapter": item["adapter"],
+                    "offset": item["offset"],
+                    "strength": strength_model,
+                    "key": key,
+                }
+            )
+        manager.add_adapter(key, OffsetBypassAdapter(wrapper_entries), strength=1.0)
+
+    injections = manager.create_injections(new_modelpatcher.model)
     new_modelpatcher.set_injections("quantized_lora_bypass", injections)
 
-    loaded_keys = set(lora_only.keys())
+    for key in unsupported_keys:
+        logging.warning("SKIP FUNCTIONAL LORA KEY IN QUANTIZED BYPASS MODE {}".format(key))
     for key in loaded:
-        if key not in loaded_keys:
+        normalized_key = key[0] if isinstance(key, tuple) else key
+        if normalized_key not in loaded_keys:
             logging.warning("NOT LOADED IN QUANTIZED BYPASS MODE {}".format(key))
 
     return new_modelpatcher
