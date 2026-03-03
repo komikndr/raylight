@@ -273,11 +273,10 @@ class RayWorker:
         for lora in self.lora_list:
             lora_path = lora["path"]
             strength_model = lora["strength_model"]
-            lora_mode = lora.get("mode", "default")
             lora_model = comfy.utils.load_torch_file(lora_path, safe_load=True)
 
             if self.parallel_dict["is_fsdp"] is True:
-                if lora_mode == "quantized":
+                if self.parallel_dict["is_quant"] is True:
                     self.model = ray_load_lora_for_models_quantized(
                         self.model,
                         lora_model,

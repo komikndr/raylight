@@ -111,23 +111,39 @@ _RAY_RUNTIME_ENV_REMOTE = _build_remote_runtime_env(_RAYLIGHT_MODULE_PATH, _COMF
 _LOCAL_CLUSTER_ADDRESSES = {None, "", "local", "LOCAL"}
 
 
+def _quant_metadata_checker(unet_path: str) -> bool:
+    try:
+        from safetensors import safe_open
+    except Exception:
+        return False
+
+    try:
+        with safe_open(unet_path, framework="pt", device="cpu") as f:
+            metadata = f.metadata() or {}
+            if "_quantization_metadata" in metadata:
+                return True
+            return any(key.endswith(".comfy_quant") for key in f.keys())
+    except Exception:
+        return False
+
+
 class RayInitializer:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_cluster_address": ("STRING", {"default": "local"}),
-                "ray_cluster_namespace": ("STRING", {"default": "default"}),
-                "GPU": ("INT", {"default": 2}),
-                "ulysses_degree": ("INT", {"default": 2}),
-                "ring_degree": ("INT", {"default": 1}),
-                "cfg_degree": ("INT", {"default": 1}),
-                "sync_ulysses": ("BOOLEAN", {"default": False}),
-                "FSDP": ("BOOLEAN", {"default": False}),
-                "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
+                "ray_cluster_address": ("STRING", {"default": "local", "tooltip": "Address of Ray cluster to connect to. Use local for single-machine."}),
+                "ray_cluster_namespace": ("STRING", {"default": "default", "tooltip": "Namespace for Ray cluster isolation."}),
+                "GPU": ("INT", {"default": 2, "tooltip": "Number of GPUs to use for distributed processing."}),
+                "ulysses_degree": ("INT", {"default": 2, "tooltip": "Ulysses parallelism degree. Divide GPUs across sequence dimension."}),
+                "ring_degree": ("INT", {"default": 1, "tooltip": "Ring attention parallelism degree. Divide GPUs across ring dimension."}),
+                "cfg_degree": ("INT", {"default": 1, "tooltip": "CFG parallelism degree. Divide GPUs across conditional/unconditional batches."}),
+                "sync_ulysses": ("BOOLEAN", {"default": False, "tooltip": "Could fix some VRAM spillage in some workflow when using Ring instead of Ulysses"}),
+                "FSDP": ("BOOLEAN", {"default": False, "tooltip": "Enable to shard, and split model among GPUs"}),
+                "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False, "tooltip": "Offload non active compute model into CPU"}),
                 "XFuser_attention": (
                     [member.name for member in AttnType],
-                    {"default": "TORCH_FLASH"},
+                    {"default": "TORCH_FLASH", "tooltip": "Attention backend to use in inference"},
                 ),
             }
         }
@@ -246,25 +262,24 @@ class RayInitializerAdvanced(RayInitializer):
             "required": {
                 "ray_cluster_address": (
                     "STRING",
-                    {"default": "local", "tooltip": "Address of Ray cluster different than torch distributed address"},
-                ),
-                "ray_cluster_namespace": ("STRING", {"default": "default"}),
+                    {"default": "local", "tooltip": "Address of Ray cluster to connect to. Use local for single-machine."}),
+                "ray_cluster_namespace": ("STRING", {"default": "default", "tooltip": "Namespace for Ray cluster isolation."}),
                 "ray_object_store_gb": ("FLOAT", {"default": 2.0, "tooltip": "Ray global object store, default is plenty enough"}),
                 "ray_dashboard_address": (
                     "STRING",
                     {"default": "None", "tooltip": "Same format as torch_dist_address, you need to install ray dashboard to monitor"},
                 ),
                 "torch_dist_address": ("STRING", {"default": "127.0.0.1:29500", "tooltip": "Might need to restart ComfyUI to apply"}),
-                "GPU": ("INT", {"default": 2}),
-                "ulysses_degree": ("INT", {"default": 2}),
-                "ring_degree": ("INT", {"default": 1}),
-                "cfg_degree": ("INT", {"default": 1}),
-                "sync_ulysses": ("BOOLEAN", {"default": False}),
-                "FSDP": ("BOOLEAN", {"default": False}),
-                "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
+                "GPU": ("INT", {"default": 2, "tooltip": "Number of GPUs to use for distributed processing."}),
+                "ulysses_degree": ("INT", {"default": 2, "tooltip": "Ulysses parallelism degree. Divide GPUs across sequence dimension."}),
+                "ring_degree": ("INT", {"default": 1, "tooltip": "Ring attention parallelism degree. Divide GPUs across ring dimension."}),
+                "cfg_degree": ("INT", {"default": 1, "tooltip": "CFG parallelism degree. Divide GPUs across conditional/unconditional batches."}),
+                "sync_ulysses": ("BOOLEAN", {"default": False, "tooltip": "Could fix some VRAM spillage in some workflow when using Ring instead of Ulysses"}),
+                "FSDP": ("BOOLEAN", {"default": False, "tooltip": "Enable to shard, and split model among GPUs"}),
+                "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False, "tooltip": "Offload non active compute model into CPU"}),
                 "XFuser_attention": (
                     [member.name for member in AttnType],
-                    {"default": "TORCH_FLASH"},
+                    {"default": "TORCH_FLASH", "tooltip": "Attention backend to use in inference"},
                 ),
             }
         }
@@ -331,24 +346,37 @@ class RayUNETLoader:
         ray.get(loaded_futures)
         loaded_futures = []
 
+        parallel_dict["is_quant"] = _quant_metadata_checker(unet_path)
+        for actor in gpu_actors:
+            loaded_futures.append(actor.set_parallel_dict.remote(parallel_dict))
+        ray.get(loaded_futures)
+        loaded_futures = []
+
         if parallel_dict["is_fsdp"] is True:
-            # Temporary for QT tensor loader
-            # worker0 = ray.get_actor("RayWorker:0")
-            # ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
-            # meta_model = ray.get(worker0.get_meta_model.remote())
+            if parallel_dict["is_quant"] is False:
+                worker0 = ray.get_actor("RayWorker:0")
+                ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
+                meta_model = ray.get(worker0.get_meta_model.remote())
 
-            # for actor in gpu_actors:
-            #    if actor != worker0:
-            #        loaded_futures.append(actor.set_meta_model.remote(meta_model))
+                for actor in gpu_actors:
+                    if actor != worker0:
+                        loaded_futures.append(actor.set_meta_model.remote(meta_model))
 
-            for actor in gpu_actors:
-                loaded_futures.append(actor.load_unet.remote(unet_path, model_options=model_options))
+                ray.get(loaded_futures)
+                loaded_futures = []
 
-            ray.get(loaded_futures)
-            loaded_futures = []
+                for actor in gpu_actors:
+                    loaded_futures.append(actor.set_state_dict.remote())
 
-            for actor in gpu_actors:
-                loaded_futures.append(actor.set_state_dict.remote())
+            else:
+                for actor in gpu_actors:
+                    loaded_futures.append(actor.load_unet.remote(unet_path, model_options=model_options))
+
+                ray.get(loaded_futures)
+                loaded_futures = []
+
+                for actor in gpu_actors:
+                    loaded_futures.append(actor.set_state_dict.remote())
 
             ray.get(loaded_futures)
             loaded_futures = []
@@ -410,56 +438,6 @@ class RayLoraLoader:
         lora = {
             "path": lora_path,
             "strength_model": strength_model,
-        }
-
-        if prev_ray_lora is not None:
-            loras_list.extend(prev_ray_lora)
-
-        loras_list.append(lora)
-        return (loras_list,)
-
-
-class RayLoraLoaderQuantized:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "lora_name": (
-                    folder_paths.get_filename_list("loras"),
-                    {"tooltip": "The name of the LoRA."},
-                ),
-                "strength_model": (
-                    "FLOAT",
-                    {
-                        "default": 1.0,
-                        "min": -100.0,
-                        "max": 100.0,
-                        "step": 0.01,
-                        "tooltip": "How strongly to modify the diffusion model. This value can be negative.",
-                    },
-                ),
-            },
-            "optional": {"prev_ray_lora": ("RAY_LORA", {"default": None})},
-        }
-
-    RETURN_TYPES = ("RAY_LORA",)
-    RETURN_NAMES = ("ray_lora",)
-    FUNCTION = "load_lora"
-    CATEGORY = "Raylight"
-
-    def load_lora(self, lora_name, strength_model, prev_ray_lora=None):
-        loras_list = []
-
-        if strength_model == 0.0:
-            if prev_ray_lora is not None:
-                loras_list.extend(prev_ray_lora)
-            return (loras_list,)
-
-        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
-        lora = {
-            "path": lora_path,
-            "strength_model": strength_model,
-            "mode": "quantized",
         }
 
         if prev_ray_lora is not None:
@@ -590,7 +568,7 @@ class DPKSamplerAdvanced:
                     "RAY_ACTORS",
                     {"tooltip": "Ray Actor to submit the model into"},
                 ),
-                "noise_list": ("NOISE",),
+                "noise_list": ("NOISE", {"tooltip": "List of noise seeds for each GPU in data parallel mode"}),
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
                 "latent_image": ("LATENT",),
@@ -708,6 +686,7 @@ class DPNoiseList:
                             "min": 0,
                             "max": 0xFFFFFFFFFFFFFFFF,
                             "control_after_generate": True,
+                            "tooltip": f"Noise seed for GPU {i} in data parallel mode. Different seeds vary outputs across GPUs.",
                         },
                     )
                     for i in range(8)
@@ -734,13 +713,13 @@ class RayVAEDecodeDistributed:
         return {
             "required": {
                 "ray_actors": ("RAY_ACTORS", {"tooltip": "Ray Actor to submit the model into"}),
-                "samples": ("LATENT",),
-                "vae_name": (folder_paths.get_filename_list("vae"),),
+                "samples": ("LATENT", {"tooltip": "Latent samples to decode."}),
+                "vae_name": (folder_paths.get_filename_list("vae"), {"tooltip": "Name of the VAE model to use for decoding."}),
                 "tile_size": (
                     "INT",
-                    {"default": 512, "min": 64, "max": 4096, "step": 32},
+                    {"default": 512, "min": 64, "max": 4096, "step": 32, "tooltip": "Tile size for spatial decoding. Larger tiles use more memory."},
                 ),
-                "overlap": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 32}),
+                "overlap": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 32, "tooltip": "Pixel overlap between tiles to prevent artifacts."}),
                 "temporal_size": (
                     "INT",
                     {
@@ -790,7 +769,6 @@ NODE_CLASS_MAPPINGS = {
     "DPKSamplerAdvanced": DPKSamplerAdvanced,
     "RayUNETLoader": RayUNETLoader,
     "RayLoraLoader": RayLoraLoader,
-    "RayLoraLoaderQuantized": RayLoraLoaderQuantized,
     "RayInitializer": RayInitializer,
     "RayInitializerAdvanced": RayInitializerAdvanced,
     "DPNoiseList": DPNoiseList,
@@ -802,7 +780,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DPKSamplerAdvanced": "Data Parallel KSampler (Advanced)",
     "RayUNETLoader": "Load Diffusion Model (Ray)",
     "RayLoraLoader": "Load Lora Model (Ray)",
-    "RayLoraLoaderQuantized": "Load Lora Quantized (Ray)",
     "RayInitializer": "Ray Init Actor",
     "RayInitializerAdvanced": "Ray Init Actor (Advanced)",
     "DPNoiseList": "Data Parallel Noise List",
