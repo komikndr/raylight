@@ -92,10 +92,13 @@ def patch_fsdp(self):
 
     diffusion_model = self.model.diffusion_model
     fsdp_kwargs = {"reshard_after_forward": True}
-    has_qt = freeze_and_detect_qt(diffusion_model)
-    fully_shard_bottom_up(diffusion_model, fsdp_kwargs=fsdp_kwargs, native_ignore_scale=not has_qt)
+    has_qt_runtime = freeze_and_detect_qt(diffusion_model)
+    has_comfy_quant_sd = isinstance(self.fsdp_state_dict, dict) and any(key.endswith(".comfy_quant") for key in self.fsdp_state_dict.keys())
+    use_quant_loader = has_qt_runtime or has_comfy_quant_sd
 
-    if has_qt:
+    fully_shard_bottom_up(diffusion_model, fsdp_kwargs=fsdp_kwargs, native_ignore_scale=not use_quant_loader)
+
+    if use_quant_loader:
         target_device = (
             self.load_device if isinstance(self.load_device, torch.device) else torch.device("cuda", torch.cuda.current_device())
         )
