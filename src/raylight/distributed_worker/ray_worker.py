@@ -122,6 +122,11 @@ class RayWorker:
             raise ValueError("Model being set is not meta, can cause OOM in large model")
 
     def set_state_dict(self):
+        if self.state_dict is None:
+            if self.parallel_dict.get("is_fsdp") is True and self.parallel_dict.get("is_quant") is False:
+                self.model.set_fsdp_state_dict({})
+                return
+            raise ValueError("Worker state_dict is None before set_state_dict")
         self.model.set_fsdp_state_dict(self.state_dict)
 
     def get_compute_capability(self):

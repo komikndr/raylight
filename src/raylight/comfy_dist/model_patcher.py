@@ -96,10 +96,13 @@ def patch_fsdp(self):
     fully_shard_bottom_up(diffusion_model, fsdp_kwargs=fsdp_kwargs, native_ignore_scale=not has_qt)
 
     if has_qt:
+        target_device = (
+            self.load_device if isinstance(self.load_device, torch.device) else torch.device("cuda", torch.cuda.current_device())
+        )
         load_from_full_model_state_dict(
-            model=diffusion_model,
+            model=self.model,
             full_sd=self.fsdp_state_dict,
-            device=torch.device(f"cuda:{self.rank}"),
+            device=target_device,
             strict=False,
             cpu_offload=self.is_cpu_offload,
             release_sd=False,
@@ -111,7 +114,7 @@ def patch_fsdp(self):
             cpu_offload=self.is_cpu_offload,
             broadcast_from_rank0=True,
         )
-        set_model_state_dict(diffusion_model, self.fsdp_state_dict, options=options)
+        set_model_state_dict(self.model, self.fsdp_state_dict, options=options)
 
     print("FSDP registered successfully.")
     return self.model

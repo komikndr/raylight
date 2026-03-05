@@ -116,6 +116,22 @@ def collect_scale_ignored_params(module: torch.nn.Module) -> set[torch.nn.Parame
     return ignored
 
 
+def collect_input_scale_ignored_params(module: torch.nn.Module) -> set[torch.nn.Parameter]:
+    ignored: set[torch.nn.Parameter] = set()
+    for param_name, param in module.named_parameters(recurse=True):
+        if "input_scale" in param_name:
+            ignored.add(param)
+    return ignored
+
+
+def collect_scalar_ignored_params(module: torch.nn.Module) -> set[torch.nn.Parameter]:
+    ignored: set[torch.nn.Parameter] = set()
+    for _param_name, param in module.named_parameters(recurse=True):
+        if param.ndim == 0:
+            ignored.add(param)
+    return ignored
+
+
 def fully_shard_bottom_up(
     model: torch.nn.Module,
     fsdp_kwargs: dict[str, Any],
@@ -124,10 +140,16 @@ def fully_shard_bottom_up(
     num_layers_sharded = 0
     for _name, module in collect_bottom_up_shard_order(model):
         kwargs = dict(fsdp_kwargs)
+        ignored_params: set[torch.nn.Parameter] = set()
         if native_ignore_scale:
-            ignored = collect_scale_ignored_params(module)
-            if ignored:
-                kwargs["ignored_params"] = ignored
+            ignored_params |= collect_scale_ignored_params(module)
+
+        ignored_params |= collect_input_scale_ignored_params(module)
+        ignored_params |= collect_scalar_ignored_params(module)
+
+        if ignored_params:
+            kwargs["ignored_params"] = ignored_params
+
         fully_shard(module, **kwargs)
         num_layers_sharded += 1
 
@@ -277,6 +299,20 @@ def load_from_full_model_state_dict(
     meta_sharded_sd = model.state_dict()
     sharded_sd: dict[str, torch.nn.Parameter] = {}
     for param_name, sharded_meta_param in meta_sharded_sd.items():
+        if param_name.endswith("input_scale"):
+            full_tensor = full_sd.get(param_name)
+            if full_tensor is None:
+                if strict:
+                    raise ValueError(f"Missing parameter {param_name} in state_dict")
+                continue
+            full_tensor = full_tensor.to(dtype=sharded_meta_param.dtype, device=device)
+            if cpu_offload:
+                full_tensor = full_tensor.cpu()
+            sharded_sd[param_name] = torch.nn.Parameter(full_tensor, requires_grad=sharded_meta_param.requires_grad)
+            if release_sd:
+                full_sd[param_name] = None
+            continue
+
         if _is_quant_param(param_name, full_sd, sharded_meta_param):
             quant_tensor = _build_quantized_tensor(param_name, full_sd, sharded_meta_param, device)
             if quant_tensor is None:
