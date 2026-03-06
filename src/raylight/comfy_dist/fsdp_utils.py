@@ -19,6 +19,39 @@ except Exception:  # pragma: no cover
     QUANT_ALGOS = {}
 
 
+"""
+ This stuff is for systematically fully_shard from bottom up,
+ with "*-1 parents are sharded, then continue up to root*", the def collect_bottom_up_shard_order is the function
+ the tree looks like this:
+
+model                          [FSDP]
+├── block0                     [FSDP]
+│   ├── qkv                    [FSDP, ignored_params={q.scale,k.scale,v.scale}]
+│   │   ├── q.weight           [SHARDED]
+│   │   ├── q.scale            [IGNORED]
+│   │   ├── k.weight           [SHARDED]
+│   │   ├── k.scale            [IGNORED]
+│   │   ├── v.weight           [SHARDED]
+│   │   └── v.scale            [IGNORED]
+│   ├── ffn                    [FSDP, ignored_params={scale}]
+│   │   ├── weight             [SHARDED]
+│   │   └── scale              [IGNORED]
+│   └── conv                   [FSDP, ignored_params={} ]
+│       ├── weight             [SHARDED]
+│       └── bias               [SHARDED]
+│
+├── block1                     [FSDP]
+│   ├── qkv                    [FSDP, ignored_params={q.scale,k.scale,v.scale}]
+│   ├── ffn                    [FSDP, ignored_params={scale}]
+│   └── conv                   [FSDP]
+│
+└── block2                     [FSDP]
+    ├── qkv                    [FSDP, ignored_params={q.scale,k.scale,v.scale}]
+    ├── ffn                    [FSDP, ignored_params={scale}]
+    └── conv                   [FSDP]
+"""
+
+
 def freeze_and_detect_qt(model: torch.nn.Module) -> bool:
     has_qt = False
     for param in model.parameters():
@@ -130,6 +163,58 @@ def collect_scalar_ignored_params(module: torch.nn.Module) -> set[torch.nn.Param
         if param.ndim == 0:
             ignored.add(param)
     return ignored
+
+
+def _should_materialize_unsharded_param(param_name: str, param: torch.Tensor) -> bool:
+    return param_name.endswith("input_scale") or param.ndim == 0
+
+
+def _get_parent_module_and_name(model: torch.nn.Module, param_name: str) -> tuple[torch.nn.Module, str]:
+    if "." not in param_name:
+        return model, param_name
+    parent_name, leaf_name = param_name.rsplit(".", 1)
+    return model.get_submodule(parent_name), leaf_name
+
+
+def _materialize_unsharded_param(
+    model: torch.nn.Module,
+    param_name: str,
+    meta_param: torch.Tensor,
+    full_tensor: torch.Tensor,
+    device: torch.device,
+    cpu_offload: bool,
+) -> None:
+    full_tensor = full_tensor.to(dtype=meta_param.dtype, device=device)
+    if cpu_offload:
+        full_tensor = full_tensor.cpu()
+    parent_module, leaf_name = _get_parent_module_and_name(model, param_name)
+    parent_module.register_parameter(
+        leaf_name,
+        torch.nn.Parameter(full_tensor, requires_grad=meta_param.requires_grad),
+    )
+
+
+def _materialize_missing_ignored_scalar_params(
+    model: torch.nn.Module,
+    full_sd: dict[str, Any],
+    device: torch.device,
+    strict: bool,
+    cpu_offload: bool,
+    release_sd: bool,
+) -> None:
+    for param_name, param in list(model.named_parameters()):
+        if not getattr(param, "is_meta", False):
+            continue
+        if not _should_materialize_unsharded_param(param_name, param):
+            continue
+        full_tensor = full_sd.get(param_name)
+        if full_tensor is None:
+            if strict:
+                raise ValueError(f"Missing parameter {param_name} in state_dict")
+            continue
+        _materialize_unsharded_param(model, param_name, param, full_tensor, device, cpu_offload)
+        if release_sd:
+            full_sd[param_name] = None
 
 
 def fully_shard_bottom_up(
@@ -288,6 +373,9 @@ def _release_quant_keys(full_sd: dict[str, Any], param_name: str) -> None:
             full_sd[key] = None
 
 
+# Heavily modified from
+# https://github.com/meta-pytorch/torchtune/blob/d0f63bb33d00b8bd3905a010b71d8c6324c2e980/torchtune/training/_distributed.py#L336
+# Need to be done since dcp loader cause wrong dtype among rank when broadcasting.
 def load_from_full_model_state_dict(
     model,
     full_sd,
@@ -299,16 +387,13 @@ def load_from_full_model_state_dict(
     meta_sharded_sd = model.state_dict()
     sharded_sd: dict[str, torch.nn.Parameter] = {}
     for param_name, sharded_meta_param in meta_sharded_sd.items():
-        if param_name.endswith("input_scale"):
+        if _should_materialize_unsharded_param(param_name, sharded_meta_param):
             full_tensor = full_sd.get(param_name)
             if full_tensor is None:
                 if strict:
                     raise ValueError(f"Missing parameter {param_name} in state_dict")
                 continue
-            full_tensor = full_tensor.to(dtype=sharded_meta_param.dtype, device=device)
-            if cpu_offload:
-                full_tensor = full_tensor.cpu()
-            sharded_sd[param_name] = torch.nn.Parameter(full_tensor, requires_grad=sharded_meta_param.requires_grad)
+            _materialize_unsharded_param(model, param_name, sharded_meta_param, full_tensor, device, cpu_offload)
             if release_sd:
                 full_sd[param_name] = None
             continue
@@ -351,4 +436,6 @@ def load_from_full_model_state_dict(
         sharded_sd[param_name] = torch.nn.Parameter(sharded_tensor)
         if release_sd:
             full_sd[param_name] = None
-    return model.load_state_dict(sharded_sd, strict=strict, assign=True)
+    out = model.load_state_dict(sharded_sd, strict=strict, assign=True)
+    _materialize_missing_ignored_scalar_params(model, full_sd, device, strict, cpu_offload, release_sd)
+    return out
