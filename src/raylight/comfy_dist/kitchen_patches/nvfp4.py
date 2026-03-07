@@ -15,7 +15,7 @@ _ORIG_QT_POST = _MISSING
 
 def _get_op(path: str) -> Any:
     cur = torch
-    for part in path.split('.')[1:]:
+    for part in path.split(".")[1:]:
         cur = getattr(cur, part, None)
         if cur is None:
             return None
@@ -38,6 +38,7 @@ def install_nvfp4_patches() -> None:
             if op is not None:
                 register_layout_op(op, TensorCoreNVFP4Layout)(fn)
             return fn
+
         return deco
 
     def _extract_collective_result(result):
@@ -56,7 +57,7 @@ def install_nvfp4_patches() -> None:
             return result
 
         def is_completed(self):
-            return all(getattr(work, 'is_completed', lambda: True)() for work in self._works)
+            return all(getattr(work, "is_completed", lambda: True)() for work in self._works)
 
     def _block_scale_unblocked_shape(qtensor) -> tuple[int, int]:
         storage_shape = tuple(qtensor._qdata.shape)
@@ -71,11 +72,16 @@ def install_nvfp4_patches() -> None:
     def _reblock_block_scale(scale_rows: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         return to_blocked(scale_rows.to(dtype=dtype), flatten=False)
 
+    def _dequantize_arg(arg):
+        if isinstance(arg, QuantizedTensor):
+            return arg.dequantize()
+        return arg
+
     def _scaled_rowwise_orig_shape(qtensor, new_qdata: torch.Tensor, orig_shape=None) -> tuple[int, ...]:
         if orig_shape is not None:
             return tuple(orig_shape)
         orig_shape = qtensor._params.orig_shape
-        if getattr(qtensor._params, 'transposed', False):
+        if getattr(qtensor._params, "transposed", False):
             return tuple(orig_shape)
         if len(orig_shape) != 2 or qtensor._qdata.dim() != 2 or new_qdata.dim() != 2:
             return tuple(orig_shape)
@@ -102,7 +108,7 @@ def install_nvfp4_patches() -> None:
     def _normalize_slice_args(size: int, start, end, step) -> tuple[int, int, int]:
         step = 1 if step is None else step
         if step != 1:
-            raise NotImplementedError('NVFP4 only supports slice step=1')
+            raise NotImplementedError("NVFP4 only supports slice step=1")
         start = 0 if start is None else start
         end = size if end is None else end
         if start < 0:
@@ -135,36 +141,36 @@ def install_nvfp4_patches() -> None:
         qdata = qtensor._qdata.contiguous()
         block_scale = qtensor._params.block_scale.contiguous()
         metadata = {
-            'scale': qtensor._params.scale,
-            'orig_dtype': qtensor._params.orig_dtype,
-            'orig_shape': qtensor._params.orig_shape,
-            'transposed': qtensor._params.transposed,
+            "scale": qtensor._params.scale,
+            "orig_dtype": qtensor._params.orig_dtype,
+            "orig_shape": qtensor._params.orig_shape,
+            "transposed": qtensor._params.transposed,
         }
         return (qdata, block_scale), metadata
 
     def post_all_gather(qtensor: QuantizedTensor, all_gather_outputs, metadata: Any, param_dtype: torch.dtype, *, out=None):
         gathered_qdata, gathered_block_scale = all_gather_outputs
         params = TensorCoreNVFP4Layout.Params(
-            scale=metadata['scale'],
-            orig_dtype=metadata.get('orig_dtype', param_dtype),
-            orig_shape=_scaled_rowwise_orig_shape(qtensor, gathered_qdata, metadata.get('orig_shape')),
+            scale=metadata["scale"],
+            orig_dtype=metadata.get("orig_dtype", param_dtype),
+            orig_shape=_scaled_rowwise_orig_shape(qtensor, gathered_qdata, metadata.get("orig_shape")),
             block_scale=gathered_block_scale,
-            transposed=metadata.get('transposed', False),
+            transposed=metadata.get("transposed", False),
         )
         if out is not None:
             if not isinstance(out, QuantizedTensor):
-                raise TypeError(f'Expected QuantizedTensor out, got {type(out)}')
+                raise TypeError(f"Expected QuantizedTensor out, got {type(out)}")
             out._qdata = gathered_qdata
             out._params = params
             return None
         return QuantizedTensor(gathered_qdata, qtensor._layout_cls, params), (gathered_qdata, gathered_block_scale)
 
     if _ORIG_LAYOUT_PRE is _MISSING:
-        _ORIG_LAYOUT_PRE = getattr(TensorCoreNVFP4Layout, 'pre_all_gather', _MISSING)
+        _ORIG_LAYOUT_PRE = getattr(TensorCoreNVFP4Layout, "pre_all_gather", _MISSING)
     if _ORIG_LAYOUT_POST is _MISSING:
-        _ORIG_LAYOUT_POST = getattr(TensorCoreNVFP4Layout, 'post_all_gather', _MISSING)
-    setattr(TensorCoreNVFP4Layout, 'pre_all_gather', pre_all_gather)
-    setattr(TensorCoreNVFP4Layout, 'post_all_gather', post_all_gather)
+        _ORIG_LAYOUT_POST = getattr(TensorCoreNVFP4Layout, "post_all_gather", _MISSING)
+    setattr(TensorCoreNVFP4Layout, "pre_all_gather", pre_all_gather)
+    setattr(TensorCoreNVFP4Layout, "post_all_gather", post_all_gather)
 
     def fsdp_pre_all_gather(self, mesh):
         return self.layout_cls.pre_all_gather(self, mesh)
@@ -173,32 +179,40 @@ def install_nvfp4_patches() -> None:
         return self.layout_cls.post_all_gather(self, all_gather_outputs, metadata, param_dtype, out=out)
 
     if _ORIG_QT_PRE is _MISSING:
-        _ORIG_QT_PRE = getattr(QuantizedTensor, 'fsdp_pre_all_gather', _MISSING)
+        _ORIG_QT_PRE = getattr(QuantizedTensor, "fsdp_pre_all_gather", _MISSING)
     if _ORIG_QT_POST is _MISSING:
-        _ORIG_QT_POST = getattr(QuantizedTensor, 'fsdp_post_all_gather', _MISSING)
-    setattr(QuantizedTensor, 'fsdp_pre_all_gather', fsdp_pre_all_gather)
-    setattr(QuantizedTensor, 'fsdp_post_all_gather', fsdp_post_all_gather)
+        _ORIG_QT_POST = getattr(QuantizedTensor, "fsdp_post_all_gather", _MISSING)
+    setattr(QuantizedTensor, "fsdp_pre_all_gather", fsdp_pre_all_gather)
+    setattr(QuantizedTensor, "fsdp_post_all_gather", fsdp_post_all_gather)
 
     op_all_gather_ops = tuple(
-        op for op in (
-            _get_op('torch.ops.c10d_functional.all_gather_into_tensor.default'),
-            _get_op('torch.ops._c10d_functional.all_gather_into_tensor.default'),
-        ) if op is not None
+        op
+        for op in (
+            _get_op("torch.ops.c10d_functional.all_gather_into_tensor.default"),
+            _get_op("torch.ops._c10d_functional.all_gather_into_tensor.default"),
+        )
+        if op is not None
     )
     op_wait_tensor_ops = tuple(
-        op for op in (
-            _get_op('torch.ops.c10d_functional.wait_tensor.default'),
-            _get_op('torch.ops._c10d_functional.wait_tensor.default'),
-        ) if op is not None
+        op
+        for op in (
+            _get_op("torch.ops.c10d_functional.wait_tensor.default"),
+            _get_op("torch.ops._c10d_functional.wait_tensor.default"),
+        )
+        if op is not None
     )
-    op_broadcast = _get_op('torch.ops.c10d.broadcast_.default')
-    op_scatter = _get_op('torch.ops.c10d.scatter_.default')
-    op_alias = _get_op('torch.ops.aten.alias.default')
-    op_slice = _get_op('torch.ops.aten.slice.Tensor')
-    op_split = _get_op('torch.ops.aten.split.Tensor')
-    op_split_with_sizes = _get_op('torch.ops.aten.split_with_sizes.default')
-    op_cat = _get_op('torch.ops.aten.cat.default')
-    op_new_zeros = _get_op('torch.ops.aten.new_zeros.default')
+    op_broadcast = _get_op("torch.ops.c10d.broadcast_.default")
+    op_scatter = _get_op("torch.ops.c10d.scatter_.default")
+    op_alias = _get_op("torch.ops.aten.alias.default")
+    op_view = _get_op("torch.ops.aten.view.default")
+    op_view_as = _get_op("torch.ops.aten.view_as.default")
+    op_reshape = _get_op("torch.ops.aten.reshape.default")
+    op_slice = _get_op("torch.ops.aten.slice.Tensor")
+    op_split = _get_op("torch.ops.aten.split.Tensor")
+    op_split_with_sizes = _get_op("torch.ops.aten.split_with_sizes.default")
+    op_cat = _get_op("torch.ops.aten.cat.default")
+    op_new_zeros = _get_op("torch.ops.aten.new_zeros.default")
+    op_as_strided = _get_op("torch.ops.aten.as_strided.default")
 
     def _wait_tensor_if_available(tensor: torch.Tensor) -> torch.Tensor:
         if not isinstance(tensor, torch.Tensor):
@@ -239,6 +253,7 @@ def install_nvfp4_patches() -> None:
         return _wrap_nvfp4_tensor(input_tensor, gathered_qdata, block_scale=gathered_block_scale)
 
     for _op_all_gather in op_all_gather_ops:
+
         @maybe_register(_op_all_gather)
         def handle_all_gather(qt, args, kwargs, _op=_op_all_gather):
             return _handle_all_gather_impl(_op, args, kwargs)
@@ -255,6 +270,7 @@ def install_nvfp4_patches() -> None:
         return _wrap_nvfp4_tensor(input_tensor, waited_qdata, block_scale=waited_block_scale)
 
     for _op_wait_tensor in op_wait_tensor_ops:
+
         @maybe_register(_op_wait_tensor)
         def handle_wait_tensor(qt, args, kwargs, _op=_op_wait_tensor):
             return _handle_wait_tensor_impl(_op, args, kwargs)
@@ -359,13 +375,61 @@ def install_nvfp4_patches() -> None:
             transposed=input_tensor._params.transposed,
         )
 
+    def _handle_same_shape_view(op, args, kwargs):
+        input_tensor = args[0]
+        if not isinstance(input_tensor, QuantizedTensor):
+            return op(*args, **kwargs)
+        return handle_alias(None, (input_tensor,), {})
+
+    def _contiguous_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
+        if len(shape) == 0:
+            return ()
+        stride = [1] * len(shape)
+        for idx in range(len(shape) - 2, -1, -1):
+            stride[idx] = max(1, int(shape[idx + 1])) * stride[idx + 1]
+        return tuple(stride)
+
+    @maybe_register(op_view)
+    def handle_view(qt, args, kwargs):
+        return _handle_same_shape_view(op_view, args, kwargs)
+
+    @maybe_register(op_view_as)
+    def handle_view_as(qt, args, kwargs):
+        input_tensor = args[0]
+        if not isinstance(input_tensor, QuantizedTensor):
+            return op_view_as(*args, **kwargs)
+        return handle_alias(None, (input_tensor,), {})
+
+    @maybe_register(op_reshape)
+    def handle_reshape(qt, args, kwargs):
+        return _handle_same_shape_view(op_reshape, args, kwargs)
+
+    @maybe_register(op_as_strided)
+    def handle_as_strided(qt, args, kwargs):
+        input_tensor = args[0]
+        if not isinstance(input_tensor, QuantizedTensor):
+            return op_as_strided(*args, **kwargs)
+
+        size = args[1] if len(args) > 1 else kwargs.get("size")
+        stride = args[2] if len(args) > 2 else kwargs.get("stride")
+        storage_offset = args[3] if len(args) > 3 else kwargs.get("storage_offset", 0)
+
+        requested_size = tuple(int(dim) for dim in size)
+        requested_stride = tuple(int(dim) for dim in stride)
+        orig_shape = tuple(int(dim) for dim in input_tensor._params.orig_shape)
+
+        if requested_size == orig_shape and requested_stride == _contiguous_stride(orig_shape) and int(storage_offset) == 0:
+            return handle_alias(None, (input_tensor,), {})
+
+        return op_as_strided(*[_dequantize_arg(arg) for arg in args], **kwargs)
+
     @maybe_register(op_slice)
     def handle_slice(qt, args, kwargs):
         input_tensor = args[0]
         if not isinstance(input_tensor, QuantizedTensor):
             return op_slice(*args, **kwargs)
-        if getattr(input_tensor._params, 'transposed', False):
-            return op_slice(*[ck.dequantize(arg) if isinstance(arg, QuantizedTensor) else arg for arg in args], **kwargs)
+        if getattr(input_tensor._params, "transposed", False):
+            return op_slice(*[_dequantize_arg(arg) for arg in args], **kwargs)
 
         dim = args[1] if len(args) > 1 else 0
         start = args[2] if len(args) > 2 else None
@@ -380,21 +444,21 @@ def install_nvfp4_patches() -> None:
             start, end, step = _normalize_slice_args(int(input_tensor._params.orig_shape[1]), start, end, step)
             if start == 0 and end == int(input_tensor._params.orig_shape[1]) and step == 1:
                 return handle_alias(qt, (input_tensor,), {})
-        return op_slice(*[ck.dequantize(arg) if isinstance(arg, QuantizedTensor) else arg for arg in args], **kwargs)
+        return op_slice(*[_dequantize_arg(arg) for arg in args], **kwargs)
 
     @maybe_register(op_split)
     def handle_split(qt, args, kwargs):
         input_tensor = args[0]
         if not isinstance(input_tensor, QuantizedTensor):
             return op_split(*args, **kwargs)
-        if getattr(input_tensor._params, 'transposed', False):
-            return op_split(*[ck.dequantize(arg) if isinstance(arg, QuantizedTensor) else arg for arg in args], **kwargs)
+        if getattr(input_tensor._params, "transposed", False):
+            return op_split(*[_dequantize_arg(arg) for arg in args], **kwargs)
 
         split_size = args[1]
-        dim = kwargs.get('dim', args[2] if len(args) > 2 else 0)
+        dim = kwargs.get("dim", args[2] if len(args) > 2 else 0)
         dim = dim if dim >= 0 else dim + len(input_tensor._params.orig_shape)
         if dim != 0 or not isinstance(split_size, int):
-            return op_split(*[ck.dequantize(arg) if isinstance(arg, QuantizedTensor) else arg for arg in args], **kwargs)
+            return op_split(*[_dequantize_arg(arg) for arg in args], **kwargs)
 
         logical_rows = int(input_tensor._params.orig_shape[0])
         chunks = []
@@ -408,14 +472,14 @@ def install_nvfp4_patches() -> None:
         input_tensor = args[0]
         if not isinstance(input_tensor, QuantizedTensor):
             return op_split_with_sizes(*args, **kwargs)
-        if getattr(input_tensor._params, 'transposed', False):
-            return op_split_with_sizes(*[ck.dequantize(arg) if isinstance(arg, QuantizedTensor) else arg for arg in args], **kwargs)
+        if getattr(input_tensor._params, "transposed", False):
+            return op_split_with_sizes(*[_dequantize_arg(arg) for arg in args], **kwargs)
 
         split_sizes = args[1]
-        dim = kwargs.get('dim', args[2] if len(args) > 2 else 0)
+        dim = kwargs.get("dim", args[2] if len(args) > 2 else 0)
         dim = dim if dim >= 0 else dim + len(input_tensor._params.orig_shape)
         if dim != 0:
-            return op_split_with_sizes(*[ck.dequantize(arg) if isinstance(arg, QuantizedTensor) else arg for arg in args], **kwargs)
+            return op_split_with_sizes(*[_dequantize_arg(arg) for arg in args], **kwargs)
 
         chunks = []
         start = 0
@@ -428,23 +492,25 @@ def install_nvfp4_patches() -> None:
     @maybe_register(op_cat)
     def handle_cat(qt, args, kwargs):
         tensors = args[0]
-        dim = kwargs.get('dim', args[1] if len(args) > 1 else 0)
+        dim = kwargs.get("dim", args[1] if len(args) > 1 else 0)
         if dim != 0 or not isinstance(tensors, (list, tuple)) or len(tensors) == 0:
             return op_cat(*args, **kwargs)
         for tensor in tensors:
             if not isinstance(tensor, QuantizedTensor):
                 return op_cat(*args, **kwargs)
         first = tensors[0]
-        if any(getattr(tensor._params, 'transposed', False) for tensor in tensors):
-            return op_cat(*[ck.dequantize(arg) if isinstance(arg, QuantizedTensor) else arg for arg in args], **kwargs)
+        if any(getattr(tensor._params, "transposed", False) for tensor in tensors):
+            return op_cat(*[_dequantize_arg(arg) for arg in args], **kwargs)
         if any(tensor._params.orig_shape[1] != first._params.orig_shape[1] for tensor in tensors):
-            return op_cat(*[ck.dequantize(arg) if isinstance(arg, QuantizedTensor) else arg for arg in args], **kwargs)
+            return op_cat(*[_dequantize_arg(arg) for arg in args], **kwargs)
 
         concatenated_qdata = op_cat([tensor._qdata for tensor in tensors], 0)
         block_scale_rows = [_unblock_block_scale(tensor) for tensor in tensors]
         concatenated_block_scale = _reblock_block_scale(op_cat(block_scale_rows, 0), first._params.block_scale.dtype)
         orig_rows = sum(int(tensor._params.orig_shape[0]) for tensor in tensors)
-        return _wrap_nvfp4_tensor(first, concatenated_qdata, block_scale=concatenated_block_scale, orig_shape=(orig_rows, int(first._params.orig_shape[1])))
+        return _wrap_nvfp4_tensor(
+            first, concatenated_qdata, block_scale=concatenated_block_scale, orig_shape=(orig_rows, int(first._params.orig_shape[1]))
+        )
 
     @maybe_register(op_new_zeros)
     def handle_new_zeros(qt, args, kwargs):
@@ -453,8 +519,8 @@ def install_nvfp4_patches() -> None:
             return op_new_zeros(*args, **kwargs)
         size = tuple(args[1]) if len(args) > 1 else tuple(input_tensor._params.orig_shape)
         if len(size) != 2:
-            return op_new_zeros(*[ck.dequantize(arg) if isinstance(arg, QuantizedTensor) else arg for arg in args], **kwargs)
-        device = kwargs.get('device', input_tensor._qdata.device)
+            return op_new_zeros(*[_dequantize_arg(arg) for arg in args], **kwargs)
+        device = kwargs.get("device", input_tensor._qdata.device)
         storage_shape = TensorCoreNVFP4Layout.get_storage_shape(size)
         qdata = torch.zeros(storage_shape, device=device, dtype=input_tensor._qdata.dtype)
         block_cols = TensorCoreNVFP4Layout.get_padded_shape(size)[1] // 16
@@ -473,28 +539,28 @@ def restore_nvfp4_patches() -> None:
     from comfy_kitchen.tensor.nvfp4 import TensorCoreNVFP4Layout
 
     if _ORIG_LAYOUT_PRE is _MISSING:
-        if hasattr(TensorCoreNVFP4Layout, 'pre_all_gather'):
-            delattr(TensorCoreNVFP4Layout, 'pre_all_gather')
+        if hasattr(TensorCoreNVFP4Layout, "pre_all_gather"):
+            delattr(TensorCoreNVFP4Layout, "pre_all_gather")
     else:
-        setattr(TensorCoreNVFP4Layout, 'pre_all_gather', _ORIG_LAYOUT_PRE)
+        setattr(TensorCoreNVFP4Layout, "pre_all_gather", _ORIG_LAYOUT_PRE)
 
     if _ORIG_LAYOUT_POST is _MISSING:
-        if hasattr(TensorCoreNVFP4Layout, 'post_all_gather'):
-            delattr(TensorCoreNVFP4Layout, 'post_all_gather')
+        if hasattr(TensorCoreNVFP4Layout, "post_all_gather"):
+            delattr(TensorCoreNVFP4Layout, "post_all_gather")
     else:
-        setattr(TensorCoreNVFP4Layout, 'post_all_gather', _ORIG_LAYOUT_POST)
+        setattr(TensorCoreNVFP4Layout, "post_all_gather", _ORIG_LAYOUT_POST)
 
     if _ORIG_QT_PRE is _MISSING:
-        if hasattr(QuantizedTensor, 'fsdp_pre_all_gather'):
-            delattr(QuantizedTensor, 'fsdp_pre_all_gather')
+        if hasattr(QuantizedTensor, "fsdp_pre_all_gather"):
+            delattr(QuantizedTensor, "fsdp_pre_all_gather")
     else:
-        setattr(QuantizedTensor, 'fsdp_pre_all_gather', _ORIG_QT_PRE)
+        setattr(QuantizedTensor, "fsdp_pre_all_gather", _ORIG_QT_PRE)
 
     if _ORIG_QT_POST is _MISSING:
-        if hasattr(QuantizedTensor, 'fsdp_post_all_gather'):
-            delattr(QuantizedTensor, 'fsdp_post_all_gather')
+        if hasattr(QuantizedTensor, "fsdp_post_all_gather"):
+            delattr(QuantizedTensor, "fsdp_post_all_gather")
     else:
-        setattr(QuantizedTensor, 'fsdp_post_all_gather', _ORIG_QT_POST)
+        setattr(QuantizedTensor, "fsdp_post_all_gather", _ORIG_QT_POST)
 
     _ORIG_LAYOUT_PRE = _MISSING
     _ORIG_LAYOUT_POST = _MISSING

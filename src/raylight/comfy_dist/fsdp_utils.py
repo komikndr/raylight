@@ -165,8 +165,30 @@ def collect_scalar_ignored_params(module: torch.nn.Module) -> set[torch.nn.Param
     return ignored
 
 
-def _should_materialize_unsharded_param(param_name: str, param: torch.Tensor) -> bool:
-    return param_name.endswith("input_scale") or param.ndim == 0
+def _has_odd_shard_dim(param: torch.Tensor) -> bool:
+    return param.ndim > 0 and (int(param.shape[0]) % 2) == 1
+
+
+def collect_odd_dim0_ignored_params(module: torch.nn.Module) -> set[torch.nn.Parameter]:
+    ignored: set[torch.nn.Parameter] = set()
+    for _param_name, param in module.named_parameters(recurse=True):
+        if _has_odd_shard_dim(param):
+            ignored.add(param)
+    return ignored
+
+
+def _should_materialize_unsharded_param(
+    param_name: str,
+    param: torch.Tensor,
+    full_sd: dict[str, Any] | None = None,
+) -> bool:
+    if param_name.endswith("input_scale") or param.ndim == 0:
+        return True
+    if not _has_odd_shard_dim(param):
+        return False
+    if full_sd is not None and _is_quant_param(param_name, full_sd, param):
+        return False
+    return True
 
 
 def _get_parent_module_and_name(model: torch.nn.Module, param_name: str) -> tuple[torch.nn.Module, str]:
@@ -220,7 +242,7 @@ def _materialize_unsharded_param(
     )
 
 
-def _materialize_missing_ignored_scalar_params(
+def _materialize_missing_ignored_params(
     model: torch.nn.Module,
     full_sd: dict[str, Any],
     device: torch.device,
@@ -231,7 +253,7 @@ def _materialize_missing_ignored_scalar_params(
     for param_name, param in list(model.named_parameters()):
         if not getattr(param, "is_meta", False):
             continue
-        if not _should_materialize_unsharded_param(param_name, param):
+        if not _should_materialize_unsharded_param(param_name, param, full_sd):
             continue
         full_tensor = full_sd.get(param_name)
         if full_tensor is None:
@@ -257,6 +279,7 @@ def fully_shard_bottom_up(
 
         ignored_params |= collect_input_scale_ignored_params(module)
         ignored_params |= collect_scalar_ignored_params(module)
+        ignored_params |= collect_odd_dim0_ignored_params(module)
 
         if ignored_params:
             kwargs["ignored_params"] = ignored_params
@@ -441,7 +464,7 @@ def load_from_full_model_state_dict(
     meta_sharded_sd = model.state_dict()
     sharded_sd: dict[str, torch.nn.Parameter] = {}
     for param_name, sharded_meta_param in meta_sharded_sd.items():
-        if _should_materialize_unsharded_param(param_name, sharded_meta_param):
+        if _should_materialize_unsharded_param(param_name, sharded_meta_param, full_sd):
             full_tensor = full_sd.get(param_name)
             if full_tensor is None:
                 if strict:
@@ -493,5 +516,5 @@ def load_from_full_model_state_dict(
         if release_sd:
             full_sd[param_name] = None
     out = model.load_state_dict(sharded_sd, strict=strict, assign=True)
-    _materialize_missing_ignored_scalar_params(model, full_sd, device, strict, cpu_offload, release_sd)
+    _materialize_missing_ignored_params(model, full_sd, device, strict, cpu_offload, release_sd)
     return out

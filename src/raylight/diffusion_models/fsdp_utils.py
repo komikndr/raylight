@@ -151,6 +151,34 @@ def collect_scale_ignored_params(module: torch.nn.Module) -> set[torch.nn.Parame
     return ignored
 
 
+def collect_input_scale_ignored_params(module: torch.nn.Module) -> set[torch.nn.Parameter]:
+    ignored: set[torch.nn.Parameter] = set()
+    for param_name, param in module.named_parameters(recurse=True):
+        if "input_scale" in param_name:
+            ignored.add(param)
+    return ignored
+
+
+def collect_scalar_ignored_params(module: torch.nn.Module) -> set[torch.nn.Parameter]:
+    ignored: set[torch.nn.Parameter] = set()
+    for _param_name, param in module.named_parameters(recurse=True):
+        if param.ndim == 0:
+            ignored.add(param)
+    return ignored
+
+
+def _has_odd_shard_dim(param: torch.Tensor) -> bool:
+    return param.ndim > 0 and (int(param.shape[0]) % 2) == 1
+
+
+def collect_odd_dim0_ignored_params(module: torch.nn.Module) -> set[torch.nn.Parameter]:
+    ignored: set[torch.nn.Parameter] = set()
+    for _param_name, param in module.named_parameters(recurse=True):
+        if _has_odd_shard_dim(param):
+            ignored.add(param)
+    return ignored
+
+
 def fully_shard_bottom_up(
     model: torch.nn.Module,
     fsdp_kwargs: dict[str, Any],
@@ -159,10 +187,14 @@ def fully_shard_bottom_up(
     num_layers_sharded = 0
     for _name, module in collect_bottom_up_shard_order(model):
         kwargs = dict(fsdp_kwargs)
+        ignored: set[torch.nn.Parameter] = set()
         if native_ignore_scale:
-            ignored = collect_scale_ignored_params(module)
-            if ignored:
-                kwargs["ignored_params"] = ignored
+            ignored |= collect_scale_ignored_params(module)
+        ignored |= collect_input_scale_ignored_params(module)
+        ignored |= collect_scalar_ignored_params(module)
+        ignored |= collect_odd_dim0_ignored_params(module)
+        if ignored:
+            kwargs["ignored_params"] = ignored
         fully_shard(module, **kwargs)
         num_layers_sharded += 1
 
@@ -200,9 +232,23 @@ def _shard_tensor(full_tensor: torch.Tensor, sharded_meta_param: Any, device: to
     shard_world_size = mesh.size(shard_mesh_dim)
     shard_rank = cast(torch.distributed.ProcessGroup, mesh.get_group(shard_mesh_dim)).rank()
 
-    chunk = list(torch.chunk(full_tensor, shard_world_size, dim=0))[shard_rank]
-    sharded_param = full_tensor.new_zeros(chunk.size(), device=device)
-    sharded_param[: chunk.size(0)].copy_(chunk)
+    chunk = torch.tensor_split(full_tensor, shard_world_size, dim=0)[shard_rank].to(device=device)
+
+    local_meta = getattr(sharded_meta_param, "_local_tensor", None)
+    if not isinstance(local_meta, torch.Tensor):
+        return chunk
+
+    local_shape = tuple(local_meta.shape)
+    if tuple(chunk.shape) == local_shape:
+        return chunk
+    if len(local_shape) != chunk.ndim:
+        return chunk
+    if any(local_dim < chunk_dim for local_dim, chunk_dim in zip(local_shape, chunk.shape)):
+        return chunk
+
+    sharded_param = full_tensor.new_zeros(local_shape, device=device)
+    if chunk.numel() > 0:
+        sharded_param[tuple(slice(0, dim) for dim in chunk.shape)].copy_(chunk)
     return sharded_param
 
 

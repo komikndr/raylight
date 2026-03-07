@@ -6,7 +6,8 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 
 ## UPDATE
-- Now TensorCoreNVFP4 and TensorCoreFP8 works in FSDP2, check on [CK-Distributed](https://github.com/komikndr/comfy-kitchen-distributed)
+- NVFP4 is on the way to be implemented for FSDP2
+- Now TensorCoreFP8 works in FSDP2, check on [CK-Distributed](https://github.com/komikndr/comfy-kitchen-distributed)
 - LTX-2 USP
 - Kandinsky5 model
 - Fix FSDP error cause by Ray cannot pickle None type return by `comfy.supported_models_base.BASE.__getattr__`
