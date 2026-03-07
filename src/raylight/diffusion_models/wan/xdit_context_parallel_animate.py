@@ -15,6 +15,14 @@ sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
 
 
+def _pad_and_split_for_sp(tensor, dim=1):
+    if tensor is None:
+        return None, None
+    tensor, orig_size = pad_to_world_size(tensor, dim=dim)
+    tensor = torch.chunk(tensor, get_sequence_parallel_world_size(), dim=dim)[get_sequence_parallel_rank()]
+    return tensor, orig_size
+
+
 def usp_face_block_forward(
     self,
     x: torch.Tensor,
@@ -22,7 +30,6 @@ def usp_face_block_forward(
     motion_mask: Optional[torch.Tensor] = None,
     # use_context_parallel=False,
 ) -> torch.Tensor:
-
     B, T, N, C = motion_vec.shape
     T_comp = T
 
@@ -75,8 +82,7 @@ def usp_animate_dit_forward(
     x = x.flatten(2).transpose(1, 2)
 
     # time embeddings
-    e = self.time_embedding(
-        sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype=x[0].dtype))
+    e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype=x[0].dtype))
     e = e.reshape(t.shape[0], -1, e.shape[-1])
     e0 = self.time_projection(e).unflatten(2, (6, self.dim))
 
@@ -98,19 +104,31 @@ def usp_animate_dit_forward(
         context_img_len = clip_fea.shape[-2]
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    x, orig_size = pad_to_world_size(x, dim=1)
-    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    x, orig_size = _pad_and_split_for_sp(x, dim=1)
+    freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
     for i, block in enumerate(self.blocks):
         if ("double_block", i) in blocks_replace:
+
             def block_wrap(args):
                 out = {}
-                out["img"] = block(args["img"], context=args["txt"], e=args["vec"], freqs=args["pe"], context_img_len=context_img_len, transformer_options=args["transformer_options"])
+                out["img"] = block(
+                    args["img"],
+                    context=args["txt"],
+                    e=args["vec"],
+                    freqs=args["pe"],
+                    context_img_len=context_img_len,
+                    transformer_options=args["transformer_options"],
+                )
                 return out
-            out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
+
+            out = blocks_replace[("double_block", i)](
+                {"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options},
+                {"original_block": block_wrap},
+            )
             x = out["img"]
         else:
             x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
@@ -128,7 +146,7 @@ def usp_animate_dit_forward(
     # Context Parallel
 
     if full_ref is not None:
-        x = x[:, full_ref.shape[1]:]
+        x = x[:, full_ref.shape[1] :]
 
     # unpatchify
     x = self.unpatchify(x, grid_sizes)

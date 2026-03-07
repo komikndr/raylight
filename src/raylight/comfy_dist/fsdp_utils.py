@@ -176,6 +176,31 @@ def _get_parent_module_and_name(model: torch.nn.Module, param_name: str) -> tupl
     return model.get_submodule(parent_name), leaf_name
 
 
+def _maybe_collapse_replicated_leading_dim(full_tensor: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
+    expected_shape = tuple(target_shape)
+    if tuple(full_tensor.shape) == expected_shape:
+        return full_tensor
+    if full_tensor.ndim == 0 or full_tensor.ndim != len(expected_shape):
+        return full_tensor
+    if tuple(full_tensor.shape[1:]) != expected_shape[1:]:
+        return full_tensor
+
+    actual_leading = full_tensor.shape[0]
+    expected_leading = expected_shape[0]
+    if expected_leading <= 0 or actual_leading < expected_leading or actual_leading % expected_leading != 0:
+        return full_tensor
+
+    replicas = actual_leading // expected_leading
+    if replicas <= 1:
+        return full_tensor
+
+    collapsed = full_tensor.reshape(expected_leading, replicas, *full_tensor.shape[1:])
+    canonical = collapsed[:, 0, ...]
+    if torch.equal(collapsed, canonical.unsqueeze(1).expand_as(collapsed)):
+        return canonical
+    return full_tensor
+
+
 def _materialize_unsharded_param(
     model: torch.nn.Module,
     param_name: str,
@@ -184,6 +209,7 @@ def _materialize_unsharded_param(
     device: torch.device,
     cpu_offload: bool,
 ) -> None:
+    full_tensor = _maybe_collapse_replicated_leading_dim(full_tensor, meta_param.shape)
     full_tensor = full_tensor.to(dtype=meta_param.dtype, device=device)
     if cpu_offload:
         full_tensor = full_tensor.cpu()
@@ -272,9 +298,23 @@ def _shard_tensor(full_tensor: torch.Tensor, sharded_meta_param: Any, device: to
     shard_world_size = mesh.size(shard_mesh_dim)
     shard_rank = cast(torch.distributed.ProcessGroup, mesh.get_group(shard_mesh_dim)).rank()
 
-    chunk = list(torch.chunk(full_tensor, shard_world_size, dim=0))[shard_rank]
-    sharded_param = full_tensor.new_zeros(chunk.size(), device=device)
-    sharded_param[: chunk.size(0)].copy_(chunk)
+    chunk = torch.tensor_split(full_tensor, shard_world_size, dim=0)[shard_rank].to(device=device)
+
+    local_meta = getattr(sharded_meta_param, "_local_tensor", None)
+    if not isinstance(local_meta, torch.Tensor):
+        return chunk
+
+    local_shape = tuple(local_meta.shape)
+    if tuple(chunk.shape) == local_shape:
+        return chunk
+    if len(local_shape) != chunk.ndim:
+        return chunk
+    if any(local_dim < chunk_dim for local_dim, chunk_dim in zip(local_shape, chunk.shape)):
+        return chunk
+
+    sharded_param = full_tensor.new_zeros(local_shape, device=device)
+    if chunk.numel() > 0:
+        sharded_param[tuple(slice(0, dim) for dim in chunk.shape)].copy_(chunk)
     return sharded_param
 
 
@@ -435,6 +475,8 @@ def load_from_full_model_state_dict(
             if strict:
                 raise ValueError(f"Missing parameter {param_name} in state_dict")
             continue
+        if not hasattr(sharded_meta_param, "device_mesh"):
+            full_tensor = _maybe_collapse_replicated_leading_dim(full_tensor, sharded_meta_param.shape)
         full_tensor = full_tensor.to(sharded_meta_param.dtype).to(device)
         if hasattr(sharded_meta_param, "device_mesh"):
             local_dense = _shard_tensor(full_tensor, sharded_meta_param, device)

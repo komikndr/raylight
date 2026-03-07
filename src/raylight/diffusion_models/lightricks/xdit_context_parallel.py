@@ -8,6 +8,7 @@ import raylight.distributed_modules.attention as xfuser_attn
 import comfy
 from comfy.ldm.lightricks.model import apply_rotary_emb
 from ..utils import pad_to_world_size
+
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
@@ -42,7 +43,7 @@ def pad_group_to_world_size(group, dim):
 def pad_and_split_pe(pe, dim, sp_world_size, sp_rank):
     out = []
 
-    for group in pe:              # pe[i]
+    for group in pe:  # pe[i]
         new_group = []
 
         for cos, sin, flag in group:  # pe[i][j]
@@ -66,10 +67,7 @@ def sp_chunk_group(group, sp_world_size, sp_rank, dim):
         return torch.chunk(group, sp_world_size, dim=dim)[sp_rank]
 
     elif isinstance(group, (list, tuple)):
-        return type(group)(
-            torch.chunk(g, sp_world_size, dim=dim)[sp_rank]
-            for g in group
-        )
+        return type(group)(torch.chunk(g, sp_world_size, dim=dim)[sp_rank] for g in group)
     else:
         return group
 
@@ -92,16 +90,7 @@ def sp_gather_group(group, orig_sizes, dim):
 
 
 def usp_dit_forward(
-    self,
-    x,
-    timestep,
-    context,
-    attention_mask,
-    frame_rate=25,
-    transformer_options={},
-    keyframe_idxs=None,
-    denoise_mask=None,
-    **kwargs
+    self, x, timestep, context, attention_mask, frame_rate=25, transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs
 ):
     """
     Internal forward pass for LTX models.
@@ -133,7 +122,19 @@ def usp_dit_forward(
     merged_args.update(additional_args)
 
     # Prepare timestep and context
-    timestep, embedded_timestep = self._prepare_timestep(timestep, batch_size, input_dtype, **merged_args)
+    timestep_prep = self._prepare_timestep(timestep, batch_size, input_dtype, **merged_args)
+    if not isinstance(timestep_prep, (list, tuple)):
+        raise TypeError(f"Unexpected _prepare_timestep return type: {type(timestep_prep)!r}")
+
+    if len(timestep_prep) == 3:
+        timestep, embedded_timestep, prompt_timestep = timestep_prep
+        if prompt_timestep is not None:
+            merged_args["prompt_timestep"] = prompt_timestep
+    elif len(timestep_prep) == 2:
+        timestep, embedded_timestep = timestep_prep
+    else:
+        raise ValueError(f"Unexpected _prepare_timestep return length: {len(timestep_prep)}")
+
     context, attention_mask = self._prepare_context(context, batch_size, x, attention_mask)
 
     # Prepare attention mask and positional embeddings
@@ -149,9 +150,7 @@ def usp_dit_forward(
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     # Process transformer blocks
-    x = self._process_transformer_blocks(
-        x, context, attention_mask, timestep, pe, transformer_options=transformer_options, **merged_args
-    )
+    x = self._process_transformer_blocks(x, context, attention_mask, timestep, pe, transformer_options=transformer_options, **merged_args)
 
     x = sp_gather_group(x, x_orig, dim=1)
 
@@ -160,15 +159,7 @@ def usp_dit_forward(
     return x
 
 
-def usp_cross_attn_forward(
-        self,
-        x,
-        context=None,
-        mask=None,
-        pe=None,
-        k_pe=None,
-        transformer_options={}
-):
+def usp_cross_attn_forward(self, x, context=None, mask=None, pe=None, k_pe=None, transformer_options={}):
     q = self.to_q(x)
     context = x if context is None else context
     k = self.to_k(context)
@@ -181,6 +172,5 @@ def usp_cross_attn_forward(
         q = apply_rotary_emb(q, pe)
         k = apply_rotary_emb(k, pe if k_pe is None else k_pe)
 
-    out = xfuser_optimized_attention(q, k, v, self.heads)
     out = xfuser_optimized_attention(q, k, v, self.heads)
     return self.to_out(out)

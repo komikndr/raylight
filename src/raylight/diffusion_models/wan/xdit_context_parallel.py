@@ -8,9 +8,18 @@ import raylight.distributed_modules.attention as xfuser_attn
 import comfy
 from comfy.ldm.flux.math import apply_rope1
 from ..utils import pad_to_world_size
+
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
+
+
+def _pad_and_split_for_sp(tensor, dim=1):
+    if tensor is None:
+        return None, None
+    tensor, orig_size = pad_to_world_size(tensor, dim=dim)
+    tensor = torch.chunk(tensor, get_sequence_parallel_world_size(), dim=dim)[get_sequence_parallel_rank()]
+    return tensor, orig_size
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -38,21 +47,18 @@ def usp_dit_forward(
 ):
     x = self.patch_embedding(x.float()).to(x.dtype)
     grid_sizes = x.shape[2:]
+    transformer_options["grid_sizes"] = grid_sizes
     x = x.flatten(2).transpose(1, 2)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     sp_world = get_sequence_parallel_world_size()
     sp_rank = get_sequence_parallel_rank()
 
-    x, orig_size = pad_to_world_size(x, dim=1)
-    freqs, _ = pad_to_world_size(freqs, dim=1)
-
-    x = torch.chunk(x, sp_world, dim=1)[sp_rank]
-    freqs = torch.chunk(freqs, sp_world, dim=1)[sp_rank]
+    x, orig_size = _pad_and_split_for_sp(x, dim=1)
+    freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     # time embeddings
-    e = self.time_embedding(
-        sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype=x[0].dtype))
+    e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype=x[0].dtype))
     e = e.reshape(t.shape[0], -1, e.shape[-1])
     e0 = self.time_projection(e).unflatten(2, (6, self.dim))
 
@@ -80,11 +86,23 @@ def usp_dit_forward(
     for i, block in enumerate(self.blocks):
         transformer_options["block_index"] = i
         if ("double_block", i) in blocks_replace:
+
             def block_wrap(args):
                 out = {}
-                out["img"] = block(args["img"], context=args["txt"], e=args["vec"], freqs=args["pe"], context_img_len=context_img_len, transformer_options=args["transformer_options"])
+                out["img"] = block(
+                    args["img"],
+                    context=args["txt"],
+                    e=args["vec"],
+                    freqs=args["pe"],
+                    context_img_len=context_img_len,
+                    transformer_options=args["transformer_options"],
+                )
                 return out
-            out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
+
+            out = blocks_replace[("double_block", i)](
+                {"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options},
+                {"original_block": block_wrap},
+            )
             x = out["img"]
         else:
             x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
@@ -98,7 +116,7 @@ def usp_dit_forward(
 
     x = self.head(x, e)
     if full_ref is not None:
-        x = x[:, full_ref.shape[1]:]
+        x = x[:, full_ref.shape[1] :]
 
     # unpatchify
     x = self.unpatchify(x, grid_sizes)
@@ -120,11 +138,11 @@ def usp_vace_dit_forward(
     # embeddings
     x = self.patch_embedding(x.float()).to(x.dtype)
     grid_sizes = x.shape[2:]
+    transformer_options["grid_sizes"] = grid_sizes
     x = x.flatten(2).transpose(1, 2)
 
     # time embeddings
-    e = self.time_embedding(
-        sinusoidal_embedding_1d(self.freq_dim, t).to(dtype=x[0].dtype))
+    e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).to(dtype=x[0].dtype))
     e0 = self.time_projection(e).unflatten(1, (6, self.dim))
 
     # context
@@ -144,8 +162,9 @@ def usp_vace_dit_forward(
     c = list(c.split(orig_shape[0], dim=0))
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    x, orig_size = pad_to_world_size(x, dim=1)
-    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    x, orig_size = _pad_and_split_for_sp(x, dim=1)
+    freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
+    c = [_pad_and_split_for_sp(item, dim=1)[0] for item in c]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     x_orig = x
 
@@ -155,11 +174,23 @@ def usp_vace_dit_forward(
     transformer_options["block_type"] = "double"
     for i, block in enumerate(self.blocks):
         if ("double_block", i) in blocks_replace:
+
             def block_wrap(args):
                 out = {}
-                out["img"] = block(args["img"], context=args["txt"], e=args["vec"], freqs=args["pe"], context_img_len=context_img_len, transformer_options=args["transformer_options"])
+                out["img"] = block(
+                    args["img"],
+                    context=args["txt"],
+                    e=args["vec"],
+                    freqs=args["pe"],
+                    context_img_len=context_img_len,
+                    transformer_options=args["transformer_options"],
+                )
                 return out
-            out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
+
+            out = blocks_replace[("double_block", i)](
+                {"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options},
+                {"original_block": block_wrap},
+            )
             x = out["img"]
         else:
             x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
@@ -167,7 +198,15 @@ def usp_vace_dit_forward(
         ii = self.vace_layers_mapping.get(i, None)
         if ii is not None:
             for iii in range(len(c)):
-                c_skip, c[iii] = self.vace_blocks[ii](c[iii], x=x_orig, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
+                c_skip, c[iii] = self.vace_blocks[ii](
+                    c[iii],
+                    x=x_orig,
+                    e=e0,
+                    freqs=freqs,
+                    context=context,
+                    context_img_len=context_img_len,
+                    transformer_options=transformer_options,
+                )
                 x += c_skip * vace_strength[iii]
             del c_skip
 
@@ -201,8 +240,7 @@ def usp_camera_dit_forward(
     x = x.flatten(2).transpose(1, 2)
 
     # time embeddings
-    e = self.time_embedding(
-        sinusoidal_embedding_1d(self.freq_dim, t).to(dtype=x[0].dtype))
+    e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).to(dtype=x[0].dtype))
     e0 = self.time_projection(e).unflatten(1, (6, self.dim))
 
     # context
@@ -216,8 +254,8 @@ def usp_camera_dit_forward(
         context_img_len = clip_fea.shape[-2]
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    x, orig_size = pad_to_world_size(x, dim=1)
-    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    x, orig_size = _pad_and_split_for_sp(x, dim=1)
+    freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     patches_replace = transformer_options.get("patches_replace", {})
@@ -227,11 +265,23 @@ def usp_camera_dit_forward(
     for i, block in enumerate(self.blocks):
         transformer_options["block_index"] = i
         if ("double_block", i) in blocks_replace:
+
             def block_wrap(args):
                 out = {}
-                out["img"] = block(args["img"], context=args["txt"], e=args["vec"], freqs=args["pe"], context_img_len=context_img_len, transformer_options=args["transformer_options"])
+                out["img"] = block(
+                    args["img"],
+                    context=args["txt"],
+                    e=args["vec"],
+                    freqs=args["pe"],
+                    context_img_len=context_img_len,
+                    transformer_options=args["transformer_options"],
+                )
                 return out
-            out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
+
+            out = blocks_replace[("double_block", i)](
+                {"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options},
+                {"original_block": block_wrap},
+            )
             x = out["img"]
         else:
             x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
@@ -268,15 +318,16 @@ def usp_humo_dit_forward(
     x = x.flatten(2).transpose(1, 2)
 
     # time embeddings
-    e = self.time_embedding(
-        sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype=x[0].dtype))
+    e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype=x[0].dtype))
     e = e.reshape(t.shape[0], -1, e.shape[-1])
     e0 = self.time_projection(e).unflatten(2, (6, self.dim))
 
     if reference_latent is not None:
         ref = self.patch_embedding(reference_latent.float()).to(x.dtype)
         ref = ref.flatten(2).transpose(1, 2)
-        freqs_ref = self.rope_encode(reference_latent.shape[-3], reference_latent.shape[-2], reference_latent.shape[-1], t_start=time, device=x.device, dtype=x.dtype)
+        freqs_ref = self.rope_encode(
+            reference_latent.shape[-3], reference_latent.shape[-2], reference_latent.shape[-1], t_start=time, device=x.device, dtype=x.dtype
+        )
         x = torch.cat([x, ref], dim=1)
         freqs = torch.cat([freqs, freqs_ref], dim=1)
         del ref, freqs_ref
@@ -287,15 +338,17 @@ def usp_humo_dit_forward(
 
     if audio_embed is not None:
         if reference_latent is not None:
-            zero_audio_pad = torch.zeros(audio_embed.shape[0], reference_latent.shape[-3], *audio_embed.shape[2:], device=audio_embed.device, dtype=audio_embed.dtype)
+            zero_audio_pad = torch.zeros(
+                audio_embed.shape[0], reference_latent.shape[-3], *audio_embed.shape[2:], device=audio_embed.device, dtype=audio_embed.dtype
+            )
             audio_embed = torch.cat([audio_embed, zero_audio_pad], dim=1)
         audio = self.audio_proj(audio_embed).permute(0, 3, 1, 2).flatten(2).transpose(1, 2)
     else:
         audio = None
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    x, orig_size = pad_to_world_size(x, dim=1)
-    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    x, orig_size = _pad_and_split_for_sp(x, dim=1)
+    freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     patches_replace = transformer_options.get("patches_replace", {})
@@ -305,14 +358,29 @@ def usp_humo_dit_forward(
     for i, block in enumerate(self.blocks):
         transformer_options["block_index"] = i
         if ("double_block", i) in blocks_replace:
+
             def block_wrap(args):
                 out = {}
-                out["img"] = block(args["img"], context=args["txt"], e=args["vec"], freqs=args["pe"], context_img_len=context_img_len, audio=audio, transformer_options=args["transformer_options"])
+                out["img"] = block(
+                    args["img"],
+                    context=args["txt"],
+                    e=args["vec"],
+                    freqs=args["pe"],
+                    context_img_len=context_img_len,
+                    audio=audio,
+                    transformer_options=args["transformer_options"],
+                )
                 return out
-            out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
+
+            out = blocks_replace[("double_block", i)](
+                {"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options},
+                {"original_block": block_wrap},
+            )
             x = out["img"]
         else:
-            x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, audio=audio, transformer_options=transformer_options)
+            x = block(
+                x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, audio=audio, transformer_options=transformer_options
+            )
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     x = get_sp_group().all_gather(x, dim=1)
@@ -358,13 +426,22 @@ def usp_s2v_dit_forward(
     x = x.flatten(2).transpose(1, 2)
     seq_len = x.size(1)
 
-    cond_mask_weight = comfy.model_management.cast_to(self.trainable_cond_mask.weight, dtype=x.dtype, device=x.device).unsqueeze(1).unsqueeze(1)
+    cond_mask_weight = (
+        comfy.model_management.cast_to(self.trainable_cond_mask.weight, dtype=x.dtype, device=x.device).unsqueeze(1).unsqueeze(1)
+    )
     x = x + cond_mask_weight[0]
 
     if reference_latent is not None:
         ref = self.patch_embedding(reference_latent.float()).to(x.dtype)
         ref = ref.flatten(2).transpose(1, 2)
-        freqs_ref = self.rope_encode(reference_latent.shape[-3], reference_latent.shape[-2], reference_latent.shape[-1], t_start=max(30, time + 9), device=x.device, dtype=x.dtype)
+        freqs_ref = self.rope_encode(
+            reference_latent.shape[-3],
+            reference_latent.shape[-2],
+            reference_latent.shape[-1],
+            t_start=max(30, time + 9),
+            device=x.device,
+            dtype=x.dtype,
+        )
         ref = ref + cond_mask_weight[1]
         x = torch.cat([x, ref], dim=1)
         freqs = torch.cat([freqs, freqs_ref], dim=1)
@@ -382,8 +459,7 @@ def usp_s2v_dit_forward(
         del motion_encoded, freqs_motion
 
     # time embeddings
-    e = self.time_embedding(
-        sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype=x[0].dtype))
+    e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype=x[0].dtype))
     e = e.reshape(t.shape[0], -1, e.shape[-1])
     e0 = self.time_projection(e).unflatten(2, (6, self.dim))
 
@@ -391,8 +467,8 @@ def usp_s2v_dit_forward(
     context = self.text_embedding(context)
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    x, orig_size = pad_to_world_size(x, dim=1)
-    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    x, orig_size = _pad_and_split_for_sp(x, dim=1)
+    freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
@@ -401,11 +477,18 @@ def usp_s2v_dit_forward(
     for i, block in enumerate(self.blocks):
         transformer_options["block_index"] = i
         if ("double_block", i) in blocks_replace:
+
             def block_wrap(args):
                 out = {}
-                out["img"] = block(args["img"], context=args["txt"], e=args["vec"], freqs=args["pe"], transformer_options=args["transformer_options"])
+                out["img"] = block(
+                    args["img"], context=args["txt"], e=args["vec"], freqs=args["pe"], transformer_options=args["transformer_options"]
+                )
                 return out
-            out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
+
+            out = blocks_replace[("double_block", i)](
+                {"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options},
+                {"original_block": block_wrap},
+            )
             x = out["img"]
         else:
             x = block(x, e=e0, freqs=freqs, context=context, transformer_options=transformer_options)
@@ -512,10 +595,11 @@ def usp_t2v_cross_attn_gather_forward(self, x, context, transformer_options={}, 
     # Handle video spatial structure
     q = q.reshape(k.shape[0], -1, n, d).transpose(1, 2)
 
-    x = xfuser_optimized_attention(q, k, v, heads=self.num_heads, skip_reshape=True, skip_output_reshape=True, transformer_options=transformer_options)
+    x = xfuser_optimized_attention(
+        q, k, v, heads=self.num_heads, skip_reshape=True, skip_output_reshape=True, transformer_options=transformer_options
+    )
 
     x = x.transpose(1, 2).reshape(b, -1, n * d)
     x = x.flatten(2)
     x = self.o(x)
     return x
-

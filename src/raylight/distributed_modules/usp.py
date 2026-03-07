@@ -16,9 +16,11 @@ class USPInjectRegistry:
             @USPInjectRegistry.register(model_base.Chroma)
             def _inject_chroma(model): ...
         """
+
         def decorator(inject_func):
             cls._REGISTRY[model_class] = inject_func
             return inject_func
+
         return decorator
 
     @classmethod
@@ -31,13 +33,50 @@ class USPInjectRegistry:
         raise ValueError(f"Model: {type(base_model).__name__} is not yet supported for USP Parallelism")
 
 
+def _patch_wan_attention_blocks(
+    model, usp_self_attn_forward, usp_t2v_cross_attn_forward, usp_i2v_cross_attn_forward=None, include_vace_blocks=False
+):
+    from comfy.ldm.wan.model import WanI2VCrossAttention, WanT2VCrossAttention
+
+    block_groups = [getattr(model, "blocks", [])]
+    if include_vace_blocks and hasattr(model, "vace_blocks"):
+        block_groups.append(model.vace_blocks)
+
+    for blocks in block_groups:
+        for block in blocks:
+            if hasattr(block, "self_attn"):
+                block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
+            if not hasattr(block, "cross_attn"):
+                continue
+            if isinstance(block.cross_attn, WanT2VCrossAttention):
+                block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
+            elif usp_i2v_cross_attn_forward is not None and isinstance(block.cross_attn, WanI2VCrossAttention):
+                block.cross_attn.forward = types.MethodType(usp_i2v_cross_attn_forward, block.cross_attn)
+
+
 if hasattr(model_base, "WAN21_Vace"):
+
     @USPInjectRegistry.register(model_base.WAN21_Vace)
     def _inject_wan21_vace(model_patcher, base_model, *args):
-        pass
+        from ..diffusion_models.wan.xdit_context_parallel import (
+            usp_dit_forward,
+            usp_self_attn_forward,
+            usp_t2v_cross_attn_forward,
+            usp_vace_dit_forward,
+        )
+
+        model = base_model.diffusion_model
+        _patch_wan_attention_blocks(
+            model,
+            usp_self_attn_forward,
+            usp_t2v_cross_attn_forward,
+            include_vace_blocks=True,
+        )
+        model.forward_orig = types.MethodType(usp_vace_dit_forward, model)
 
 
 if hasattr(model_base, "WAN21_Camera"):
+
     @USPInjectRegistry.register(model_base.WAN21_Camera)
     def _inject_wan21_camera(model_patcher, base_model, *args):
         from ..diffusion_models.wan.xdit_context_parallel import (
@@ -45,6 +84,7 @@ if hasattr(model_base, "WAN21_Camera"):
             usp_self_attn_forward,
             usp_t2v_cross_attn_forward,
         )
+
         model = base_model.diffusion_model
         for block in model.blocks:
             block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
@@ -53,23 +93,27 @@ if hasattr(model_base, "WAN21_Camera"):
 
 
 if hasattr(model_base, "WAN21_HuMo"):
+
     @USPInjectRegistry.register(model_base.WAN21_HuMo)
     def _inject_wan21_humo(model_patcher, base_model, *args):
         from ..diffusion_models.wan.xdit_context_parallel import (
             usp_humo_dit_forward,
             usp_self_attn_forward,
             usp_t2v_cross_attn_forward,
-            usp_t2v_cross_attn_gather_forward
+            usp_t2v_cross_attn_gather_forward,
         )
+
         model = base_model.diffusion_model
-        model.wan_attn_block_class.audio_cross_attn.forward = type.MethodType(usp_t2v_cross_attn_gather_forward, model.wan_attn_block_class.audio_cross_attn)
+        _patch_wan_attention_blocks(model, usp_self_attn_forward, usp_t2v_cross_attn_forward)
         for block in model.blocks:
-            block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
-            block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
+            audio_cross_attn = getattr(getattr(block, "audio_cross_attn_wrapper", None), "audio_cross_attn", None)
+            if audio_cross_attn is not None:
+                audio_cross_attn.forward = types.MethodType(usp_t2v_cross_attn_gather_forward, audio_cross_attn)
         model.forward_orig = types.MethodType(usp_humo_dit_forward, model)
 
 
 if hasattr(model_base, "WAN22_Animate"):
+
     @USPInjectRegistry.register(model_base.WAN22_Animate)
     def _inject_wan22_animate(model_patcher, base_model, *args):
         from ..diffusion_models.wan.xdit_context_parallel_animate import (
@@ -80,6 +124,7 @@ if hasattr(model_base, "WAN22_Animate"):
             usp_self_attn_forward,
             usp_t2v_cross_attn_forward,
         )
+
         model = base_model.diffusion_model
         for block in model.blocks:
             block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
@@ -90,6 +135,7 @@ if hasattr(model_base, "WAN22_Animate"):
 
 
 if hasattr(model_base, "WAN22_S2V"):
+
     @USPInjectRegistry.register(model_base.WAN22_S2V)
     def _inject_wan22_s2v(model_patcher, base_model, *args):
         from ..diffusion_models.wan.xdit_context_parallel import (
@@ -97,6 +143,7 @@ if hasattr(model_base, "WAN22_S2V"):
             usp_self_attn_forward,
             usp_t2v_cross_attn_forward,
         )
+
         model = base_model.diffusion_model
         for block in model.blocks:
             block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
@@ -105,36 +152,29 @@ if hasattr(model_base, "WAN22_S2V"):
 
 
 if hasattr(model_base, "WAN21"):
+
     @USPInjectRegistry.register(model_base.WAN21)
     def _inject_wan21(model_patcher, base_model, *args):
         from ..diffusion_models.wan.xdit_context_parallel import (
             usp_self_attn_forward,
             usp_dit_forward,
             usp_i2v_cross_attn_forward,
-            usp_t2v_cross_attn_forward
+            usp_t2v_cross_attn_forward,
         )
-        from comfy.ldm.wan.model import WanT2VCrossAttention, WanI2VCrossAttention
 
         model = base_model.diffusion_model
-        for block in model.blocks:
-            block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
-            if isinstance(block.cross_attn, WanT2VCrossAttention):
-                block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
-            elif isinstance(block.cross_attn, WanI2VCrossAttention):
-                block.cross_attn.forward = types.MethodType(usp_i2v_cross_attn_forward, block.cross_attn)
+        _patch_wan_attention_blocks(model, usp_self_attn_forward, usp_t2v_cross_attn_forward, usp_i2v_cross_attn_forward)
         model.forward_orig = types.MethodType(usp_dit_forward, model)
 
 
 # Chroma Radiance should be using this since the forward_orig MRO in Chroma Radiance is from Chroma itself
 if hasattr(model_base, "ChromaRadiance"):
+
     @USPInjectRegistry.register(model_base.ChromaRadiance)
     @USPInjectRegistry.register(model_base.Chroma)
     def _inject_chroma(model_patcher, base_model, *args):
-        from ..diffusion_models.chroma.xdit_context_parallel import (
-            usp_dit_forward,
-            usp_single_stream_forward,
-            usp_double_stream_forward
-        )
+        from ..diffusion_models.chroma.xdit_context_parallel import usp_dit_forward, usp_single_stream_forward, usp_double_stream_forward
+
         model = base_model.diffusion_model
         for block in model.double_blocks:
             block.forward = types.MethodType(usp_double_stream_forward, block)
@@ -144,13 +184,11 @@ if hasattr(model_base, "ChromaRadiance"):
 
 
 if hasattr(model_base, "Flux"):
+
     @USPInjectRegistry.register(model_base.Flux)
     def _inject_flux(model_patcher, base_model, *args):
-        from ..diffusion_models.flux.xdit_context_parallel import (
-            usp_dit_forward,
-            usp_single_stream_forward,
-            usp_double_stream_forward
-        )
+        from ..diffusion_models.flux.xdit_context_parallel import usp_dit_forward, usp_single_stream_forward, usp_double_stream_forward
+
         model = base_model.diffusion_model
         for block in model.double_blocks:
             block.forward = types.MethodType(usp_double_stream_forward, block)
@@ -160,15 +198,14 @@ if hasattr(model_base, "Flux"):
 
 
 if hasattr(model_base, "Hunyuan3Dv2"):
+
     @USPInjectRegistry.register(model_base.Hunyuan3Dv2)
     def _inject_hunyuan_3dv2(model_patcher, base_model, *args):
         from ..diffusion_models.hunyuan3d.xdit_context_parallel import (
             usp_dit_forward,
         )
-        from ..diffusion_models.flux.xdit_context_parallel import (
-            usp_single_stream_forward,
-            usp_double_stream_forward
-        )
+        from ..diffusion_models.flux.xdit_context_parallel import usp_single_stream_forward, usp_double_stream_forward
+
         model = base_model.diffusion_model
         for block in model.double_blocks:
             block.forward = types.MethodType(usp_double_stream_forward, block)
@@ -178,16 +215,12 @@ if hasattr(model_base, "Hunyuan3Dv2"):
 
 
 if hasattr(model_base, "HunyuanVideo"):
+
     @USPInjectRegistry.register(model_base.HunyuanVideo)
     def _inject_hunyuan(model_patcher, base_model, *args):
-        from ..diffusion_models.hunyuan_video.xdit_context_parallel import (
-            usp_dit_forward,
-            usp_token_refiner_forward
-        )
-        from ..diffusion_models.flux.xdit_context_parallel import (
-            usp_single_stream_forward,
-            usp_double_stream_forward
-        )
+        from ..diffusion_models.hunyuan_video.xdit_context_parallel import usp_dit_forward, usp_token_refiner_forward
+        from ..diffusion_models.flux.xdit_context_parallel import usp_single_stream_forward, usp_double_stream_forward
+
         model = base_model.diffusion_model
         for block in model.double_blocks:
             block.forward = types.MethodType(usp_double_stream_forward, block)
@@ -199,12 +232,14 @@ if hasattr(model_base, "HunyuanVideo"):
 
 
 if hasattr(model_base, "QwenImage"):
+
     @USPInjectRegistry.register(model_base.QwenImage)
     def _inject_qwen(model_patcher, base_model, *args):
         from ..diffusion_models.qwen_image.xdit_context_parallel import (
             usp_dit_forward,
             usp_attn_forward,
         )
+
         model = base_model.diffusion_model
         for block in model.transformer_blocks:
             block.attn.forward = types.MethodType(usp_attn_forward, block.attn)
@@ -212,12 +247,11 @@ if hasattr(model_base, "QwenImage"):
 
 
 if hasattr(model_base, "CosmosPredict2"):
+
     @USPInjectRegistry.register(model_base.CosmosPredict2)
     def _inject_cosmos_predict2(model_patcher, base_model, *args):
-        from ..diffusion_models.cosmos.xdit_context_parallel import (
-            usp_xfuser_attention_op,
-            usp_mini_train_dit_forward
-        )
+        from ..diffusion_models.cosmos.xdit_context_parallel import usp_xfuser_attention_op, usp_mini_train_dit_forward
+
         model = base_model.diffusion_model
         for block in model.blocks:
             block.cross_attn.attn_op = usp_xfuser_attention_op
@@ -226,24 +260,22 @@ if hasattr(model_base, "CosmosPredict2"):
 
 
 if hasattr(model_base, "CosmosVideo"):
+
     @USPInjectRegistry.register(model_base.CosmosVideo)
     def _inject_cosmos_video(model_patcher, base_model, *args):
         pass
-        from ..diffusion_models.cosmos.xdit_context_parallel import (
-            usp_general_dit_forward,
-            usp_general_attention_forward
-        )
+        from ..diffusion_models.cosmos.xdit_context_parallel import usp_general_dit_forward, usp_general_attention_forward
+
         model = base_model.diffusion_model
         model._forward = types.MethodType(usp_general_dit_forward, model)
 
 
 if hasattr(model_base, "Lumina2"):
+
     @USPInjectRegistry.register(model_base.Lumina2)  # Lumina and Z Image
     def _inject_lumina(model_patcher, base_model, *args):
-        from ..diffusion_models.lumina.xdit_context_parallel import (
-            usp_dit_forward,
-            usp_joint_attention_forward
-        )
+        from ..diffusion_models.lumina.xdit_context_parallel import usp_dit_forward, usp_joint_attention_forward
+
         model = base_model.diffusion_model
         for block in model.layers:
             block.attention.forward = types.MethodType(usp_joint_attention_forward, block.attention)
@@ -251,6 +283,7 @@ if hasattr(model_base, "Lumina2"):
 
 
 if hasattr(model_base, "Kandinsky5"):
+
     @USPInjectRegistry.register(model_base.Kandinsky5)
     def _inject_kandinsky5(model_patcher, base_model, *args):
         from ..diffusion_models.kandinsky5.xdit_context_parallel import (
@@ -259,33 +292,28 @@ if hasattr(model_base, "Kandinsky5"):
             usp_self_attn_forward_chunked,
             usp_cross_attn_forward,
         )
+
         model = base_model.diffusion_model
         for text_block in model.text_transformer_blocks:
-            text_block.self_attention._forward = types.MethodType(
-                usp_self_attn_foward, text_block.self_attention)
+            text_block.self_attention._forward = types.MethodType(usp_self_attn_foward, text_block.self_attention)
 
-            text_block.self_attention._forward_chunked = types.MethodType(
-                usp_self_attn_forward_chunked, text_block.self_attention)
+            text_block.self_attention._forward_chunked = types.MethodType(usp_self_attn_forward_chunked, text_block.self_attention)
 
         for visual_block in model.visual_transformer_blocks:
-            visual_block.self_attention._forward = types.MethodType(
-                usp_self_attn_foward, visual_block.self_attention)
+            visual_block.self_attention._forward = types.MethodType(usp_self_attn_foward, visual_block.self_attention)
 
-            visual_block.self_attention._forward_chunked = types.MethodType(
-                usp_self_attn_forward_chunked, visual_block.self_attention)
+            visual_block.self_attention._forward_chunked = types.MethodType(usp_self_attn_forward_chunked, visual_block.self_attention)
 
-            visual_block.cross_attention.forward = types.MethodType(
-                usp_cross_attn_forward, visual_block.cross_attention)
+            visual_block.cross_attention.forward = types.MethodType(usp_cross_attn_forward, visual_block.cross_attention)
 
         model.forward_orig = types.MethodType(usp_dit_forward, model)
 
+
 if hasattr(model_base, "LTXAV"):
+
     @USPInjectRegistry.register(model_base.LTXAV)
     def _inject_ltxvav(model_patcher, base_model, *args):
-        from ..diffusion_models.lightricks.xdit_context_parallel import (
-            usp_dit_forward,
-            usp_cross_attn_forward
-        )
+        from ..diffusion_models.lightricks.xdit_context_parallel import usp_dit_forward, usp_cross_attn_forward
 
         model = base_model.diffusion_model
         for block in model.transformer_blocks:
@@ -298,13 +326,12 @@ if hasattr(model_base, "LTXAV"):
 
         model._forward = types.MethodType(usp_dit_forward, model)
 
+
 if hasattr(model_base, "LTXV"):
+
     @USPInjectRegistry.register(model_base.LTXV)
     def _inject_ltxv(model_patcher, base_model, *args):
-        from ..diffusion_models.lightricks.xdit_context_parallel import (
-            usp_dit_forward,
-            usp_cross_attn_forward
-        )
+        from ..diffusion_models.lightricks.xdit_context_parallel import usp_dit_forward, usp_cross_attn_forward
 
         model = base_model.diffusion_model
         for block in model.transformer_blocks:

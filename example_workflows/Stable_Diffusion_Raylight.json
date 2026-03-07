@@ -129,8 +129,8 @@
         2,
         false,
         false,
-        "TORCH",
-        "TORCH"
+        "TORCH_FLASH",
+        "TORCH_FLASH"
       ]
     },
     {
