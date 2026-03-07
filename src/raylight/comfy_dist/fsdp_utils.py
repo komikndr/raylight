@@ -300,6 +300,13 @@ def _build_quantized_tensor(
     sharded_meta_param: Any,
     device: torch.device,
 ):
+    def _local_orig_shape(layout_name: str, local_qdata: torch.Tensor, logical_orig_shape: tuple[int, ...] | None) -> tuple[int, ...]:
+        if logical_orig_shape is None:
+            return tuple(local_qdata.shape)
+        if layout_name == "TensorCoreNVFP4Layout" and len(logical_orig_shape) == 2 and local_qdata.dim() == 2:
+            return (int(local_qdata.shape[0]), int(logical_orig_shape[1]))
+        return tuple(local_qdata.shape)
+
     if not param_name.endswith("weight"):
         return None
 
@@ -307,7 +314,9 @@ def _build_quantized_tensor(
     if isinstance(full_q, QuantizedTensor):
         qt = cast(Any, full_q)
         local_qdata = _shard_tensor(qt._qdata.to(device=device), sharded_meta_param, device)
-        local_params = replace(qt._params, orig_shape=tuple(local_qdata.shape))
+        local_params = replace(
+            qt._params, orig_shape=_local_orig_shape(qt._layout_cls, local_qdata, getattr(qt._params, "orig_shape", None))
+        )
         return QuantizedTensor(local_qdata, qt._layout_cls, local_params)
 
     prefix = param_name[: -len("weight")]
@@ -343,6 +352,11 @@ def _build_quantized_tensor(
         orig_dtype = getattr(local_meta._params, "orig_dtype", None)
         if orig_dtype is not None:
             params_kwargs["orig_dtype"] = orig_dtype
+
+    logical_orig_shape = getattr(getattr(local_meta, "_params", None), "orig_shape", None)
+    if logical_orig_shape is None and quant_format == "nvfp4" and full_qdata.dim() == 2:
+        logical_orig_shape = (int(full_qdata.shape[0]), int(full_qdata.shape[1] * 2))
+    params_kwargs["orig_shape"] = _local_orig_shape(layout_name, qdata, logical_orig_shape)
 
     if quant_format in ("float8_e4m3fn", "float8_e5m2"):
         scale = full_sd.get(f"{prefix}weight_scale")

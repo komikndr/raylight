@@ -115,14 +115,14 @@ def load_lora_for_models_quantized(model, lora, strength_model):
         key_map = comfy.lora.model_lora_keys_unet(model.model, key_map)
 
     lora = comfy.lora_convert.convert_lora(lora)
-    loaded = comfy.lora.load_lora(lora, key_map)
+    loaded = comfy_dist.lora.load_lora(lora, key_map)
 
     if model is None:
         return None
 
     new_modelpatcher = model.clone()
 
-    grouped_lora = {}
+    grouped_adapters = {}
     unsupported_keys = []
     for loaded_key, patch_data in loaded.items():
         key = loaded_key
@@ -138,11 +138,11 @@ def load_lora_for_models_quantized(model, lora, strength_model):
         if not isinstance(key, str):
             continue
 
-        if isinstance(patch_data, comfy.weight_adapter.WeightAdapterBase) and getattr(patch_data, "name", None) == "lora":
+        if getattr(patch_data, "name", None) in {"lora", "loha", "lokr"} and hasattr(patch_data, "h"):
             if function is not None:
                 unsupported_keys.append(loaded_key)
                 continue
-            grouped_lora.setdefault(key, []).append(
+            grouped_adapters.setdefault(key, []).append(
                 {
                     "adapter": patch_data,
                     "offset": offset,
@@ -151,7 +151,7 @@ def load_lora_for_models_quantized(model, lora, strength_model):
 
     manager = comfy.weight_adapter.BypassInjectionManager()
     loaded_keys = set()
-    for key, entries in grouped_lora.items():
+    for key, entries in grouped_adapters.items():
         loaded_keys.add(key)
         if len(entries) == 1 and entries[0]["offset"] is None:
             manager.add_adapter(key, entries[0]["adapter"], strength=strength_model)
@@ -174,17 +174,22 @@ def load_lora_for_models_quantized(model, lora, strength_model):
 
     for key in unsupported_keys:
         logging.warning("SKIP FUNCTIONAL LORA KEY IN QUANTIZED BYPASS MODE {}".format(key))
-    for key in loaded:
+    for key, patch_data in loaded.items():
         normalized_key = key[0] if isinstance(key, tuple) else key
         if normalized_key not in loaded_keys:
-            logging.warning("NOT LOADED IN QUANTIZED BYPASS MODE {}".format(key))
+            patch_type = getattr(patch_data, "name", None)
+            if patch_type is None and isinstance(patch_data, tuple) and len(patch_data) > 0:
+                patch_type = patch_data[0]
+            logging.warning("NOT LOADED IN QUANTIZED BYPASS MODE [%s] %s", patch_type or type(patch_data).__name__, key)
 
     return new_modelpatcher
 
 
 def fsdp_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload, model_options={}):
-    sd = comfy.utils.load_torch_file(unet_path)
-    model, state_dict = fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options=model_options)
+    sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
+    model, state_dict = fsdp_load_diffusion_model_stat_dict(
+        sd, rank, device_mesh, is_cpu_offload, model_options=model_options, metadata=metadata
+    )
     if model is None:
         logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
         raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))
@@ -385,7 +390,6 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
         model_config.optimizations["fp8"] = True
 
     model = model_config.get_model(new_sd, "")
-    model.load_model_weights(new_sd, "")
 
     model_patcher = comfy_dist.model_patcher.FSDPModelPatcher(
         model,
@@ -395,6 +399,7 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
         device_mesh=device_mesh,
         is_cpu_offload=is_cpu_offload,
     )
+    model.load_model_weights(new_sd, "", assign=model_patcher.is_dynamic())
     if not model_management.is_device_cpu(offload_device):
         model.to(offload_device)
     left_over = sd.keys()

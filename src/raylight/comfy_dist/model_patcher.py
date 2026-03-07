@@ -150,6 +150,9 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         self._has_quantized_dtensor_shards: bool | None = None
         self.patch_fsdp = patch_fsdp.__get__(self, FSDPModelPatcher)
 
+    def is_dynamic(self):
+        return True
+
     def config_fsdp(self, rank, device_mesh):
         self.rank = rank
         self.device_mesh = device_mesh

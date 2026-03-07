@@ -269,8 +269,8 @@ class LoRAAdapter(WeightAdapterBase):
         scale = alpha / rank if alpha is not None else 1.0
         scale *= getattr(self, "multiplier", 1.0)
 
-        up = up.to(dtype=x.dtype)
-        down = down.to(dtype=x.dtype)
+        up = comfy.model_management.cast_to_device(up, x.device, x.dtype)
+        down = comfy.model_management.cast_to_device(down, x.device, x.dtype)
 
         is_conv = getattr(self, "is_conv", False)
         conv_dim = getattr(self, "conv_dim", 0)
@@ -289,7 +289,7 @@ class LoRAAdapter(WeightAdapterBase):
             if up.dim() == 2:
                 up = up.view(*up.shape, *([1] * conv_dim))
             if mid is not None:
-                mid = mid.to(dtype=x.dtype)
+                mid = comfy.model_management.cast_to_device(mid, x.device, x.dtype)
                 if mid.dim() == 2:
                     mid = mid.view(*mid.shape, *([1] * conv_dim))
         else:

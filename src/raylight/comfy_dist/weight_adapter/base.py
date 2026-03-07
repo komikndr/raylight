@@ -40,6 +40,12 @@ class WeightAdapterBase:
     ):
         raise NotImplementedError
 
+    def h(self, x, base_out):
+        return torch.zeros_like(base_out)
+
+    def g(self, y):
+        return y
+
 
 class WeightAdapterTrainBase(nn.Module):
     # We follow the scheme of PR #7032
@@ -67,11 +73,7 @@ def weight_decompose(dora_scale, weight, lora_diff, alpha, strength, intermediat
 
     wd_on_output_axis = dora_scale.shape[0] == weight_calc.shape[0]
     if wd_on_output_axis:
-        weight_norm = (
-            weight.reshape(weight.shape[0], -1)
-            .norm(dim=1, keepdim=True)
-            .reshape(weight.shape[0], *[1] * (weight.dim() - 1))
-        )
+        weight_norm = weight.reshape(weight.shape[0], -1).norm(dim=1, keepdim=True).reshape(weight.shape[0], *[1] * (weight.dim() - 1))
     else:
         weight_norm = (
             weight_calc.transpose(0, 1)
