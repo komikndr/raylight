@@ -33,6 +33,7 @@ if os.getenv("debug_raylight") == "1":
     print("RAYLIGHT DEBUG MODE")
     from raylight.nodes_debug import NODE_CLASS_MAPPINGS as DEBUG_NODE_CLASS_NAME_MAPPINGS
     from raylight.nodes_debug import NODE_DISPLAY_NAME_MAPPINGS as DEBUG_NODE_DISPLAY_NAME_MAPPINGS
+
     NODE_CLASS_MAPPINGS.update(DEBUG_NODE_CLASS_NAME_MAPPINGS)
     NODE_DISPLAY_NAME_MAPPINGS.update(DEBUG_NODE_DISPLAY_NAME_MAPPINGS)
 
@@ -44,6 +45,7 @@ print(gguf_dir)
 if os.path.isdir(gguf_dir):
     from raylight.expansion.comfyui_gguf.nodes import NODE_CLASS_MAPPINGS as GGUF_NODE_CLASS_MAPPINGS
     from raylight.expansion.comfyui_gguf.nodes import NODE_DISPLAY_NAME_MAPPINGS as GGUF_NODE_DISPLAY_NAME_MAPPINGS
+
     NODE_CLASS_MAPPINGS.update(GGUF_NODE_CLASS_MAPPINGS)
     NODE_DISPLAY_NAME_MAPPINGS.update(GGUF_NODE_DISPLAY_NAME_MAPPINGS)
 else:
@@ -70,4 +72,4 @@ __all__ = [
 
 __author__ = """Micko Lesmana"""
 __email__ = "mickolesmana@gmail.com"
-__version__ = "1.0.0"
+__version__ = "1.0.1"

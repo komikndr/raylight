@@ -122,7 +122,7 @@ def _quant_metadata_checker(unet_path: str) -> bool:
             metadata = f.metadata() or {}
             if "_quantization_metadata" in metadata:
                 return True
-            return any(key.endswith(".comfy_quant") for key in f.keys())
+            return any(key.endswith(".comfy_quant") or key.endswith(".scaled_fp8") or key == "scaled_fp8" for key in f.keys())
     except Exception:
         return False
 

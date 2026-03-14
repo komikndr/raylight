@@ -46,8 +46,12 @@ class RayWorker:
         self.vae_model = None
         self.model_type = None
         self.state_dict = None
+        self.lora_list = None
         self.parallel_dict = parallel_dict
         self.overwrite_cast_dtype = None
+        self.cached_base_model = None
+        self.cached_base_key = None
+        self.active_request_key = None
 
         self.local_rank = local_rank
         self.global_world_size = self.parallel_dict["global_world_size"]
@@ -116,10 +120,73 @@ class RayWorker:
     def set_meta_model(self, model):
         first_param_device = next(model.model.parameters()).device
         if first_param_device == torch.device("meta"):
+            self.state_dict = None
             self.model = model
             self.model.config_fsdp(self.local_rank, self.device_mesh)
         else:
             raise ValueError("Model being set is not meta, can cause OOM in large model")
+
+    def _normalize_model_options(self, model_options):
+        if not model_options:
+            return ()
+
+        normalized = []
+        for key in sorted(model_options.keys()):
+            value = model_options[key]
+            if isinstance(value, (list, tuple)):
+                value = tuple(str(v) for v in value)
+            else:
+                value = str(value)
+            normalized.append((key, value))
+        return tuple(normalized)
+
+    def _lora_signature(self, lora_list=None):
+        if lora_list is None:
+            lora_list = self.lora_list
+
+        if not lora_list:
+            return ()
+
+        return tuple((lora["path"], float(lora["strength_model"])) for lora in lora_list)
+
+    def _base_model_key(self, unet_path, model_options):
+        return (unet_path, self._normalize_model_options(model_options))
+
+    def _active_model_key(self, unet_path, model_options, lora_list=None):
+        return self._base_model_key(unet_path, model_options) + (self._lora_signature(lora_list),)
+
+    def _reset_active_model(self):
+        if self.model is not None:
+            try:
+                self.model.detach()
+            except Exception:
+                pass
+            try:
+                self.model.cleanup()
+            except Exception:
+                pass
+
+        self.model = None
+        self.overwrite_cast_dtype = None
+        self.active_request_key = None
+        comfy.model_management.soft_empty_cache()
+        gc.collect()
+
+    def _invalidate_non_fsdp_cache(self):
+        self.cached_base_model = None
+        self.cached_base_key = None
+        self.active_request_key = None
+
+    def _activate_cached_base_model(self, active_key):
+        self._reset_active_model()
+        self.model = self.cached_base_model.clone()
+
+        if self.lora_list is not None:
+            self.load_lora()
+
+        self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+        self.active_request_key = active_key
+        self.is_model_loaded = True
 
     def set_state_dict(self):
         if self.state_dict is None:
@@ -161,6 +228,9 @@ class RayWorker:
 
     def load_unet(self, unet_path, model_options):
         if self.parallel_dict["is_fsdp"] is True:
+            if self.cached_base_model is not None or self.active_request_key is not None:
+                self._reset_active_model()
+            self._invalidate_non_fsdp_cache()
             # Monkey patch
             import comfy.model_patcher as model_patcher
             import comfy.model_management as model_management
@@ -194,10 +264,28 @@ class RayWorker:
             comfy.model_management.soft_empty_cache()
             gc.collect()
         else:
-            self.model = comfy.sd.load_diffusion_model(
+            base_key = self._base_model_key(unet_path, model_options)
+            active_key = self._active_model_key(unet_path, model_options)
+
+            if self.model is not None and self.active_request_key == active_key:
+                self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+                self.is_model_loaded = True
+                return
+
+            if self.cached_base_model is not None and self.cached_base_key == base_key:
+                self._activate_cached_base_model(active_key)
+                return
+
+            self._reset_active_model()
+            self._invalidate_non_fsdp_cache()
+            loaded_model = comfy.sd.load_diffusion_model(
                 unet_path,
-                model_options={},
+                model_options=model_options,
             )
+            self.cached_base_model = loaded_model
+            self.cached_base_key = base_key
+            self._activate_cached_base_model(active_key)
+            return
 
         if self.lora_list is not None:
             self.load_lora()
@@ -206,6 +294,8 @@ class RayWorker:
         self.is_model_loaded = True
 
     def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype):
+        self._reset_active_model()
+        self._invalidate_non_fsdp_cache()
         if self.parallel_dict["is_fsdp"] is True:
             raise ValueError("FSDP Sharding for GGUF is not supported")
         else:
@@ -219,6 +309,9 @@ class RayWorker:
         self.is_model_loaded = True
 
     def load_bnb_unet(self, unet_path):
+        if self.parallel_dict["is_fsdp"] is False:
+            self._reset_active_model()
+        self._invalidate_non_fsdp_cache()
         if self.parallel_dict["is_fsdp"] is True:
             import comfy.model_patcher as model_patcher
             import comfy.model_management as model_management
@@ -288,6 +381,7 @@ class RayWorker:
             del lora_model
 
     def kill(self):
+        self._invalidate_non_fsdp_cache()
         self.model = None
         dist.destroy_process_group()
         ray.actor.exit_actor()

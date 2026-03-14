@@ -309,6 +309,62 @@ def _decode_comfy_quant(conf: Any) -> dict[str, Any] | None:
     raise TypeError(f"Unsupported comfy_quant type: {type(conf)}")
 
 
+def _find_scaled_fp8_key(full_sd: dict[str, Any]) -> str | None:
+    if "scaled_fp8" in full_sd:
+        return "scaled_fp8"
+
+    for key in full_sd.keys():
+        if key.endswith(".scaled_fp8"):
+            return key
+
+    return None
+
+
+def _legacy_scaled_fp8_conf(prefix: str, full_sd: dict[str, Any]) -> dict[str, Any] | None:
+    has_legacy_scale = f"{prefix}scale_weight" in full_sd
+    has_converted_scale = f"{prefix}weight_scale" in full_sd
+    if not has_legacy_scale and not has_converted_scale:
+        return None
+
+    conf: dict[str, Any] = {"format": "float8_e4m3fn"}
+    scaled_fp8_key = _find_scaled_fp8_key(full_sd)
+    if scaled_fp8_key is not None:
+        scaled_fp8_weight = full_sd.get(scaled_fp8_key)
+        if isinstance(scaled_fp8_weight, torch.Tensor) and scaled_fp8_weight.nelement() == 2:
+            conf["full_precision_matrix_mult"] = True
+
+    return conf
+
+
+def _quant_payload_debug_info(param_name: str, full_sd: dict[str, Any]) -> str:
+    prefix = param_name[: -len("weight")] if param_name.endswith("weight") else param_name
+    debug_bits = {
+        "weight": param_name in full_sd,
+        "comfy_quant": f"{prefix}comfy_quant" in full_sd,
+        "weight_scale": f"{prefix}weight_scale" in full_sd,
+        "weight_scale_2": f"{prefix}weight_scale_2" in full_sd,
+        "input_scale": f"{prefix}input_scale" in full_sd,
+        "legacy_scale_weight": f"{prefix}scale_weight" in full_sd,
+        "legacy_scale_input": f"{prefix}scale_input" in full_sd,
+        "scaled_fp8": _find_scaled_fp8_key(full_sd) is not None,
+    }
+    prefix_keys = sorted(
+        key
+        for key in full_sd.keys()
+        if key.startswith(prefix)
+        and (
+            key == param_name
+            or key.endswith("comfy_quant")
+            or key.endswith("weight_scale")
+            or key.endswith("weight_scale_2")
+            or key.endswith("input_scale")
+            or key.endswith("scale_weight")
+            or key.endswith("scale_input")
+        )
+    )
+    return f"payload={debug_bits}, prefix_keys={prefix_keys}"
+
+
 def _shard_tensor(
     full_tensor: torch.Tensor,
     sharded_meta_param: Any,
@@ -352,7 +408,11 @@ def _is_quant_param(param_name: str, full_sd: dict[str, Any], sharded_meta_param
         return True
 
     prefix = param_name[: -len("weight")] if param_name.endswith("weight") else None
-    if prefix is not None and f"{prefix}comfy_quant" in full_sd:
+    if prefix is not None and (
+        f"{prefix}comfy_quant" in full_sd
+        or f"{prefix}weight_scale" in full_sd
+        or f"{prefix}scale_weight" in full_sd
+    ):
         return True
 
     if isinstance(sharded_meta_param, QuantizedTensor):
@@ -390,6 +450,8 @@ def _build_quantized_tensor(
 
     prefix = param_name[: -len("weight")]
     conf = _decode_comfy_quant(full_sd.get(f"{prefix}comfy_quant"))
+    if conf is None:
+        conf = _legacy_scaled_fp8_conf(prefix, full_sd)
     if conf is None:
         return None
 
@@ -432,6 +494,8 @@ def _build_quantized_tensor(
 
     if quant_format in ("float8_e4m3fn", "float8_e5m2"):
         scale = full_sd.get(f"{prefix}weight_scale")
+        if scale is None:
+            scale = full_sd.get(f"{prefix}scale_weight")
         if scale is not None:
             scale = scale.to(device=device)
         params_kwargs["scale"] = scale
@@ -454,7 +518,15 @@ def _build_quantized_tensor(
 
 def _release_quant_keys(full_sd: dict[str, Any], param_name: str) -> None:
     prefix = param_name[: -len("weight")]
-    for key in (param_name, f"{prefix}weight_scale", f"{prefix}weight_scale_2", f"{prefix}comfy_quant"):
+    for key in (
+        param_name,
+        f"{prefix}weight_scale",
+        f"{prefix}weight_scale_2",
+        f"{prefix}input_scale",
+        f"{prefix}scale_weight",
+        f"{prefix}scale_input",
+        f"{prefix}comfy_quant",
+    ):
         if key in full_sd:
             full_sd[key] = None
 
@@ -487,7 +559,9 @@ def load_from_full_model_state_dict(
         if _is_quant_param(param_name, full_sd, sharded_meta_param):
             quant_tensor = _build_quantized_tensor(param_name, full_sd, sharded_meta_param, device)
             if quant_tensor is None:
-                raise ValueError(f"Expected quantized tensor for {param_name}, but could not build it")
+                raise ValueError(
+                    f"Expected quantized tensor for {param_name}, but could not build it ({_quant_payload_debug_info(param_name, full_sd)})"
+                )
             if hasattr(sharded_meta_param, "device_mesh"):
                 sharded_tensor = DTensor.from_local(
                     quant_tensor,
