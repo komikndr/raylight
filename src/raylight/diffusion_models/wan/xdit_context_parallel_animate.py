@@ -28,6 +28,8 @@ def usp_face_block_forward(
     x: torch.Tensor,
     motion_vec: torch.Tensor,
     motion_mask: Optional[torch.Tensor] = None,
+    *args,
+    **kwargs,
     # use_context_parallel=False,
 ) -> torch.Tensor:
     B, T, N, C = motion_vec.shape
@@ -73,6 +75,7 @@ def usp_animate_dit_forward(
     face_pixel_values=None,
     freqs=None,
     transformer_options={},
+    *args,
     **kwargs,
 ):
     # embeddings

@@ -53,6 +53,7 @@ def usp_general_attention_forward(
     mask=None,
     rope_emb=None,
     transformer_options={},
+    *args,
     **kwargs,
 ):
     q, k, v = self.cal_qkv(x, context, mask, rope_emb=rope_emb, **kwargs)
@@ -76,6 +77,7 @@ def usp_general_dit_forward(
     latent_condition: Optional[torch.Tensor] = None,
     latent_condition_sigma: Optional[torch.Tensor] = None,
     condition_video_augment_sigma: Optional[torch.Tensor] = None,
+    *args,
     **kwargs,
 ):
     crossattn_emb = context
@@ -174,6 +176,7 @@ def usp_mini_train_dit_forward(
     context: torch.Tensor,
     fps: Optional[torch.Tensor] = None,
     padding_mask: Optional[torch.Tensor] = None,
+    *args,
     **kwargs,
 ):
     x_B_C_T_H_W = x

@@ -21,7 +21,7 @@ def attention(q, k, v, heads, transformer_options={}):
     )
 
 
-def usp_dit_forward(self, x, timestep, context, y, freqs, freqs_text, transformer_options={}, **kwargs):
+def usp_dit_forward(self, x, timestep, context, y, freqs, freqs_text, transformer_options={}, *args, **kwargs):
     patches_replace = transformer_options.get("patches_replace", {})
     context = self.text_embeddings(context)
     time_embed = self.time_embeddings(timestep, x.dtype) + self.pooled_text_embeddings(y)
@@ -84,16 +84,16 @@ def usp_dit_forward(self, x, timestep, context, y, freqs, freqs_text, transforme
 
 
 # Both for visual block and text block
-def usp_self_attn_foward(self, x, freqs, **kwargs):
+def usp_self_attn_foward(self, x, freqs, transformer_options={}, **kwargs):
     q = self._compute_qk(x, freqs, self.to_query, self.query_norm)
     k = self._compute_qk(x, freqs, self.to_key, self.key_norm)
     v = self.to_value(x).view(*x.shape[:-1], self.num_heads, -1)
-    out = attention(q, k, v, self.num_heads)
+    out = attention(q, k, v, self.num_heads, transformer_options=transformer_options)
     return self.out_layer(out)
 
 
 # idk if this is necessary split chunk since x seq size would be halved and this would not get called
-def usp_self_attn_forward_chunked(self, x, freqs, **kwargs):
+def usp_self_attn_forward_chunked(self, x, freqs, transformer_options={}, **kwargs):
     def process_chunks(proj_fn, norm_fn):
         x_chunks = torch.chunk(x, self.num_chunks, dim=1)
         freqs_chunks = torch.chunk(freqs, self.num_chunks, dim=1)
@@ -105,11 +105,11 @@ def usp_self_attn_forward_chunked(self, x, freqs, **kwargs):
     q = process_chunks(self.to_query, self.query_norm)
     k = process_chunks(self.to_key, self.key_norm)
     v = self.to_value(x).view(*x.shape[:-1], self.num_heads, -1)
-    out = attention(q, k, v, self.num_heads)
+    out = attention(q, k, v, self.num_heads, transformer_options=transformer_options)
     return self.out_layer(out)
 
 
-def usp_cross_attn_forward(self, x, context, transformer_options={}, **kwargs):
+def usp_cross_attn_forward(self, x, context, transformer_options={}, *args, **kwargs):
     q, k, v = self.get_qkv(x, context)
-    out = attention(self.query_norm(q), self.key_norm(k), v, self.num_heads)
+    out = attention(self.query_norm(q), self.key_norm(k), v, self.num_heads, transformer_options=transformer_options)
     return self.out_layer(out)

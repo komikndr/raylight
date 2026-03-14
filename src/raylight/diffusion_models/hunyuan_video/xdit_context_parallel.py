@@ -51,7 +51,7 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
     return embedding
 
 
-def usp_token_refiner_forward(self, x, c, mask, transformer_options={}):
+def usp_token_refiner_forward(self, x, c, mask, transformer_options={}, *args, **kwargs):
     mod1, mod2 = self.adaLN_modulation(c).chunk(2, dim=1)
 
     norm_x = self.norm1(x)
@@ -81,7 +81,10 @@ def usp_dit_forward(
     disable_time_r=False,
     control=None,
     transformer_options={},
+    *args,
+    **kwargs,
 ) -> Tensor:
+    transformer_options = transformer_options.copy()
     patches_replace = transformer_options.get("patches_replace", {})
     initial_shape = list(img.shape)
     # running on sequences img
@@ -95,7 +98,7 @@ def usp_dit_forward(
             timesteps_r = transformer_options['sample_sigmas'][w[0] + 1]
             timesteps_r = timesteps_r.unsqueeze(0).to(device=timesteps.device, dtype=timesteps.dtype)
             vec_r = self.time_r_in(timestep_embedding(timesteps_r, 256, time_factor=1000.0).to(img.dtype))
-            vec = (vec + vec_r) / 2
+            vec = (vec + vec_r) if self.params.meanflow_sum else (vec + vec_r) / 2
 
     if ref_latent is not None:
         ref_latent_ids = self.img_ids(ref_latent)
@@ -232,12 +235,13 @@ def usp_dit_forward(
     img = img[:, :img_orig_size, :]
     txt = txt[:, :txt_orig_size, :]
 
-    img = torch.cat((img, txt), 1)
+    img = torch.cat((txt, img), 1)
     img, img_orig_size = pad_to_world_size(img, dim=1)
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     transformer_options["total_blocks"] = len(self.single_blocks)
     transformer_options["block_type"] = "single"
+    transformer_options["img_slice"] = [txt.shape[1], img.shape[1]]
     for i, block in enumerate(self.single_blocks):
         transformer_options["block_index"] = i
         if ("single_block", i) in blocks_replace:
@@ -272,13 +276,13 @@ def usp_dit_forward(
             if i < len(control_o):
                 add = control_o[i]
                 if add is not None:
-                    img[:, : img_len] += add
+                    img[:, txt.shape[1]: img_len + txt.shape[1]] += add
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = get_sp_group().all_gather(img.contiguous(), dim=1)
     img = img[:, :img_orig_size, :]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    img = img[:, : img_len]
+    img = img[:, txt.shape[1]: img_len + txt.shape[1]]
     if ref_latent is not None:
         img = img[:, ref_latent.shape[1]:]
 

@@ -59,18 +59,12 @@ def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor):
     return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
 
 
-def attention(q, k, v, pe, mask=None) -> Tensor:
+def attention(q, k, v, pe, mask=None, transformer_options={}) -> Tensor:
     if pe is not None:
         q, k = apply_rope(q, k, pe)
 
     heads = q.shape[1]
-    x = xfuser_optimized_attention(
-        q,
-        k,
-        v,
-        heads,
-        skip_reshape=True
-    )
+    x = xfuser_optimized_attention(q, k, v, heads, skip_reshape=True)
     return x
 
 
@@ -85,6 +79,8 @@ def usp_dit_forward(
     control=None,
     transformer_options={},
     attn_mask: Tensor = None,
+    *args,
+    **kwargs,
 ) -> Tensor:
     patches_replace = transformer_options.get("patches_replace", {})
 
@@ -114,7 +110,7 @@ def usp_dit_forward(
     # Seq is odd (idk how) if the w == h, so just pad 0 to the end
     img, img_orig_size = pad_to_world_size(img, dim=1)
     img_ids, _ = pad_to_world_size(img_ids, dim=1)
-    txt, txt_orig_size= pad_to_world_size(txt, dim=1)
+    txt, txt_orig_size = pad_to_world_size(txt, dim=1)
     txt_ids, _ = pad_to_world_size(txt_ids, dim=1)
     ids = torch.cat((txt_ids, img_ids), dim=1)
     pe_combine = self.pe_embedder(ids)
@@ -222,14 +218,23 @@ def usp_dit_forward(
 
 def usp_single_stream_forward(self, x: Tensor, pe: Tensor, vec: Tensor, attn_mask=None, **kwargs) -> Tensor:
     mod = vec
+    transformer_options = kwargs.get("transformer_options", {})
+    transformer_patches = transformer_options.get("patches", {})
+    extra_options = transformer_options.copy()
     x_mod = torch.addcmul(mod.shift, 1 + mod.scale, self.pre_norm(x))
     qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
 
     q, k, v = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
     q, k = self.norm(q, k, v)
 
+    if "attn1_patch" in transformer_patches:
+        patch = transformer_patches["attn1_patch"]
+        for p in patch:
+            out = p(q, k, v, pe=pe, attn_mask=attn_mask, extra_options=extra_options)
+            q, k, v, pe, attn_mask = out.get("q", q), out.get("k", k), out.get("v", v), out.get("pe", pe), out.get("attn_mask", attn_mask)
+
     # compute attention
-    attn = attention(q, k, v, pe=pe, mask=attn_mask)
+    attn = attention(q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options)
     # compute activation in mlp stream, cat again and run second linear layer
     output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
     x.addcmul_(mod.gate, output)
@@ -240,6 +245,9 @@ def usp_single_stream_forward(self, x: Tensor, pe: Tensor, vec: Tensor, attn_mas
 
 def usp_double_stream_forward(self, img: Tensor, txt: Tensor, pe: Tensor, vec: Tensor, attn_mask=None, **kwargs):
     (img_mod1, img_mod2), (txt_mod1, txt_mod2) = vec
+    transformer_options = kwargs.get("transformer_options", {})
+    transformer_patches = transformer_options.get("patches", {})
+    extra_options = transformer_options.copy()
 
     # prepare image for attention
     img_modulated = torch.addcmul(img_mod1.shift, 1 + img_mod1.scale, self.img_norm1(img))
@@ -255,10 +263,16 @@ def usp_double_stream_forward(self, img: Tensor, txt: Tensor, pe: Tensor, vec: T
 
     # run actual attention
     img_q, img_k = apply_rope(img_q, img_k, pe)
-    attn = attention(torch.cat((txt_q, img_q), dim=2),
-                     torch.cat((txt_k, img_k), dim=2),
-                     torch.cat((txt_v, img_v), dim=2),
-                     pe=None, mask=attn_mask)
+    q = torch.cat((txt_q, img_q), dim=2)
+    k = torch.cat((txt_k, img_k), dim=2)
+    v = torch.cat((txt_v, img_v), dim=2)
+    extra_options["img_slice"] = [txt.shape[1], q.shape[2]]
+    if "attn1_patch" in transformer_patches:
+        patch = transformer_patches["attn1_patch"]
+        for p in patch:
+            out = p(q, k, v, pe=pe, attn_mask=attn_mask, extra_options=extra_options)
+            q, k, v, pe, attn_mask = out.get("q", q), out.get("k", k), out.get("v", v), out.get("pe", pe), out.get("attn_mask", attn_mask)
+    attn = attention(q, k, v, pe=None, mask=attn_mask, transformer_options=transformer_options)
 
     txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
 

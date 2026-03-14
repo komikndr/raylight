@@ -90,7 +90,7 @@ def sp_gather_group(group, orig_sizes, dim):
 
 
 def usp_dit_forward(
-    self, x, timestep, context, attention_mask, frame_rate=25, transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs
+    self, x, timestep, context, attention_mask, frame_rate=25, transformer_options={}, keyframe_idxs=None, denoise_mask=None, *args, **kwargs
 ):
     """
     Internal forward pass for LTX models.
@@ -159,7 +159,7 @@ def usp_dit_forward(
     return x
 
 
-def usp_cross_attn_forward(self, x, context=None, mask=None, pe=None, k_pe=None, transformer_options={}):
+def usp_cross_attn_forward(self, x, context=None, mask=None, pe=None, k_pe=None, transformer_options={}, *args, **kwargs):
     q = self.to_q(x)
     context = x if context is None else context
     k = self.to_k(context)
@@ -172,5 +172,20 @@ def usp_cross_attn_forward(self, x, context=None, mask=None, pe=None, k_pe=None,
         q = apply_rotary_emb(q, pe)
         k = apply_rotary_emb(k, pe if k_pe is None else k_pe)
 
-    out = xfuser_optimized_attention(q, k, v, self.heads)
+    out = xfuser_optimized_attention(
+        q,
+        k,
+        v,
+        self.heads,
+        attn_precision=self.attn_precision,
+    )
+
+    if self.to_gate_logits is not None:
+        gate_logits = self.to_gate_logits(x)
+        b, t, _ = out.shape
+        out = out.view(b, t, self.heads, self.dim_head)
+        gates = 2.0 * torch.sigmoid(gate_logits)
+        out = out * gates.unsqueeze(-1)
+        out = out.view(b, t, self.heads * self.dim_head)
+
     return self.to_out(out)

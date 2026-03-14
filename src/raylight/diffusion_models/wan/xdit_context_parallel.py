@@ -43,6 +43,7 @@ def usp_dit_forward(
     clip_fea=None,
     freqs=None,
     transformer_options={},
+    *args,
     **kwargs,
 ):
     x = self.patch_embedding(x.float()).to(x.dtype)
@@ -133,6 +134,7 @@ def usp_vace_dit_forward(
     clip_fea=None,
     freqs=None,
     transformer_options={},
+    *args,
     **kwargs,
 ):
     # embeddings
@@ -173,6 +175,7 @@ def usp_vace_dit_forward(
     transformer_options["total_blocks"] = len(self.blocks)
     transformer_options["block_type"] = "double"
     for i, block in enumerate(self.blocks):
+        transformer_options["block_index"] = i
         if ("double_block", i) in blocks_replace:
 
             def block_wrap(args):
@@ -230,6 +233,7 @@ def usp_camera_dit_forward(
     freqs=None,
     camera_conditions=None,
     transformer_options={},
+    *args,
     **kwargs,
 ):
     # embeddings
@@ -308,6 +312,7 @@ def usp_humo_dit_forward(
     audio_embed=None,
     reference_latent=None,
     transformer_options={},
+    *args,
     **kwargs,
 ):
     bs, _, time, height, width = x.shape
@@ -405,6 +410,7 @@ def usp_s2v_dit_forward(
     clip_fea=None,
     freqs=None,
     transformer_options={},
+    *args,
     **kwargs,
 ):
     if audio_embed is not None:
@@ -543,7 +549,7 @@ def usp_self_attn_forward(self, x, freqs, transformer_options={}, **kwargs):
     return x
 
 
-def usp_t2v_cross_attn_forward(self, x, context, **kwargs):
+def usp_t2v_cross_attn_forward(self, x, context, transformer_options={}, **kwargs):
     r"""
     Args:
         x(Tensor): Shape [B, L1, C]
@@ -560,7 +566,7 @@ def usp_t2v_cross_attn_forward(self, x, context, **kwargs):
     return x
 
 
-def usp_i2v_cross_attn_forward(self, x, context, context_img_len, **kwargs):
+def usp_i2v_cross_attn_forward(self, x, context, context_img_len, transformer_options={}, **kwargs):
     r"""
     Args:
         x(Tensor): Shape [B, L1, C]
@@ -603,7 +609,7 @@ def usp_t2v_cross_attn_gather_forward(self, x, context, transformer_options={}, 
     q = q.reshape(k.shape[0], -1, n, d).transpose(1, 2)
 
     x = xfuser_optimized_attention(
-        q, k, v, heads=self.num_heads, skip_reshape=True, skip_output_reshape=True, transformer_options=transformer_options
+        q, k, v, heads=self.num_heads, skip_reshape=True, skip_output_reshape=True
     )
 
     x = x.transpose(1, 2).reshape(b, -1, n * d)
@@ -623,6 +629,7 @@ def usp_scail_dit_forward(
     pose_latents=None,
     reference_latent=None,
     transformer_options={},
+    *args,
     **kwargs,
 ):
     if reference_latent is not None:
@@ -722,6 +729,7 @@ def usp_multitalk_dit_forward(
     clip_fea=None,
     freqs=None,
     transformer_options={},
+    *args,
     **kwargs,
 ):
     x = self.patch_embedding(x.float()).to(x.dtype)

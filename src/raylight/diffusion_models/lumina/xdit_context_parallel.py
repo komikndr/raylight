@@ -28,6 +28,7 @@ def usp_dit_forward(
         ref_contexts=[],
         siglip_feats=[],
         transformer_options={},
+        *args,
         **kwargs
 ):
     omni = len(ref_latents) > 0
@@ -125,6 +126,8 @@ def usp_joint_attention_forward(
     x_mask: torch.Tensor,
     freqs_cis: torch.Tensor,
     transformer_options={},
+    *args,
+    **kwargs,
 ) -> torch.Tensor:
     bsz, seqlen, _ = x.shape
 
@@ -152,10 +155,10 @@ def usp_joint_attention_forward(
         xv = xv.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
 
     output = xfuser_optimized_attention(xq.movedim(1, 2),
-                                        xk.movedim(1, 2),
-                                        xv.movedim(1, 2),
-                                        self.n_local_heads,
-                                        x_mask,
-                                        skip_reshape=True)
+                                         xk.movedim(1, 2),
+                                         xv.movedim(1, 2),
+                                         self.n_local_heads,
+                                         mask=x_mask,
+                                         skip_reshape=True)
 
     return self.out(output)
