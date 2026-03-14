@@ -51,7 +51,7 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
     return embedding
 
 
-def usp_dit_forward(self, x, timestep, context, guidance=None, transformer_options={}, **kwargs):
+def usp_dit_forward(self, x, timestep, context, guidance=None, transformer_options={}, *args, **kwargs):
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     # Seq is odd (idk how) if the w == h, so just pad 0 to the end
     x = pad_if_odd(x, dim=1)

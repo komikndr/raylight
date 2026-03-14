@@ -31,6 +31,7 @@ def usp_dit_forward(
     additional_t_cond=None,
     transformer_options={},
     control=None,
+    *args,
     **kwargs
 ):
     timestep = timesteps
@@ -208,12 +209,16 @@ def usp_attn_forward(
     img_query = self.norm_q(img_query)
     img_key = self.norm_k(img_key)
 
-    img_query, img_key = apply_rope(img_query, img_key, image_rotary_emb[0])
+    if image_rotary_emb is not None:
+        img_rotary_emb = image_rotary_emb[0]
+        img_query, img_key = apply_rope(img_query, img_key, img_rotary_emb)
 
     txt_query = self.norm_added_q(txt_query)
     txt_key = self.norm_added_k(txt_key)
 
-    txt_query, txt_key = apply_rope(txt_query, txt_key, image_rotary_emb[1])
+    if image_rotary_emb is not None:
+        txt_rotary_emb = image_rotary_emb[1]
+        txt_query, txt_key = apply_rope(txt_query, txt_key, txt_rotary_emb)
 
     joint_query = torch.cat([txt_query, img_query], dim=1)
     joint_key = torch.cat([txt_key, img_key], dim=1)

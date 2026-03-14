@@ -28,6 +28,7 @@ def usp_dit_forward(
         ref_contexts=[],
         siglip_feats=[],
         transformer_options={},
+        *args,
         **kwargs
 ):
     omni = len(ref_latents) > 0
@@ -125,6 +126,8 @@ def usp_joint_attention_forward(
     x_mask: torch.Tensor,
     freqs_cis: torch.Tensor,
     transformer_options={},
+    *args,
+    **kwargs,
 ) -> torch.Tensor:
     bsz, seqlen, _ = x.shape
 

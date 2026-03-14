@@ -43,6 +43,7 @@ def usp_dit_forward(
     clip_fea=None,
     freqs=None,
     transformer_options={},
+    *args,
     **kwargs,
 ):
     x = self.patch_embedding(x.float()).to(x.dtype)
@@ -133,6 +134,7 @@ def usp_vace_dit_forward(
     clip_fea=None,
     freqs=None,
     transformer_options={},
+    *args,
     **kwargs,
 ):
     # embeddings
@@ -230,6 +232,7 @@ def usp_camera_dit_forward(
     freqs=None,
     camera_conditions=None,
     transformer_options={},
+    *args,
     **kwargs,
 ):
     # embeddings
@@ -308,6 +311,7 @@ def usp_humo_dit_forward(
     audio_embed=None,
     reference_latent=None,
     transformer_options={},
+    *args,
     **kwargs,
 ):
     bs, _, time, height, width = x.shape
@@ -405,6 +409,7 @@ def usp_s2v_dit_forward(
     clip_fea=None,
     freqs=None,
     transformer_options={},
+    *args,
     **kwargs,
 ):
     if audio_embed is not None:
@@ -623,6 +628,7 @@ def usp_scail_dit_forward(
     pose_latents=None,
     reference_latent=None,
     transformer_options={},
+    *args,
     **kwargs,
 ):
     if reference_latent is not None:
@@ -722,6 +728,7 @@ def usp_multitalk_dit_forward(
     clip_fea=None,
     freqs=None,
     transformer_options={},
+    *args,
     **kwargs,
 ):
     x = self.patch_embedding(x.float()).to(x.dtype)

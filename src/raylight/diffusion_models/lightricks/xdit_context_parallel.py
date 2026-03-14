@@ -90,7 +90,7 @@ def sp_gather_group(group, orig_sizes, dim):
 
 
 def usp_dit_forward(
-    self, x, timestep, context, attention_mask, frame_rate=25, transformer_options={}, keyframe_idxs=None, denoise_mask=None, **kwargs
+    self, x, timestep, context, attention_mask, frame_rate=25, transformer_options={}, keyframe_idxs=None, denoise_mask=None, *args, **kwargs
 ):
     """
     Internal forward pass for LTX models.
@@ -159,7 +159,7 @@ def usp_dit_forward(
     return x
 
 
-def usp_cross_attn_forward(self, x, context=None, mask=None, pe=None, k_pe=None, transformer_options={}):
+def usp_cross_attn_forward(self, x, context=None, mask=None, pe=None, k_pe=None, transformer_options={}, *args, **kwargs):
     q = self.to_q(x)
     context = x if context is None else context
     k = self.to_k(context)

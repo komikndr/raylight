@@ -85,6 +85,8 @@ def usp_dit_forward(
     control=None,
     transformer_options={},
     attn_mask: Tensor = None,
+    *args,
+    **kwargs,
 ) -> Tensor:
     patches_replace = transformer_options.get("patches_replace", {})
 
@@ -114,7 +116,7 @@ def usp_dit_forward(
     # Seq is odd (idk how) if the w == h, so just pad 0 to the end
     img, img_orig_size = pad_to_world_size(img, dim=1)
     img_ids, _ = pad_to_world_size(img_ids, dim=1)
-    txt, txt_orig_size= pad_to_world_size(txt, dim=1)
+    txt, txt_orig_size = pad_to_world_size(txt, dim=1)
     txt_ids, _ = pad_to_world_size(txt_ids, dim=1)
     ids = torch.cat((txt_ids, img_ids), dim=1)
     pe_combine = self.pe_embedder(ids)

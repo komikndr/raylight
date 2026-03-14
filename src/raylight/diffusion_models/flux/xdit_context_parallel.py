@@ -59,6 +59,21 @@ def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor):
     return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
 
 
+def invert_slices(slices, length):
+    if slices is None:
+        return [(0, length)]
+
+    output = []
+    current = 0
+    for start, end in slices:
+        if start > current:
+            output.append((current, start))
+        current = end
+    if current < length:
+        output.append((current, length))
+    return output
+
+
 def attention(q, k, v, pe, mask=None) -> Tensor:
     if pe is not None:
         q, k = apply_rope(q, k, pe)
@@ -84,8 +99,11 @@ def usp_dit_forward(
     y: Tensor,
     guidance: Tensor = None,
     control=None,
+    timestep_zero_index=None,
     transformer_options={},
     attn_mask: Tensor = None,
+    *args,
+    **kwargs,
 ) -> Tensor:
     transformer_options = transformer_options.copy()
     patches = transformer_options.get("patches", {})
@@ -117,8 +135,24 @@ def usp_dit_forward(
     txt = self.txt_in(txt)
 
     vec_orig = vec
+    txt_vec = vec
+    modulation_dims = None
+    double_block_kwargs = {}
+    single_block_kwargs = {}
+    final_layer_kwargs = {}
+    if timestep_zero_index is not None:
+        modulation_dims = []
+        batch = vec.shape[0] // 2
+        vec_orig = vec_orig.reshape(2, batch, vec.shape[1]).movedim(0, 1)
+        invert = invert_slices(timestep_zero_index, img.shape[1])
+        for start, end in invert:
+            modulation_dims.append((start, end, 0))
+        for start, end in timestep_zero_index:
+            modulation_dims.append((start, end, 1))
+        double_block_kwargs["modulation_dims_img"] = modulation_dims
+        txt_vec = vec[:batch]
     if self.params.global_modulation:
-        vec = (self.double_stream_modulation_img(vec_orig), self.double_stream_modulation_txt(vec_orig))
+        vec = (self.double_stream_modulation_img(vec_orig), self.double_stream_modulation_txt(txt_vec))
 
     if "post_input" in patches:
         for p in patches["post_input"]:
@@ -156,7 +190,8 @@ def usp_dit_forward(
                                                txt=args["txt"],
                                                vec=args["vec"],
                                                pe=args["pe"],
-                                               transformer_options=args.get("transformer_options"))
+                                               transformer_options=args.get("transformer_options"),
+                                               **double_block_kwargs)
                 return out
 
             out = blocks_replace[("double_block", i)]({
@@ -173,7 +208,8 @@ def usp_dit_forward(
                              txt=txt,
                              vec=vec,
                              pe=pe_image,
-                             transformer_options=transformer_options)
+                             transformer_options=transformer_options,
+                             **double_block_kwargs)
 
         if control is not None:  # Controlnet
             control_i = control.get("input")
@@ -197,6 +233,12 @@ def usp_dit_forward(
 
     if self.params.global_modulation:
         vec, _ = self.single_stream_modulation(vec_orig)
+    if timestep_zero_index is not None:
+        assert modulation_dims is not None
+        single_block_kwargs["modulation_dims"] = list(
+            map(lambda x: (0 if x[0] == 0 else x[0] + txt.shape[1], x[1] + txt.shape[1], x[2]), modulation_dims)
+        )
+        final_layer_kwargs["modulation_dims"] = modulation_dims
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
@@ -211,7 +253,8 @@ def usp_dit_forward(
                 out["img"] = block(args["img"],
                                    vec=args["vec"],
                                    pe=args["pe"],
-                                   transformer_options=args.get("transformer_options"))
+                                   transformer_options=args.get("transformer_options"),
+                                   **single_block_kwargs)
                 return out
 
             out = blocks_replace[("single_block", i)]({"img": img,
@@ -221,14 +264,13 @@ def usp_dit_forward(
                                                       {"original_block": block_wrap})
             img = out["img"]
         else:
-            img = block(img, vec=vec, pe=pe_combine, transformer_options=transformer_options)
-
-        if control is not None:  # Controlnet
-            control_o = control.get("output")
-            if i < len(control_o):
-                add = control_o[i]
-                if add is not None:
-                    img[:, txt.shape[1]:txt.shape[1] + add.shape[1], ...] += add
+            img = block(img, vec=vec, pe=pe_combine, transformer_options=transformer_options, **single_block_kwargs)
+            if control is not None:  # Controlnet
+                control_o = control.get("output")
+                if i < len(control_o):
+                    add = control_o[i]
+                    if add is not None:
+                        img[:, txt.shape[1]:txt.shape[1] + add.shape[1], ...] += add
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = get_sp_group().all_gather(img.contiguous(), dim=1)
@@ -236,7 +278,7 @@ def usp_dit_forward(
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = img[:, txt.shape[1]:, ...]
 
-    img = self.final_layer(img, vec_orig)  # (N, T, patch_size ** 2 * out_channels)
+    img = self.final_layer(img, vec_orig, **final_layer_kwargs)  # (N, T, patch_size ** 2 * out_channels)
     return img
 
 

@@ -21,7 +21,7 @@ def attention(q, k, v, heads, transformer_options={}):
     )
 
 
-def usp_dit_forward(self, x, timestep, context, y, freqs, freqs_text, transformer_options={}, **kwargs):
+def usp_dit_forward(self, x, timestep, context, y, freqs, freqs_text, transformer_options={}, *args, **kwargs):
     patches_replace = transformer_options.get("patches_replace", {})
     context = self.text_embeddings(context)
     time_embed = self.time_embeddings(timestep, x.dtype) + self.pooled_text_embeddings(y)
@@ -109,7 +109,7 @@ def usp_self_attn_forward_chunked(self, x, freqs, **kwargs):
     return self.out_layer(out)
 
 
-def usp_cross_attn_forward(self, x, context, transformer_options={}, **kwargs):
+def usp_cross_attn_forward(self, x, context, transformer_options={}, *args, **kwargs):
     q, k, v = self.get_qkv(x, context)
     out = attention(self.query_norm(q), self.key_norm(k), v, self.num_heads)
     return self.out_layer(out)
