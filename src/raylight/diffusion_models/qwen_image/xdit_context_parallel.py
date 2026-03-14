@@ -7,18 +7,12 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 from ..utils import pad_to_world_size
+from comfy.ldm.flux.math import apply_rope
 import raylight.distributed_modules.attention as xfuser_attn
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
 
-
-def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor):
-    xq_ = xq.to(dtype=freqs_cis.dtype).reshape(*xq.shape[:-1], -1, 1, 2)
-    xk_ = xk.to(dtype=freqs_cis.dtype).reshape(*xk.shape[:-1], -1, 1, 2)
-    xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
-    xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
-    return xq_out.reshape(*xq.shape), xk_out.reshape(*xk.shape)
 
 
 def usp_dit_forward(
@@ -262,7 +256,6 @@ def usp_attn_forward(
         joint_value,
         self.heads,
         mask=attention_mask,
-        transformer_options=transformer_options,
     )
 
     txt_attn_output = joint_hidden_states[:, :seq_txt, :]

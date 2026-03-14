@@ -159,7 +159,6 @@ def usp_joint_attention_forward(
                                          xv.movedim(1, 2),
                                          self.n_local_heads,
                                          mask=x_mask,
-                                         transformer_options=transformer_options,
                                          skip_reshape=True)
 
     return self.out(output)

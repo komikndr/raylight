@@ -9,6 +9,7 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 from ..utils import pad_to_world_size
+from comfy.ldm.flux.math import apply_rope
 import raylight.distributed_modules.attention as xfuser_attn
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
@@ -51,14 +52,6 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
     return embedding
 
 
-def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor):
-    xq_ = xq.to(dtype=freqs_cis.dtype).reshape(*xq.shape[:-1], -1, 1, 2)
-    xk_ = xk.to(dtype=freqs_cis.dtype).reshape(*xk.shape[:-1], -1, 1, 2)
-    xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
-    xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
-    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
-
-
 def invert_slices(slices, length):
     if slices is None:
         return [(0, length)]
@@ -79,7 +72,7 @@ def attention(q, k, v, pe, mask=None, transformer_options={}) -> Tensor:
         q, k = apply_rope(q, k, pe)
 
     heads = q.shape[1]
-    x = xfuser_optimized_attention(q, k, v, heads, skip_reshape=True, transformer_options=transformer_options)
+    x = xfuser_optimized_attention(q, k, v, heads, skip_reshape=True)
     return x
 
 
@@ -386,11 +379,11 @@ def usp_double_stream_forward(
     if "attn1_patch" in transformer_patches:
         patch = transformer_patches["attn1_patch"]
         for p in patch:
-            out = p(q, k, v, pe=pe, attn_mask=attn_mask, extra_options=extra_options)
+            out = p(q, k, v, pe=None, attn_mask=attn_mask, extra_options=extra_options)
             q, k, v, pe, attn_mask = out.get("q", q), out.get("k", k), out.get("v", v), out.get("pe", pe), out.get("attn_mask", attn_mask)
 
     # run actual attention
-    attn = attention(q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options)
+    attn = attention(q, k, v, pe=None, mask=attn_mask, transformer_options=transformer_options)
     del q, k, v
 
     if "attn1_output_patch" in transformer_patches:

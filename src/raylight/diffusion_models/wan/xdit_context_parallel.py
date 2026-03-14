@@ -538,7 +538,6 @@ def usp_self_attn_forward(self, x, freqs, transformer_options={}, **kwargs):
         k.view(b, s, n * d),
         self.v(x).view(b, s, n * d),
         heads=self.num_heads,
-        transformer_options=transformer_options,
     )
     x = x.flatten(2)
 
@@ -561,7 +560,7 @@ def usp_t2v_cross_attn_forward(self, x, context, transformer_options={}, **kwarg
     v = self.v(context)
 
     # compute attention
-    x = xfuser_optimized_attention(q, k, v, heads=self.num_heads, transformer_options=transformer_options)
+    x = xfuser_optimized_attention(q, k, v, heads=self.num_heads)
     x = x.flatten(2)
     x = self.o(x)
     return x
@@ -582,8 +581,8 @@ def usp_i2v_cross_attn_forward(self, x, context, context_img_len, transformer_op
     v = self.v(context)
     k_img = self.norm_k_img(self.k_img(context_img))
     v_img = self.v_img(context_img)
-    img_x = xfuser_optimized_attention(q, k_img, v_img, heads=self.num_heads, transformer_options=transformer_options)
-    x = xfuser_optimized_attention(q, k, v, heads=self.num_heads, transformer_options=transformer_options)
+    img_x = xfuser_optimized_attention(q, k_img, v_img, heads=self.num_heads)
+    x = xfuser_optimized_attention(q, k, v, heads=self.num_heads)
     x = x + img_x
     x = x.flatten(2)
     x = self.o(x)
@@ -610,7 +609,7 @@ def usp_t2v_cross_attn_gather_forward(self, x, context, transformer_options={}, 
     q = q.reshape(k.shape[0], -1, n, d).transpose(1, 2)
 
     x = xfuser_optimized_attention(
-        q, k, v, heads=self.num_heads, skip_reshape=True, skip_output_reshape=True, transformer_options=transformer_options
+        q, k, v, heads=self.num_heads, skip_reshape=True, skip_output_reshape=True
     )
 
     x = x.transpose(1, 2).reshape(b, -1, n * d)

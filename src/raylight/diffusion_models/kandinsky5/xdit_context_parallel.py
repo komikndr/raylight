@@ -18,7 +18,6 @@ def attention(q, k, v, heads, transformer_options={}):
         v.transpose(1, 2),
         heads=heads,
         skip_reshape=True,
-        transformer_options=transformer_options,
     )
 
 

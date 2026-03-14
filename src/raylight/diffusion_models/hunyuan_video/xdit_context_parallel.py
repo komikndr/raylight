@@ -57,7 +57,7 @@ def usp_token_refiner_forward(self, x, c, mask, transformer_options={}, *args, *
     norm_x = self.norm1(x)
     qkv = self.self_attn.qkv(norm_x)
     q, k, v = qkv.reshape(qkv.shape[0], qkv.shape[1], 3, self.heads, -1).permute(2, 0, 3, 1, 4)
-    attn = xfuser_optimized_attention(q, k, v, self.heads, skip_reshape=True, transformer_options=transformer_options)
+    attn = xfuser_optimized_attention(q, k, v, self.heads, skip_reshape=True)
 
     x = x + self.self_attn.proj(attn) * mod1.unsqueeze(1)
     x = x + self.mlp(self.norm2(x)) * mod2.unsqueeze(1)

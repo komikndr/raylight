@@ -178,7 +178,6 @@ def usp_cross_attn_forward(self, x, context=None, mask=None, pe=None, k_pe=None,
         v,
         self.heads,
         attn_precision=self.attn_precision,
-        transformer_options=transformer_options,
     )
 
     if self.to_gate_logits is not None:

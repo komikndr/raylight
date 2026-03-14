@@ -64,7 +64,7 @@ def attention(q, k, v, pe, mask=None, transformer_options={}) -> Tensor:
         q, k = apply_rope(q, k, pe)
 
     heads = q.shape[1]
-    x = xfuser_optimized_attention(q, k, v, heads, skip_reshape=True, transformer_options=transformer_options)
+    x = xfuser_optimized_attention(q, k, v, heads, skip_reshape=True)
     return x
 
 

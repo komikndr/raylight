@@ -54,7 +54,9 @@ def make_xfuser_attention(attn_type, sync_ulysses):
             mask=None,
             attn_precision=None,
             skip_reshape=False,
-            skip_output_reshape=False):
+            skip_output_reshape=False,
+            *args,
+            **kwargs):
 
         if skip_reshape:
             b, _, _, dim_head = q.shape
