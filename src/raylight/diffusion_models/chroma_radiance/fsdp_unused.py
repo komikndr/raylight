@@ -1,3 +1,5 @@
+# No longer needed, only for backup for now, use newer general fsdp_utils inside comfy_dist.
+
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,

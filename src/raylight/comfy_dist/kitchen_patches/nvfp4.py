@@ -145,15 +145,27 @@ def install_nvfp4_patches() -> None:
             "orig_dtype": qtensor._params.orig_dtype,
             "orig_shape": qtensor._params.orig_shape,
             "transposed": qtensor._params.transposed,
+            "qdata_shape": tuple(qdata.shape),
         }
         return (qdata, block_scale), metadata
 
     def post_all_gather(qtensor: QuantizedTensor, all_gather_outputs, metadata: Any, param_dtype: torch.dtype, *, out=None):
         gathered_qdata, gathered_block_scale = all_gather_outputs
+        orig_shape = metadata.get("orig_shape")
+        qdata_shape = metadata.get("qdata_shape")
+        if orig_shape is not None and qdata_shape is not None and not metadata.get("transposed", False):
+            orig_shape = tuple(orig_shape)
+            qdata_shape = tuple(qdata_shape)
+            if len(orig_shape) == 2 and len(qdata_shape) == 2 and gathered_qdata.dim() == 2:
+                old_storage_rows = int(qdata_shape[0])
+                new_storage_rows = int(gathered_qdata.shape[0])
+                if old_storage_rows > 0 and new_storage_rows != old_storage_rows:
+                    new_logical_rows = (int(orig_shape[0]) * new_storage_rows + old_storage_rows - 1) // old_storage_rows
+                    orig_shape = (new_logical_rows, int(orig_shape[1]))
         params = TensorCoreNVFP4Layout.Params(
             scale=metadata["scale"],
             orig_dtype=metadata.get("orig_dtype", param_dtype),
-            orig_shape=_scaled_rowwise_orig_shape(qtensor, gathered_qdata, metadata.get("orig_shape")),
+            orig_shape=_scaled_rowwise_orig_shape(qtensor, gathered_qdata, orig_shape),
             block_scale=gathered_block_scale,
             transposed=metadata.get("transposed", False),
         )
@@ -389,6 +401,30 @@ def install_nvfp4_patches() -> None:
             stride[idx] = max(1, int(shape[idx + 1])) * stride[idx + 1]
         return tuple(stride)
 
+    def _can_alias_as_logical_shape(
+        input_tensor, requested_size: tuple[int, ...], requested_stride: tuple[int, ...], storage_offset: int
+    ) -> bool:
+        if int(storage_offset) != 0:
+            return False
+        if requested_stride != _contiguous_stride(requested_size):
+            return False
+        if getattr(input_tensor._params, "transposed", False):
+            return False
+        if len(requested_size) != 2 or input_tensor._qdata.dim() != 2:
+            return False
+        return tuple(input_tensor._qdata.shape) == TensorCoreNVFP4Layout.get_storage_shape(requested_size)
+
+    def _alias_with_orig_shape(input_tensor, orig_shape: tuple[int, ...]):
+        aliased_qdata = op_alias(input_tensor._qdata)
+        aliased_block_scale = op_alias(input_tensor._params.block_scale)
+        return _wrap_nvfp4_tensor(
+            input_tensor,
+            aliased_qdata,
+            block_scale=aliased_block_scale,
+            orig_shape=orig_shape,
+            transposed=input_tensor._params.transposed,
+        )
+
     @maybe_register(op_view)
     def handle_view(qt, args, kwargs):
         return _handle_same_shape_view(op_view, args, kwargs)
@@ -419,7 +455,10 @@ def install_nvfp4_patches() -> None:
         orig_shape = tuple(int(dim) for dim in input_tensor._params.orig_shape)
 
         if requested_size == orig_shape and requested_stride == _contiguous_stride(orig_shape) and int(storage_offset) == 0:
-            return handle_alias(None, (input_tensor,), {})
+            return _alias_with_orig_shape(input_tensor, orig_shape)
+
+        if _can_alias_as_logical_shape(input_tensor, requested_size, requested_stride, int(storage_offset)):
+            return _alias_with_orig_shape(input_tensor, requested_size)
 
         return op_as_strided(*[_dequantize_arg(arg) for arg in args], **kwargs)
 
