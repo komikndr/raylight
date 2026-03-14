@@ -309,7 +309,13 @@ def _decode_comfy_quant(conf: Any) -> dict[str, Any] | None:
     raise TypeError(f"Unsupported comfy_quant type: {type(conf)}")
 
 
-def _shard_tensor(full_tensor: torch.Tensor, sharded_meta_param: Any, device: torch.device) -> torch.Tensor:
+def _shard_tensor(
+    full_tensor: torch.Tensor,
+    sharded_meta_param: Any,
+    device: torch.device,
+    *,
+    pad_to_local_meta: bool = True,
+) -> torch.Tensor:
     if not hasattr(sharded_meta_param, "device_mesh"):
         return full_tensor.to(device=device)
 
@@ -324,7 +330,7 @@ def _shard_tensor(full_tensor: torch.Tensor, sharded_meta_param: Any, device: to
     chunk = torch.tensor_split(full_tensor, shard_world_size, dim=0)[shard_rank].to(device=device)
 
     local_meta = getattr(sharded_meta_param, "_local_tensor", None)
-    if not isinstance(local_meta, torch.Tensor):
+    if not pad_to_local_meta or not isinstance(local_meta, torch.Tensor):
         return chunk
 
     local_shape = tuple(local_meta.shape)
@@ -376,7 +382,7 @@ def _build_quantized_tensor(
     full_q = full_sd.get(param_name)
     if isinstance(full_q, QuantizedTensor):
         qt = cast(Any, full_q)
-        local_qdata = _shard_tensor(qt._qdata.to(device=device), sharded_meta_param, device)
+        local_qdata = _shard_tensor(qt._qdata.to(device=device), sharded_meta_param, device, pad_to_local_meta=False)
         local_params = replace(
             qt._params, orig_shape=_local_orig_shape(qt._layout_cls, local_qdata, getattr(qt._params, "orig_shape", None))
         )
@@ -402,7 +408,7 @@ def _build_quantized_tensor(
         raise ValueError(f"Missing quantized weight for {param_name}")
 
     qdata = full_qdata.to(device=device, dtype=qconfig["storage_t"])
-    qdata = _shard_tensor(qdata, sharded_meta_param, device)
+    qdata = _shard_tensor(qdata, sharded_meta_param, device, pad_to_local_meta=False)
 
     params_kwargs: dict[str, Any] = {"orig_shape": tuple(qdata.shape)}
 
@@ -411,10 +417,13 @@ def _build_quantized_tensor(
         local_meta = sharded_meta_param
     elif hasattr(sharded_meta_param, "_local_tensor") and isinstance(sharded_meta_param._local_tensor, QuantizedTensor):
         local_meta = sharded_meta_param._local_tensor
+    orig_dtype = None
     if local_meta is not None and hasattr(local_meta, "_params"):
         orig_dtype = getattr(local_meta._params, "orig_dtype", None)
-        if orig_dtype is not None:
-            params_kwargs["orig_dtype"] = orig_dtype
+    if orig_dtype is None:
+        orig_dtype = getattr(sharded_meta_param, "dtype", None)
+    if orig_dtype is not None:
+        params_kwargs["orig_dtype"] = orig_dtype
 
     logical_orig_shape = getattr(getattr(local_meta, "_params", None), "orig_shape", None)
     if logical_orig_shape is None and quant_format == "nvfp4" and full_qdata.dim() == 2:
@@ -433,7 +442,7 @@ def _build_quantized_tensor(
             raise ValueError(f"Missing NVFP4 scales for {param_name}")
         tensor_scale = tensor_scale.to(device=device)
         block_scale = block_scale.view(dtype=torch.float8_e4m3fn).to(device=device)
-        block_scale = _shard_tensor(block_scale, sharded_meta_param, device)
+        block_scale = _shard_tensor(block_scale, sharded_meta_param, device, pad_to_local_meta=False)
         params_kwargs["scale"] = tensor_scale
         params_kwargs["block_scale"] = block_scale
     else:

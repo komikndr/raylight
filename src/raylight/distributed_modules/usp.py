@@ -151,6 +151,22 @@ if hasattr(model_base, "WAN22_S2V"):
         model.forward_orig = types.MethodType(usp_s2v_dit_forward, model)
 
 
+if hasattr(model_base, "WAN21_FlowRVS"):
+
+    @USPInjectRegistry.register(model_base.WAN21_FlowRVS)
+    def _inject_wan21_flowrvs(model_patcher, base_model, *args):
+        from ..diffusion_models.wan.xdit_context_parallel import (
+            usp_self_attn_forward,
+            usp_dit_forward,
+            usp_i2v_cross_attn_forward,
+            usp_t2v_cross_attn_forward,
+        )
+
+        model = base_model.diffusion_model
+        _patch_wan_attention_blocks(model, usp_self_attn_forward, usp_t2v_cross_attn_forward, usp_i2v_cross_attn_forward)
+        model.forward_orig = types.MethodType(usp_dit_forward, model)
+
+
 if hasattr(model_base, "WAN21"):
 
     @USPInjectRegistry.register(model_base.WAN21)
@@ -165,6 +181,46 @@ if hasattr(model_base, "WAN21"):
         model = base_model.diffusion_model
         _patch_wan_attention_blocks(model, usp_self_attn_forward, usp_t2v_cross_attn_forward, usp_i2v_cross_attn_forward)
         model.forward_orig = types.MethodType(usp_dit_forward, model)
+
+
+if hasattr(model_base, "WAN21_SCAIL"):
+
+    @USPInjectRegistry.register(model_base.WAN21_SCAIL)
+    def _inject_wan21_scail(model_patcher, base_model, *args):
+        from ..diffusion_models.wan.xdit_context_parallel import (
+            usp_scail_dit_forward,
+            usp_self_attn_forward,
+            usp_i2v_cross_attn_forward,
+            usp_t2v_cross_attn_forward,
+        )
+
+        model = base_model.diffusion_model
+        _patch_wan_attention_blocks(
+            model,
+            usp_self_attn_forward,
+            usp_t2v_cross_attn_forward,
+            usp_i2v_cross_attn_forward,
+        )
+        model.forward_orig = types.MethodType(usp_scail_dit_forward, model)
+
+
+if hasattr(model_base, "WanMultiTalk"):
+
+    @USPInjectRegistry.register(model_base.WanMultiTalk)
+    def _inject_wan_multitalk(model_patcher, base_model, *args):
+        from ..diffusion_models.wan.xdit_context_parallel import (
+            usp_multitalk_dit_forward,
+            usp_self_attn_forward,
+            usp_t2v_cross_attn_forward,
+        )
+
+        model = base_model.diffusion_model
+        _patch_wan_attention_blocks(
+            model,
+            usp_self_attn_forward,
+            usp_t2v_cross_attn_forward,
+        )
+        model.forward_orig = types.MethodType(usp_multitalk_dit_forward, model)
 
 
 # Chroma Radiance should be using this since the forward_orig MRO in Chroma Radiance is from Chroma itself

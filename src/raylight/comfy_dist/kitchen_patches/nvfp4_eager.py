@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, cast
 
 import torch
+import torch.distributed as dist
 
 _PATCHED = False
 _MISSING = object()
@@ -11,6 +12,10 @@ _ORIG_LAYOUT_PRE = _MISSING
 _ORIG_LAYOUT_POST = _MISSING
 _ORIG_QT_PRE = _MISSING
 _ORIG_QT_POST = _MISSING
+_ORIG_ALL_GATHER_INTO_TENSOR = None
+_ORIG_ALL_GATHER = None
+_ORIG_SCATTER = None
+_ORIG_BROADCAST = None
 
 
 def _get_op(path: str) -> Any:
@@ -25,6 +30,7 @@ def _get_op(path: str) -> Any:
 def install_nvfp4_patches() -> None:
     global _PATCHED
     global _ORIG_LAYOUT_PRE, _ORIG_LAYOUT_POST, _ORIG_QT_PRE, _ORIG_QT_POST
+    global _ORIG_ALL_GATHER_INTO_TENSOR, _ORIG_ALL_GATHER, _ORIG_SCATTER, _ORIG_BROADCAST
     if _PATCHED:
         return
 
@@ -196,6 +202,128 @@ def install_nvfp4_patches() -> None:
         _ORIG_QT_POST = getattr(QuantizedTensor, "fsdp_post_all_gather", _MISSING)
     setattr(QuantizedTensor, "fsdp_pre_all_gather", fsdp_pre_all_gather)
     setattr(QuantizedTensor, "fsdp_post_all_gather", fsdp_post_all_gather)
+
+    if _ORIG_ALL_GATHER_INTO_TENSOR is None:
+        _ORIG_ALL_GATHER_INTO_TENSOR = dist.all_gather_into_tensor
+
+        def all_gather_into_tensor_patched(output_tensor, input_tensor, group=None, async_op=False):
+            if not isinstance(output_tensor, QuantizedTensor) and not isinstance(input_tensor, QuantizedTensor):
+                return _ORIG_ALL_GATHER_INTO_TENSOR(output_tensor, input_tensor, group=group, async_op=async_op)
+            if not isinstance(output_tensor, QuantizedTensor) or not isinstance(input_tensor, QuantizedTensor):
+                raise TypeError("NVFP4 eager all_gather_into_tensor requires QuantizedTensor input and output")
+
+            q_work = _ORIG_ALL_GATHER_INTO_TENSOR(
+                output_tensor._qdata.contiguous().view(torch.uint8),
+                input_tensor._qdata.contiguous().view(torch.uint8),
+                group=group,
+                async_op=async_op,
+            )
+            b_work = _ORIG_ALL_GATHER_INTO_TENSOR(
+                output_tensor._params.block_scale.contiguous().view(torch.uint8),
+                input_tensor._params.block_scale.contiguous().view(torch.uint8),
+                group=group,
+                async_op=async_op,
+            )
+            if async_op:
+                return _CompositeWork(q_work, b_work)
+            output_tensor._params = TensorCoreNVFP4Layout.Params(
+                scale=input_tensor._params.scale,
+                orig_dtype=input_tensor._params.orig_dtype,
+                orig_shape=_scaled_rowwise_orig_shape(input_tensor, output_tensor._qdata),
+                block_scale=output_tensor._params.block_scale,
+                transposed=input_tensor._params.transposed,
+            )
+            return q_work
+
+        dist.all_gather_into_tensor = all_gather_into_tensor_patched
+
+    if _ORIG_ALL_GATHER is None:
+        _ORIG_ALL_GATHER = dist.all_gather
+
+        def all_gather_patched(tensor_list, tensor, group=None, async_op=False):
+            if not isinstance(tensor, QuantizedTensor) and not any(isinstance(t, QuantizedTensor) for t in tensor_list):
+                return _ORIG_ALL_GATHER(tensor_list, tensor, group=group, async_op=async_op)
+            if not isinstance(tensor, QuantizedTensor) or not all(isinstance(t, QuantizedTensor) for t in tensor_list):
+                raise TypeError("NVFP4 eager all_gather requires QuantizedTensor input and outputs")
+
+            q_work = _ORIG_ALL_GATHER(
+                [t._qdata.contiguous().view(torch.uint8) for t in tensor_list],
+                tensor._qdata.contiguous().view(torch.uint8),
+                group=group,
+                async_op=async_op,
+            )
+            b_work = _ORIG_ALL_GATHER(
+                [t._params.block_scale.contiguous().view(torch.uint8) for t in tensor_list],
+                tensor._params.block_scale.contiguous().view(torch.uint8),
+                group=group,
+                async_op=async_op,
+            )
+            if async_op:
+                return _CompositeWork(q_work, b_work)
+            for out_tensor in tensor_list:
+                out_tensor._params = TensorCoreNVFP4Layout.Params(
+                    scale=tensor._params.scale,
+                    orig_dtype=tensor._params.orig_dtype,
+                    orig_shape=_scaled_rowwise_orig_shape(tensor, out_tensor._qdata),
+                    block_scale=out_tensor._params.block_scale,
+                    transposed=tensor._params.transposed,
+                )
+            return q_work
+
+        dist.all_gather = all_gather_patched
+
+    if _ORIG_BROADCAST is None:
+        _ORIG_BROADCAST = dist.broadcast
+
+        def broadcast_patched(tensor, src, group=None, async_op=False):
+            if not isinstance(tensor, QuantizedTensor):
+                return _ORIG_BROADCAST(tensor, src=src, group=group, async_op=async_op)
+            q_work = _ORIG_BROADCAST(tensor._qdata.contiguous().view(torch.uint8), src=src, group=group, async_op=async_op)
+            b_work = _ORIG_BROADCAST(tensor._params.block_scale.contiguous().view(torch.uint8), src=src, group=group, async_op=async_op)
+            if async_op:
+                return _CompositeWork(q_work, b_work)
+            return q_work
+
+        dist.broadcast = broadcast_patched
+
+    if _ORIG_SCATTER is None:
+        _ORIG_SCATTER = dist.scatter
+
+        def scatter_patched(tensor, scatter_list=None, src=0, group=None, async_op=False):
+            has_quant_inputs = isinstance(scatter_list, (list, tuple)) and any(isinstance(t, QuantizedTensor) for t in scatter_list)
+            if not isinstance(tensor, QuantizedTensor) and not has_quant_inputs:
+                return _ORIG_SCATTER(tensor, scatter_list=scatter_list, src=src, group=group, async_op=async_op)
+            if not isinstance(tensor, QuantizedTensor) or not has_quant_inputs:
+                raise TypeError("NVFP4 eager scatter requires QuantizedTensor output and scatter_list")
+
+            q_scatter = [t._qdata.contiguous().view(torch.uint8) if isinstance(t, QuantizedTensor) else t for t in scatter_list]
+            b_scatter = [
+                t._params.block_scale.contiguous().view(torch.uint8) if isinstance(t, QuantizedTensor) else t for t in scatter_list
+            ]
+            q_work = _ORIG_SCATTER(
+                tensor._qdata.contiguous().view(torch.uint8), scatter_list=q_scatter, src=src, group=group, async_op=async_op
+            )
+            b_work = _ORIG_SCATTER(
+                tensor._params.block_scale.contiguous().view(torch.uint8),
+                scatter_list=b_scatter,
+                src=src,
+                group=group,
+                async_op=async_op,
+            )
+            if async_op:
+                return _CompositeWork(q_work, b_work)
+            ref = next((item for item in scatter_list if isinstance(item, QuantizedTensor)), None)
+            if ref is not None:
+                tensor._params = TensorCoreNVFP4Layout.Params(
+                    scale=ref._params.scale,
+                    orig_dtype=ref._params.orig_dtype,
+                    orig_shape=_scaled_rowwise_orig_shape(ref, tensor._qdata),
+                    block_scale=tensor._params.block_scale,
+                    transposed=ref._params.transposed,
+                )
+            return q_work
+
+        dist.scatter = scatter_patched
 
     op_all_gather_ops = tuple(
         op
@@ -573,6 +701,7 @@ def install_nvfp4_patches() -> None:
 def restore_nvfp4_patches() -> None:
     global _PATCHED
     global _ORIG_LAYOUT_PRE, _ORIG_LAYOUT_POST, _ORIG_QT_PRE, _ORIG_QT_POST
+    global _ORIG_ALL_GATHER_INTO_TENSOR, _ORIG_ALL_GATHER, _ORIG_SCATTER, _ORIG_BROADCAST
 
     from comfy_kitchen.tensor.base import QuantizedTensor
     from comfy_kitchen.tensor.nvfp4 import TensorCoreNVFP4Layout
@@ -601,6 +730,19 @@ def restore_nvfp4_patches() -> None:
     else:
         setattr(QuantizedTensor, "fsdp_post_all_gather", _ORIG_QT_POST)
 
+    if _ORIG_ALL_GATHER_INTO_TENSOR is not None:
+        dist.all_gather_into_tensor = _ORIG_ALL_GATHER_INTO_TENSOR
+    if _ORIG_ALL_GATHER is not None:
+        dist.all_gather = _ORIG_ALL_GATHER
+    if _ORIG_BROADCAST is not None:
+        dist.broadcast = _ORIG_BROADCAST
+    if _ORIG_SCATTER is not None:
+        dist.scatter = _ORIG_SCATTER
+
+    _ORIG_ALL_GATHER_INTO_TENSOR = None
+    _ORIG_ALL_GATHER = None
+    _ORIG_BROADCAST = None
+    _ORIG_SCATTER = None
     _ORIG_LAYOUT_PRE = _MISSING
     _ORIG_LAYOUT_POST = _MISSING
     _ORIG_QT_PRE = _MISSING
