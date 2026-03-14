@@ -405,6 +405,6 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
     left_over = sd.keys()
     if len(left_over) > 0:
         logging.info("left over keys in diffusion model: {}".format(left_over))
-    state_dict = model_patcher.model_state_dict()
-    model_patcher.model.to("meta")
+    state_dict = model_patcher.model_state_dict(filter_prefix="diffusion_model.")
+    model_patcher.model.diffusion_model.to("meta")
     return model_patcher, state_dict

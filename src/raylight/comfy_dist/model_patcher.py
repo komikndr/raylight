@@ -80,6 +80,21 @@ def _is_quantized_tensor_like(tensor: torch.Tensor) -> bool:
     return hasattr(tensor, "_qdata") and hasattr(tensor, "_layout_cls") and hasattr(tensor, "_params")
 
 
+def _state_dict_has_quant_payload(state_dict) -> bool:
+    if not isinstance(state_dict, dict):
+        return False
+
+    for key, value in state_dict.items():
+        if key.endswith(".comfy_quant") or key.endswith(".scale_weight") or key.endswith(".weight_scale"):
+            return True
+        if key == "scaled_fp8" or key.endswith(".scaled_fp8"):
+            return True
+        if _is_quantized_tensor_like(value):
+            return True
+
+    return False
+
+
 def patch_fsdp(self):
     print(f"[Rank {self.rank}] Applying FSDP to {type(self.model.diffusion_model).__name__}")
 
@@ -93,8 +108,8 @@ def patch_fsdp(self):
     diffusion_model = self.model.diffusion_model
     fsdp_kwargs = {"reshard_after_forward": True}
     has_qt_runtime = freeze_and_detect_qt(diffusion_model)
-    has_comfy_quant_sd = isinstance(self.fsdp_state_dict, dict) and any(key.endswith(".comfy_quant") for key in self.fsdp_state_dict.keys())
-    use_quant_loader = has_qt_runtime or has_comfy_quant_sd
+    has_quant_sd = _state_dict_has_quant_payload(self.fsdp_state_dict)
+    use_quant_loader = has_qt_runtime or has_quant_sd
 
     fully_shard_bottom_up(diffusion_model, fsdp_kwargs=fsdp_kwargs, native_ignore_scale=not use_quant_loader)
 
@@ -156,7 +171,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
     def config_fsdp(self, rank, device_mesh):
         self.rank = rank
         self.device_mesh = device_mesh
-        self.model.to("meta")
+        self.model.diffusion_model.to("meta")
 
     def set_fsdp_state_dict(self, sd):
         self.fsdp_state_dict = sd
