@@ -172,5 +172,21 @@ def usp_cross_attn_forward(self, x, context=None, mask=None, pe=None, k_pe=None,
         q = apply_rotary_emb(q, pe)
         k = apply_rotary_emb(k, pe if k_pe is None else k_pe)
 
-    out = xfuser_optimized_attention(q, k, v, self.heads)
+    out = xfuser_optimized_attention(
+        q,
+        k,
+        v,
+        self.heads,
+        attn_precision=self.attn_precision,
+        transformer_options=transformer_options,
+    )
+
+    if self.to_gate_logits is not None:
+        gate_logits = self.to_gate_logits(x)
+        b, t, _ = out.shape
+        out = out.view(b, t, self.heads, self.dim_head)
+        gates = 2.0 * torch.sigmoid(gate_logits)
+        out = out * gates.unsqueeze(-1)
+        out = out.view(b, t, self.heads * self.dim_head)
+
     return self.to_out(out)

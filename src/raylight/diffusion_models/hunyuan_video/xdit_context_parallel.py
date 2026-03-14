@@ -57,7 +57,7 @@ def usp_token_refiner_forward(self, x, c, mask, transformer_options={}, *args, *
     norm_x = self.norm1(x)
     qkv = self.self_attn.qkv(norm_x)
     q, k, v = qkv.reshape(qkv.shape[0], qkv.shape[1], 3, self.heads, -1).permute(2, 0, 3, 1, 4)
-    attn = xfuser_optimized_attention(q, k, v, self.heads, skip_reshape=True)
+    attn = xfuser_optimized_attention(q, k, v, self.heads, skip_reshape=True, transformer_options=transformer_options)
 
     x = x + self.self_attn.proj(attn) * mod1.unsqueeze(1)
     x = x + self.mlp(self.norm2(x)) * mod2.unsqueeze(1)
@@ -84,6 +84,7 @@ def usp_dit_forward(
     *args,
     **kwargs,
 ) -> Tensor:
+    transformer_options = transformer_options.copy()
     patches_replace = transformer_options.get("patches_replace", {})
     initial_shape = list(img.shape)
     # running on sequences img
@@ -234,12 +235,13 @@ def usp_dit_forward(
     img = img[:, :img_orig_size, :]
     txt = txt[:, :txt_orig_size, :]
 
-    img = torch.cat((img, txt), 1)
+    img = torch.cat((txt, img), 1)
     img, img_orig_size = pad_to_world_size(img, dim=1)
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     transformer_options["total_blocks"] = len(self.single_blocks)
     transformer_options["block_type"] = "single"
+    transformer_options["img_slice"] = [txt.shape[1], img.shape[1]]
     for i, block in enumerate(self.single_blocks):
         transformer_options["block_index"] = i
         if ("single_block", i) in blocks_replace:
@@ -274,13 +276,13 @@ def usp_dit_forward(
             if i < len(control_o):
                 add = control_o[i]
                 if add is not None:
-                    img[:, : img_len] += add
+                    img[:, txt.shape[1]: img_len + txt.shape[1]] += add
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = get_sp_group().all_gather(img.contiguous(), dim=1)
     img = img[:, :img_orig_size, :]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    img = img[:, : img_len]
+    img = img[:, txt.shape[1]: img_len + txt.shape[1]]
     if ref_latent is not None:
         img = img[:, ref_latent.shape[1]:]
 

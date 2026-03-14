@@ -54,6 +54,8 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
 def usp_dit_forward(self, x, timestep, context, guidance=None, transformer_options={}, *args, **kwargs):
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     # Seq is odd (idk how) if the w == h, so just pad 0 to the end
+    x_orig_size = x.shape[1]
+    context_orig_size = context.shape[1]
     x = pad_if_odd(x, dim=1)
     context = pad_if_odd(context, dim=1)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
@@ -111,6 +113,8 @@ def usp_dit_forward(self, x, timestep, context, guidance=None, transformer_optio
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = get_sp_group().all_gather(img, dim=1)
     txt = get_sp_group().all_gather(txt, dim=1)
+    img = img[:, :x_orig_size, ...]
+    txt = txt[:, :context_orig_size, ...]
 
     img = torch.cat((txt, img), 1)
 
@@ -139,6 +143,7 @@ def usp_dit_forward(self, x, timestep, context, guidance=None, transformer_optio
             img = block(img, vec=vec, pe=pe, attn_mask=attn_mask, transformer_options=transformer_options)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = get_sp_group().all_gather(img, dim=1)
+    img = img[:, :txt.shape[1] + x_orig_size, ...]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = img[:, txt.shape[1]:, ...]
     img = self.final_layer(img, vec)

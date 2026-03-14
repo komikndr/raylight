@@ -175,6 +175,7 @@ def usp_vace_dit_forward(
     transformer_options["total_blocks"] = len(self.blocks)
     transformer_options["block_type"] = "double"
     for i, block in enumerate(self.blocks):
+        transformer_options["block_index"] = i
         if ("double_block", i) in blocks_replace:
 
             def block_wrap(args):
@@ -537,6 +538,7 @@ def usp_self_attn_forward(self, x, freqs, transformer_options={}, **kwargs):
         k.view(b, s, n * d),
         self.v(x).view(b, s, n * d),
         heads=self.num_heads,
+        transformer_options=transformer_options,
     )
     x = x.flatten(2)
 
@@ -548,7 +550,7 @@ def usp_self_attn_forward(self, x, freqs, transformer_options={}, **kwargs):
     return x
 
 
-def usp_t2v_cross_attn_forward(self, x, context, **kwargs):
+def usp_t2v_cross_attn_forward(self, x, context, transformer_options={}, **kwargs):
     r"""
     Args:
         x(Tensor): Shape [B, L1, C]
@@ -559,13 +561,13 @@ def usp_t2v_cross_attn_forward(self, x, context, **kwargs):
     v = self.v(context)
 
     # compute attention
-    x = xfuser_optimized_attention(q, k, v, heads=self.num_heads)
+    x = xfuser_optimized_attention(q, k, v, heads=self.num_heads, transformer_options=transformer_options)
     x = x.flatten(2)
     x = self.o(x)
     return x
 
 
-def usp_i2v_cross_attn_forward(self, x, context, context_img_len, **kwargs):
+def usp_i2v_cross_attn_forward(self, x, context, context_img_len, transformer_options={}, **kwargs):
     r"""
     Args:
         x(Tensor): Shape [B, L1, C]
@@ -580,8 +582,8 @@ def usp_i2v_cross_attn_forward(self, x, context, context_img_len, **kwargs):
     v = self.v(context)
     k_img = self.norm_k_img(self.k_img(context_img))
     v_img = self.v_img(context_img)
-    img_x = xfuser_optimized_attention(q, k_img, v_img, heads=self.num_heads)
-    x = xfuser_optimized_attention(q, k, v, heads=self.num_heads)
+    img_x = xfuser_optimized_attention(q, k_img, v_img, heads=self.num_heads, transformer_options=transformer_options)
+    x = xfuser_optimized_attention(q, k, v, heads=self.num_heads, transformer_options=transformer_options)
     x = x + img_x
     x = x.flatten(2)
     x = self.o(x)

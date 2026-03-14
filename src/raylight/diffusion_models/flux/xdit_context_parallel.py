@@ -74,18 +74,12 @@ def invert_slices(slices, length):
     return output
 
 
-def attention(q, k, v, pe, mask=None) -> Tensor:
+def attention(q, k, v, pe, mask=None, transformer_options={}) -> Tensor:
     if pe is not None:
         q, k = apply_rope(q, k, pe)
 
     heads = q.shape[1]
-    x = xfuser_optimized_attention(
-        q,
-        k,
-        v,
-        heads,
-        skip_reshape=True
-    )
+    x = xfuser_optimized_attention(q, k, v, heads, skip_reshape=True, transformer_options=transformer_options)
     return x
 
 
@@ -134,12 +128,18 @@ def usp_dit_forward(
         txt = self.txt_norm(txt)
     txt = self.txt_in(txt)
 
+    if "post_input" in patches:
+        for p in patches["post_input"]:
+            out = p({"img": img, "txt": txt, "img_ids": img_ids, "txt_ids": txt_ids, "transformer_options": transformer_options})
+            img = out["img"]
+            txt = out["txt"]
+            img_ids = out["img_ids"]
+            txt_ids = out["txt_ids"]
+
     vec_orig = vec
     txt_vec = vec
     modulation_dims = None
-    double_block_kwargs = {}
-    single_block_kwargs = {}
-    final_layer_kwargs = {}
+    extra_kwargs = {}
     if timestep_zero_index is not None:
         modulation_dims = []
         batch = vec.shape[0] // 2
@@ -149,18 +149,10 @@ def usp_dit_forward(
             modulation_dims.append((start, end, 0))
         for start, end in timestep_zero_index:
             modulation_dims.append((start, end, 1))
-        double_block_kwargs["modulation_dims_img"] = modulation_dims
+        extra_kwargs["modulation_dims_img"] = modulation_dims
         txt_vec = vec[:batch]
     if self.params.global_modulation:
         vec = (self.double_stream_modulation_img(vec_orig), self.double_stream_modulation_txt(txt_vec))
-
-    if "post_input" in patches:
-        for p in patches["post_input"]:
-            out = p({"img": img, "txt": txt, "img_ids": img_ids, "txt_ids": txt_ids})
-            img = out["img"]
-            txt = out["txt"]
-            img_ids = out["img_ids"]
-            txt_ids = out["txt_ids"]
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     if img_ids is not None:
@@ -190,14 +182,16 @@ def usp_dit_forward(
                                                txt=args["txt"],
                                                vec=args["vec"],
                                                pe=args["pe"],
+                                               attn_mask=args.get("attn_mask"),
                                                transformer_options=args.get("transformer_options"),
-                                               **double_block_kwargs)
+                                               **extra_kwargs)
                 return out
 
             out = blocks_replace[("double_block", i)]({
                 "img": img,
                 "txt": txt, "vec": vec,
                 "pe": pe_image,
+                "attn_mask": attn_mask,
                 "transformer_options": transformer_options}, {
                 "original_block": block_wrap}
             )
@@ -208,8 +202,9 @@ def usp_dit_forward(
                              txt=txt,
                              vec=vec,
                              pe=pe_image,
+                             attn_mask=attn_mask,
                              transformer_options=transformer_options,
-                             **double_block_kwargs)
+                             **extra_kwargs)
 
         if control is not None:  # Controlnet
             control_i = control.get("input")
@@ -233,12 +228,12 @@ def usp_dit_forward(
 
     if self.params.global_modulation:
         vec, _ = self.single_stream_modulation(vec_orig)
+    extra_kwargs = {}
     if timestep_zero_index is not None:
         assert modulation_dims is not None
-        single_block_kwargs["modulation_dims"] = list(
+        extra_kwargs["modulation_dims"] = list(
             map(lambda x: (0 if x[0] == 0 else x[0] + txt.shape[1], x[1] + txt.shape[1], x[2]), modulation_dims)
         )
-        final_layer_kwargs["modulation_dims"] = modulation_dims
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
@@ -253,24 +248,27 @@ def usp_dit_forward(
                 out["img"] = block(args["img"],
                                    vec=args["vec"],
                                    pe=args["pe"],
+                                   attn_mask=args.get("attn_mask"),
                                    transformer_options=args.get("transformer_options"),
-                                   **single_block_kwargs)
+                                   **extra_kwargs)
                 return out
 
             out = blocks_replace[("single_block", i)]({"img": img,
                                                        "vec": vec,
                                                        "pe": pe_combine,
+                                                       "attn_mask": attn_mask,
                                                        "transformer_options": transformer_options},
                                                       {"original_block": block_wrap})
             img = out["img"]
         else:
-            img = block(img, vec=vec, pe=pe_combine, transformer_options=transformer_options, **single_block_kwargs)
-            if control is not None:  # Controlnet
-                control_o = control.get("output")
-                if i < len(control_o):
-                    add = control_o[i]
-                    if add is not None:
-                        img[:, txt.shape[1]:txt.shape[1] + add.shape[1], ...] += add
+            img = block(img, vec=vec, pe=pe_combine, attn_mask=attn_mask, transformer_options=transformer_options, **extra_kwargs)
+
+        if control is not None:  # Controlnet
+            control_o = control.get("output")
+            if i < len(control_o):
+                add = control_o[i]
+                if add is not None:
+                    img[:, txt.shape[1]:txt.shape[1] + add.shape[1], ...] += add
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = get_sp_group().all_gather(img.contiguous(), dim=1)
@@ -278,7 +276,11 @@ def usp_dit_forward(
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = img[:, txt.shape[1]:, ...]
 
-    img = self.final_layer(img, vec_orig, **final_layer_kwargs)  # (N, T, patch_size ** 2 * out_channels)
+    extra_kwargs = {}
+    if timestep_zero_index is not None:
+        extra_kwargs["modulation_dims"] = modulation_dims
+
+    img = self.final_layer(img, vec_orig, **extra_kwargs)  # (N, T, patch_size ** 2 * out_channels)
     return img
 
 
@@ -306,8 +308,14 @@ def usp_single_stream_forward(
     del qkv
     q, k = self.norm(q, k, v)
 
+    if "attn1_patch" in transformer_patches:
+        patch = transformer_patches["attn1_patch"]
+        for p in patch:
+            out = p(q, k, v, pe=pe, attn_mask=attn_mask, extra_options=extra_options)
+            q, k, v, pe, attn_mask = out.get("q", q), out.get("k", k), out.get("v", v), out.get("pe", pe), out.get("attn_mask", attn_mask)
+
     # compute attention
-    attn = attention(q, k, v, pe=pe)
+    attn = attention(q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options)
     del q, k, v
 
     if "attn1_output_patch" in transformer_patches:
@@ -374,8 +382,15 @@ def usp_double_stream_forward(
     del txt_k, img_k
     v = torch.cat((txt_v, img_v), dim=2)
     del txt_v, img_v
+    extra_options["img_slice"] = [txt.shape[1], q.shape[2]]
+    if "attn1_patch" in transformer_patches:
+        patch = transformer_patches["attn1_patch"]
+        for p in patch:
+            out = p(q, k, v, pe=pe, attn_mask=attn_mask, extra_options=extra_options)
+            q, k, v, pe, attn_mask = out.get("q", q), out.get("k", k), out.get("v", v), out.get("pe", pe), out.get("attn_mask", attn_mask)
+
     # run actual attention
-    attn = attention(q, k, v, pe=None)
+    attn = attention(q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options)
     del q, k, v
 
     if "attn1_output_patch" in transformer_patches:
