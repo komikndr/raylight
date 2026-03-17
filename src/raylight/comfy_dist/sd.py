@@ -186,7 +186,11 @@ def load_lora_for_models_quantized(model, lora, strength_model):
 
 
 def fsdp_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload, model_options={}):
-    sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
+    use_mmap = model_options.get("use_mmap", True)
+    if use_mmap and unet_path.lower().endswith(".safetensors"):
+        sd, metadata = load_safetensors_mmap(unet_path, return_metadata=True)
+    else:
+        sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
     model, state_dict = fsdp_load_diffusion_model_stat_dict(
         sd, rank, device_mesh, is_cpu_offload, model_options=model_options, metadata=metadata
     )
@@ -194,6 +198,49 @@ def fsdp_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload, mode
         logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
         raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))
     return model, state_dict
+
+
+def load_safetensors_mmap(unet_path, return_metadata=False):
+    import safetensors.torch
+    from safetensors import safe_open
+
+    sd = safetensors.torch.load_file(unet_path, device="cpu")
+    if not return_metadata:
+        return sd
+
+    metadata = {}
+    try:
+        with safe_open(unet_path, framework="pt", device="cpu") as handle:
+            metadata = handle.metadata() or {}
+    except Exception:
+        metadata = {}
+
+    return sd, metadata
+
+
+def lazy_load_diffusion_model(unet_path, model_options={}):
+    import comfy.sd
+
+    from raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
+    from raylight.expansion.comfyui_lazytensors.ops import SafetensorOps
+
+    sd = load_safetensors_mmap(unet_path)
+    lazy_sd = wrap_state_dict_lazy(sd)
+
+    load_options = model_options.copy()
+    cast_dtype = load_options.pop("dtype", None)
+    load_options.setdefault("custom_operations", SafetensorOps)
+
+    model = comfy.sd.load_diffusion_model_state_dict(lazy_sd, model_options=load_options)
+    if model is None:
+        logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
+        raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))
+
+    if cast_dtype is not None and hasattr(model, "model"):
+        model.model.manual_cast_dtype = cast_dtype
+
+    model.mmap_cache = sd
+    return model
 
 
 def gguf_load_diffusion_model(unet_path, model_options={}, dequant_dtype=None, patch_dtype=None):
@@ -230,8 +277,12 @@ def gguf_load_diffusion_model(unet_path, model_options={}, dequant_dtype=None, p
 def fsdp_bnb_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload, model_options={}):
     from raylight.expansion.comfyui_bnb import OPS
 
-    sd = comfy.utils.load_torch_file(unet_path)
-    model, state_dict = fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options={"custom_operations": OPS})
+    use_mmap = model_options.get("use_mmap", True)
+    if use_mmap and unet_path.lower().endswith(".safetensors"):
+        sd, metadata = load_safetensors_mmap(unet_path, return_metadata=True)
+    else:
+        sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
+    model, state_dict = fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options={"custom_operations": OPS, "use_mmap": use_mmap}, metadata=metadata)
     if model is None:
         logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
         raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))

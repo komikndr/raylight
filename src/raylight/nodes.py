@@ -151,6 +151,10 @@ class RayInitializer:
                     "BOOLEAN",
                     {"default": True, "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early."},
                 ),
+                "use_mmap": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "Use lazy mmap-backed safetensor loading for non-FSDP models. Disable if a model has compatibility issues."},
+                ),
             },
         }
 
@@ -176,6 +180,7 @@ class RayInitializer:
         ray_dashboard_address: str = "None",
         torch_dist_address: str = "None",
         skip_comm_test: bool = True,
+        use_mmap: bool = True,
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
@@ -209,6 +214,7 @@ class RayInitializer:
         self.parallel_dict["is_fsdp"] = False
         self.parallel_dict["sync_ulysses"] = False
         self.parallel_dict["global_world_size"] = world_size
+        self.parallel_dict["use_mmap"] = use_mmap
 
         if ulysses_degree > 0 or ring_degree > 0 or cfg_degree > 0:
             if ulysses_degree * ring_degree * cfg_degree == 0:
@@ -297,6 +303,10 @@ class RayInitializerAdvanced(RayInitializer):
                 "skip_comm_test": (
                     "BOOLEAN",
                     {"default": True, "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early."},
+                ),
+                "use_mmap": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "Use lazy mmap-backed safetensor loading for non-FSDP models. Disable if a model has compatibility issues."},
                 ),
             },
         }

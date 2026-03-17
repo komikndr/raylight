@@ -244,6 +244,9 @@ class RayWorker:
 
             from raylight.comfy_dist.sd import fsdp_load_diffusion_model
 
+            fsdp_model_options = dict(model_options)
+            fsdp_model_options["use_mmap"] = self.parallel_dict.get("use_mmap", True)
+
             # Monkey patch
             model_patcher.LowVramPatch = LowVramPatch
             model_management.cleanup_models_gc = cleanup_models_gc
@@ -261,7 +264,7 @@ class RayWorker:
                 self.local_rank,
                 self.device_mesh,
                 self.is_cpu_offload,
-                model_options=model_options,
+                model_options=fsdp_model_options,
             )
             torch.cuda.synchronize()
             comfy_model_management.soft_empty_cache()
@@ -271,6 +274,11 @@ class RayWorker:
 
             base_key = self._base_model_key(unet_path, model_options)
             active_key = self._active_model_key(unet_path, model_options)
+            use_mmap = (
+                self.parallel_dict.get("use_mmap", True)
+                and not self.parallel_dict.get("is_quant", False)
+                and unet_path.lower().endswith(".safetensors")
+            )
 
             if self.model is not None and self.active_request_key == active_key:
                 self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
@@ -283,10 +291,25 @@ class RayWorker:
 
             self._reset_active_model()
             self._invalidate_non_fsdp_cache()
-            loaded_model = comfy_sd.load_diffusion_model(
-                unet_path,
-                model_options=model_options,
-            )
+            if use_mmap:
+                from raylight.comfy_dist.sd import lazy_load_diffusion_model
+
+                try:
+                    loaded_model = lazy_load_diffusion_model(
+                        unet_path,
+                        model_options=model_options,
+                    )
+                except Exception as exc:
+                    print(f"[RayWorker {self.local_rank}] Lazy safetensor load failed, falling back to eager load: {exc}")
+                    loaded_model = comfy_sd.load_diffusion_model(
+                        unet_path,
+                        model_options=model_options,
+                    )
+            else:
+                loaded_model = comfy_sd.load_diffusion_model(
+                    unet_path,
+                    model_options=model_options,
+                )
             self.cached_base_model = loaded_model
             self.cached_base_key = base_key
             self._activate_cached_base_model(active_key)
@@ -327,6 +350,8 @@ class RayWorker:
             from raylight.comfy_dist.sd import fsdp_bnb_load_diffusion_model
             from torch.distributed.fsdp import FSDPModule
 
+            fsdp_model_options = {"use_mmap": self.parallel_dict.get("use_mmap", True)}
+
             model_patcher.LowVramPatch = LowVramPatch
             model_management.cleanup_models_gc = cleanup_models_gc
 
@@ -339,6 +364,7 @@ class RayWorker:
                 self.local_rank,
                 self.device_mesh,
                 self.is_cpu_offload,
+                model_options=fsdp_model_options,
             )
         else:
             from raylight.comfy_dist.sd import bnb_load_diffusion_model
