@@ -145,7 +145,13 @@ class RayInitializer:
                     [member.name for member in AttnType],
                     {"default": "TORCH_FLASH", "tooltip": "Attention backend to use in inference"},
                 ),
-            }
+            },
+            "optional": {
+                "skip_comm_test": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early."},
+                ),
+            },
         }
 
     RETURN_TYPES = ("RAY_ACTORS_INIT",)
@@ -169,6 +175,7 @@ class RayInitializer:
         ray_object_store_gb: float = 2.0,
         ray_dashboard_address: str = "None",
         torch_dist_address: str = "None",
+        skip_comm_test: bool = True,
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
@@ -249,7 +256,11 @@ class RayInitializer:
             ray.init(runtime_env=deepcopy(runtime_env_base))
             raise RuntimeError(f"Ray connection failed: {e}")
 
-        ray_nccl_tester(world_size)
+        if not skip_comm_test:
+            print("Running NCCL communication test...")
+            ray_nccl_tester(world_size)
+        else:
+            print("Skipping NCCL test (skip_comm_test=True)")
         ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
         ray_actors = ray_actor_fn()
         return ([ray_actors, ray_actor_fn],)
@@ -281,7 +292,13 @@ class RayInitializerAdvanced(RayInitializer):
                     [member.name for member in AttnType],
                     {"default": "TORCH_FLASH", "tooltip": "Attention backend to use in inference"},
                 ),
-            }
+            },
+            "optional": {
+                "skip_comm_test": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early."},
+                ),
+            },
         }
 
     RETURN_TYPES = ("RAY_ACTORS_INIT",)
