@@ -177,7 +177,7 @@ class RayLoraLoader2:
 
         if self.loaded_lora_path is not None:
             if self.loaded_lora_path == lora_path:
-                lora_path = self.loaded_lora
+                lora_path = self.loaded_lora_path
             else:
                 self.loaded_lora_path = None
 
@@ -188,91 +188,11 @@ class RayLoraLoader2:
         return (ray_actors,)
 
 
-class RayNF4Loader:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "unet_name": (folder_paths.get_filename_list("checkpoints"),),
-                "ray_actors_init": (
-                    "RAY_ACTORS_INIT",
-                    {"tooltip": "Ray Actor to submit the model into"},
-                ),
-            },
-            "optional": {"lora": ("RAY_LORA", {"default": None})},
-        }
-
-    RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
-    FUNCTION = "load_ray_unet"
-
-    CATEGORY = "Raylight"
-
-    def load_ray_unet(
-        self,
-        ray_actors_init,
-        unet_name,
-        lora=None,
-    ):
-        ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
-
-        unet_path = folder_paths.get_full_path_or_raise("checkpoints", unet_name)
-
-        loaded_futures = []
-        patched_futures = []
-
-        for actor in gpu_actors:
-            loaded_futures.append(actor.set_lora_list.remote(lora))
-        ray.get(loaded_futures)
-        loaded_futures = []
-
-        if parallel_dict["is_fsdp"] is True:
-            worker0 = ray.get_actor("RayWorker:0")
-            ray.get(
-                worker0.load_bnb_unet.remote(
-                    unet_path,
-                )
-            )
-            meta_model = ray.get(worker0.get_meta_model.remote())
-
-            for actor in gpu_actors:
-                if actor != worker0:
-                    loaded_futures.append(actor.set_meta_model.remote(meta_model))
-
-            ray.get(loaded_futures)
-            loaded_futures = []
-
-            for actor in gpu_actors:
-                loaded_futures.append(actor.set_state_dict.remote())
-
-            ray.get(loaded_futures)
-            loaded_futures = []
-        else:
-            for actor in gpu_actors:
-                loaded_futures.append(
-                    actor.load_bnb_unet.remote(
-                        unet_path,
-                    )
-                )
-            ray.get(loaded_futures)
-            loaded_futures = []
-
-        for actor in gpu_actors:
-            if parallel_dict["is_xdit"]:
-                patched_futures.append(actor.patch_usp.remote())
-
-        ray.get(patched_futures)
-
-        return (ray_actors,)
-
-
 NODE_CLASS_MAPPINGS = {
     "RayInitializerDebug": RayInitializerDebug,
     "RayLoraLoader2": RayLoraLoader2,
-    "RayNF4Loader": RayNF4Loader
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RayInitializerDebug": "Ray Init Actor (Debug)",
-    "RayNF4Loader": "Load Diffusion BNB Model (Ray)",
 }

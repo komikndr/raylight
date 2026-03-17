@@ -336,48 +336,6 @@ class RayWorker:
 
         self.is_model_loaded = True
 
-    def load_bnb_unet(self, unet_path):
-        if self.parallel_dict["is_fsdp"] is False:
-            self._reset_active_model()
-        self._invalidate_non_fsdp_cache()
-        if self.parallel_dict["is_fsdp"] is True:
-            import comfy.model_patcher as model_patcher
-            import comfy.model_management as model_management
-
-            from raylight.comfy_dist.model_management import cleanup_models_gc
-            from raylight.comfy_dist.model_patcher import LowVramPatch
-
-            from raylight.comfy_dist.sd import fsdp_bnb_load_diffusion_model
-            from torch.distributed.fsdp import FSDPModule
-
-            fsdp_model_options = {"use_mmap": self.parallel_dict.get("use_mmap", True)}
-
-            model_patcher.LowVramPatch = LowVramPatch
-            model_management.cleanup_models_gc = cleanup_models_gc
-
-            m = getattr(self.model, "model", None)
-            if m is not None and isinstance(getattr(m, "diffusion_model", None), FSDPModule):
-                del self.model
-                self.model = None
-            self.model, self.state_dict = fsdp_bnb_load_diffusion_model(
-                unet_path,
-                self.local_rank,
-                self.device_mesh,
-                self.is_cpu_offload,
-                model_options=fsdp_model_options,
-            )
-        else:
-            from raylight.comfy_dist.sd import bnb_load_diffusion_model
-
-            self.model = bnb_load_diffusion_model(
-                unet_path,
-            )
-
-        if self.lora_list is not None:
-            self.load_lora()
-
-        self.is_model_loaded = True
-
     def set_lora_list(self, lora):
         self.lora_list = lora
 
