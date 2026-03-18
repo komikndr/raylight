@@ -256,13 +256,17 @@ class RayWorker:
         if not hasattr(base_model, "diffusion_model") or not hasattr(base_model.diffusion_model, "blocks"):
             raise ValueError(f"PipeFusion requires a Wan diffusion model with blocks, got {type(base_model).__name__}")
 
-        self.pipefusion_stage = build_stage_plan(
-            total_blocks=len(base_model.diffusion_model.blocks),
-            rank=self.xfuser_parallel.pipeline_rank,
-            world_size=self.xfuser_parallel.pipeline_world_size,
-            config=self.pipefusion_config,
-            group_ranks=tuple(self.xfuser_parallel.pp_group().ranks),
-        )
+        self.pipefusion_stage = getattr(self.model, "pipefusion_stage", None)
+        if self.pipefusion_stage is None:
+            self.pipefusion_stage = build_stage_plan(
+                total_blocks=getattr(
+                    base_model.diffusion_model, "_raylight_pipefusion_total_blocks", len(base_model.diffusion_model.blocks)
+                ),
+                rank=self.xfuser_parallel.pipeline_rank,
+                world_size=self.xfuser_parallel.pipeline_world_size,
+                config=self.pipefusion_config,
+                group_ranks=tuple(self.xfuser_parallel.pp_group().ranks),
+            )
 
         runtime = PipeFusionRuntime(
             config=self.pipefusion_config,
@@ -370,7 +374,21 @@ class RayWorker:
 
             self._reset_active_model()
             self._invalidate_non_fsdp_cache()
-            if use_mmap:
+            if self.parallel_dict.get("pipefusion_enabled"):
+                from raylight.comfy_dist.sd import pipefusion_load_diffusion_model
+
+                if self.xfuser_parallel is None:
+                    raise RuntimeError("PipeFusion model loading requires xFuser parallel context")
+
+                pipefusion_model_options = dict(model_options)
+                pipefusion_model_options["use_mmap"] = use_mmap
+                loaded_model = pipefusion_load_diffusion_model(
+                    unet_path,
+                    pipefusion_config=self.pipefusion_config,
+                    parallel_context=self.xfuser_parallel,
+                    model_options=pipefusion_model_options,
+                )
+            elif use_mmap:
                 from raylight.comfy_dist.sd import lazy_load_diffusion_model
 
                 try:

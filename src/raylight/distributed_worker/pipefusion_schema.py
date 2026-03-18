@@ -35,11 +35,16 @@ class StagePlan:
     rank: int
     world_size: int
     group_ranks: tuple[int, ...]
+    total_blocks: int
     stage_start: int
     stage_end: int
     is_first: bool
     is_last: bool
     num_pipeline_patch: int
+
+    @property
+    def local_block_count(self) -> int:
+        return self.stage_end - self.stage_start
 
 
 def _validate_stage_splits(total_blocks: int, world_size: int, config: PipeFusionConfig) -> tuple[int, ...]:
@@ -97,6 +102,7 @@ def build_stage_plan(
         rank=rank,
         world_size=world_size,
         group_ranks=tuple(group_ranks),
+        total_blocks=total_blocks,
         stage_start=stage_start,
         stage_end=stage_end,
         is_first=rank == 0,

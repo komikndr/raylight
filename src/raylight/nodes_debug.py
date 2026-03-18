@@ -7,11 +7,7 @@ import torch
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
-from .distributed_worker.ray_worker import (
-    make_ray_actor_fn,
-    ensure_fresh_actors,
-    ray_nccl_tester
-)
+from .distributed_worker.ray_worker import make_ray_actor_fn, ensure_fresh_actors, ray_nccl_tester
 
 
 class RayInitializerDebug:
@@ -25,6 +21,7 @@ class RayInitializerDebug:
                 "ulysses_degree": ("INT", {"default": 2}),
                 "ring_degree": ("INT", {"default": 1}),
                 "cfg_degree": ("INT", {"default": 1}),
+                "pp_degree": ("INT", {"default": 1}),
                 "sync_ulysses": ("BOOLEAN", {"default": False}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
@@ -58,6 +55,7 @@ class RayInitializerDebug:
         ulysses_degree,
         ring_degree,
         cfg_degree,
+        pp_degree,
         sync_ulysses,
         FSDP,
         FSDP_CPU_OFFLOAD,
@@ -82,24 +80,22 @@ class RayInitializerDebug:
         if world_size == 0:
             raise ValueError("Num of cuda/cudalike device is 0")
         if world_size < ulysses_degree * ring_degree * cfg_degree:
-            raise ValueError(
-                f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=} mul {cfg_degree=}"
-            )
+            raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=} mul {cfg_degree=}")
         if cfg_degree > 2:
-            raise ValueError(
-                "CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2"
-            )
+            raise ValueError("CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2")
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
         self.parallel_dict["sync_ulysses"] = False
         self.parallel_dict["global_world_size"] = world_size
+        self.parallel_dict["pp_degree"] = pp_degree
+        self.parallel_dict["pipefusion_enabled"] = False
+        self.parallel_dict["num_pipeline_patch"] = 1
+        self.parallel_dict["warmup_steps"] = 0
+        self.parallel_dict["pipefusion_stage_splits"] = None
+        self.parallel_dict["pipefusion_debug"] = False
 
-        if (
-            ulysses_degree > 0
-            or ring_degree > 0
-            or cfg_degree > 0
-        ):
+        if ulysses_degree > 0 or ring_degree > 0 or cfg_degree > 0:
             if ulysses_degree * ring_degree * cfg_degree == 0:
                 raise ValueError(f"""ERROR, parallel product of {ulysses_degree=} mul {ring_degree=} mul {cfg_degree=} is 0.
                  Please make sure to set any parallel degree to be greater than 0.
@@ -138,6 +134,7 @@ class RayInitializerDebug:
         ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
         ray_actors = ray_actor_fn()
         return ([ray_actors, ray_actor_fn],)
+
 
 class RayLoraLoader2:
     def __init__(self):

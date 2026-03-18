@@ -51,6 +51,50 @@ def inject_wan21_pipefusion(model_patcher, base_model, *args):
     model._raylight_pipefusion_patched = True
 
 
+def partition_wan_for_pipefusion(base_model, stage):
+    _ensure_base_wan_only(base_model)
+
+    model = base_model.diffusion_model
+    total_blocks = len(model.blocks)
+    model.blocks = torch.nn.ModuleList(
+        [block if stage.stage_start <= block_idx < stage.stage_end else None for block_idx, block in enumerate(model.blocks)]
+    )
+    if not stage.is_first:
+        model.patch_embedding = None
+    if not stage.is_last:
+        model.head = None
+
+    model._raylight_pipefusion_partitioned = True
+    model._raylight_pipefusion_total_blocks = total_blocks
+    model._raylight_pipefusion_stage_start = stage.stage_start
+    model._raylight_pipefusion_stage_end = stage.stage_end
+    return model
+
+
+def filter_wan_state_dict_for_stage(state_dict, stage):
+    filtered = {}
+    for key, value in state_dict.items():
+        if key.startswith("blocks."):
+            parts = key.split(".", 2)
+            if len(parts) < 2 or not parts[1].isdigit():
+                filtered[key] = value
+                continue
+            block_idx = int(parts[1])
+            if stage.stage_start <= block_idx < stage.stage_end:
+                filtered[key] = value
+            continue
+        if key.startswith("patch_embedding."):
+            if stage.is_first:
+                filtered[key] = value
+            continue
+        if key.startswith("head."):
+            if stage.is_last:
+                filtered[key] = value
+            continue
+        filtered[key] = value
+    return filtered
+
+
 def _grid_sizes_from_latent(self, x):
     return tuple(int((x.shape[idx + 2] + (self.patch_size[idx] // 2)) // self.patch_size[idx]) for idx in range(3))
 
@@ -101,8 +145,11 @@ def _run_wan_block(block, block_idx, x, context, e0, freqs, context_img_len, tra
 
 def _run_local_stage(self, chunk, chunk_freqs, context, e0, context_img_len, transformer_options, stage, blocks_replace):
     for block_idx in range(stage.stage_start, stage.stage_end):
+        block = self.blocks[block_idx]
+        if block is None:
+            raise RuntimeError(f"PipeFusion stage {stage.rank} is missing owned Wan block {block_idx}")
         chunk = _run_wan_block(
-            self.blocks[block_idx],
+            block,
             block_idx,
             chunk,
             context,
@@ -236,7 +283,7 @@ def pipefusion_dit_forward(
     grid_sizes = _grid_sizes_from_latent(self, latent_x)
     transformer_options["grid_sizes"] = grid_sizes
     transformer_options["pipefusion_mode"] = pf_context.mode
-    transformer_options["total_blocks"] = len(self.blocks)
+    transformer_options["total_blocks"] = stage.total_blocks
     transformer_options["block_type"] = "double"
 
     if freqs is None:
@@ -264,6 +311,8 @@ def pipefusion_dit_forward(
 
     x_chunks = None
     if stage.is_first:
+        if self.patch_embedding is None:
+            raise RuntimeError("PipeFusion first stage requires Wan patch_embedding to be present")
         tokens = self.patch_embedding(latent_x.float()).to(latent_x.dtype)
         tokens = tokens.flatten(2).transpose(1, 2)
         x_chunks = _split_tensor(tokens, stage.num_pipeline_patch, dim=1)
@@ -296,6 +345,8 @@ def pipefusion_dit_forward(
         )
 
     if stage.is_last:
+        if self.head is None:
+            raise RuntimeError("PipeFusion last stage requires Wan head to be present")
         tokens = torch.cat(final_chunks, dim=1)
         tokens = self.head(tokens, e)
         output = self.unpatchify(tokens, grid_sizes)
