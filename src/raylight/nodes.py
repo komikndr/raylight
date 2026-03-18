@@ -127,18 +127,97 @@ def _quant_metadata_checker(unet_path: str) -> bool:
         return False
 
 
+def _parse_pipefusion_stage_splits(stage_splits: str | None) -> tuple[int, ...] | None:
+    if stage_splits is None:
+        return None
+    stage_splits = stage_splits.strip()
+    if not stage_splits:
+        return None
+    splits = tuple(int(part.strip()) for part in stage_splits.split(",") if part.strip())
+    if not splits:
+        return None
+    return splits
+
+
+def _effective_parallel_degree(value: int | None) -> int:
+    if value is None:
+        return 1
+    value = int(value)
+    return 1 if value <= 0 else value
+
+
+def _apply_pipefusion_parallel_config(
+    parallel_dict: dict[str, Any],
+    *,
+    enabled: bool,
+    world_size: int,
+    pp_degree: int,
+    num_pipeline_patch: int,
+    warmup_steps: int,
+    stage_splits: str | None,
+    debug: bool,
+):
+    parallel_dict["pipefusion_enabled"] = False
+    parallel_dict["pp_degree"] = 1
+    parallel_dict["num_pipeline_patch"] = 1
+    parallel_dict["warmup_steps"] = 0
+    parallel_dict["pipefusion_stage_splits"] = None
+    parallel_dict["pipefusion_debug"] = False
+
+    if not enabled:
+        return
+
+    if parallel_dict.get("is_fsdp"):
+        raise ValueError("PipeFusion v1 is exclusive with FSDP")
+    if world_size < 1:
+        raise ValueError("PipeFusion requires at least 1 GPU")
+    if pp_degree < 1:
+        raise ValueError("PipeFusion pp_degree must be at least 1")
+    if num_pipeline_patch <= 0:
+        raise ValueError("PipeFusion num_pipeline_patch must be positive")
+    if warmup_steps < 0:
+        raise ValueError("PipeFusion warmup_steps cannot be negative")
+
+    effective_ulysses = _effective_parallel_degree(parallel_dict.get("ulysses_degree"))
+    effective_ring = _effective_parallel_degree(parallel_dict.get("ring_degree"))
+    effective_cfg = _effective_parallel_degree(parallel_dict.get("cfg_degree"))
+    expected_world_size = pp_degree * effective_ulysses * effective_ring * effective_cfg
+    if expected_world_size != world_size:
+        raise ValueError(
+            "PipeFusion currently requires the Ray worker count to match "
+            "pp_degree * ulysses_degree * ring_degree * cfg_degree: "
+            f"{world_size} != {pp_degree} * {effective_ulysses} * {effective_ring} * {effective_cfg}"
+        )
+
+    parallel_dict["pipefusion_enabled"] = True
+    parallel_dict["pp_degree"] = pp_degree
+    parallel_dict["num_pipeline_patch"] = num_pipeline_patch
+    parallel_dict["warmup_steps"] = warmup_steps
+    parallel_dict["pipefusion_stage_splits"] = _parse_pipefusion_stage_splits(stage_splits)
+    parallel_dict["pipefusion_debug"] = debug
+
+
 class RayInitializer:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_cluster_address": ("STRING", {"default": "local", "tooltip": "Address of Ray cluster to connect to. Use local for single-machine."}),
+                "ray_cluster_address": (
+                    "STRING",
+                    {"default": "local", "tooltip": "Address of Ray cluster to connect to. Use local for single-machine."},
+                ),
                 "ray_cluster_namespace": ("STRING", {"default": "default", "tooltip": "Namespace for Ray cluster isolation."}),
                 "GPU": ("INT", {"default": 2, "tooltip": "Number of GPUs to use for distributed processing."}),
                 "ulysses_degree": ("INT", {"default": 2, "tooltip": "Ulysses parallelism degree. Divide GPUs across sequence dimension."}),
                 "ring_degree": ("INT", {"default": 1, "tooltip": "Ring attention parallelism degree. Divide GPUs across ring dimension."}),
-                "cfg_degree": ("INT", {"default": 1, "tooltip": "CFG parallelism degree. Divide GPUs across conditional/unconditional batches."}),
-                "sync_ulysses": ("BOOLEAN", {"default": False, "tooltip": "Could fix some VRAM spillage in some workflow when using Ring instead of Ulysses"}),
+                "cfg_degree": (
+                    "INT",
+                    {"default": 1, "tooltip": "CFG parallelism degree. Divide GPUs across conditional/unconditional batches."},
+                ),
+                "sync_ulysses": (
+                    "BOOLEAN",
+                    {"default": False, "tooltip": "Could fix some VRAM spillage in some workflow when using Ring instead of Ulysses"},
+                ),
                 "FSDP": ("BOOLEAN", {"default": False, "tooltip": "Enable to shard, and split model among GPUs"}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False, "tooltip": "Offload non active compute model into CPU"}),
                 "XFuser_attention": (
@@ -149,11 +228,48 @@ class RayInitializer:
             "optional": {
                 "skip_comm_test": (
                     "BOOLEAN",
-                    {"default": True, "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early."},
+                    {
+                        "default": True,
+                        "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early.",
+                    },
                 ),
                 "use_mmap": (
                     "BOOLEAN",
-                    {"default": True, "tooltip": "Use lazy mmap-backed safetensor loading for non-FSDP models. Disable if a model has compatibility issues."},
+                    {
+                        "default": True,
+                        "tooltip": "Use lazy mmap-backed safetensor loading for non-FSDP models. Disable if a model has compatibility issues.",
+                    },
+                ),
+                "pipefusion_enabled": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Enable PipeFusion v1 for base Wan. The xFuser topology can include PP and future SP, but current Wan execution stays PP-only.",
+                    },
+                ),
+                "pp_degree": (
+                    "INT",
+                    {
+                        "default": 2,
+                        "min": 1,
+                        "tooltip": "Pipeline stage count. With xFuser topology enabled, total GPUs must match pp_degree * ulysses_degree * ring_degree * cfg_degree.",
+                    },
+                ),
+                "num_pipeline_patch": (
+                    "INT",
+                    {"default": 4, "min": 1, "tooltip": "Number of token-axis micro-patches after Wan patch embedding."},
+                ),
+                "warmup_steps": (
+                    "INT",
+                    {"default": 1, "min": 0, "tooltip": "Number of synchronous denoising steps before steady-state PipeFusion mode."},
+                ),
+                "pipefusion_stage_splits": (
+                    "STRING",
+                    {"default": "", "tooltip": "Optional comma-separated manual stage splits, for example: 20,20"},
+                ),
+                "pipefusion_debug": (
+                    "BOOLEAN",
+                    {"default": False, "tooltip": "Enable verbose PipeFusion per-rank tracing."},
                 ),
             },
         }
@@ -175,12 +291,18 @@ class RayInitializer:
         sync_ulysses: bool,
         FSDP: bool,
         FSDP_CPU_OFFLOAD: bool,
-        XFuser_attention: int,
+        XFuser_attention: str,
         ray_object_store_gb: float = 2.0,
         ray_dashboard_address: str = "None",
         torch_dist_address: str = "None",
         skip_comm_test: bool = True,
         use_mmap: bool = True,
+        pipefusion_enabled: bool = False,
+        pp_degree: int = 2,
+        num_pipeline_patch: int = 4,
+        warmup_steps: int = 1,
+        pipefusion_stage_splits: str = "",
+        pipefusion_debug: bool = False,
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
@@ -232,6 +354,17 @@ class RayInitializer:
             self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
             self.parallel_dict["is_fsdp"] = True
 
+        _apply_pipefusion_parallel_config(
+            self.parallel_dict,
+            enabled=pipefusion_enabled,
+            world_size=world_size,
+            pp_degree=pp_degree,
+            num_pipeline_patch=num_pipeline_patch,
+            warmup_steps=warmup_steps,
+            stage_splits=pipefusion_stage_splits,
+            debug=pipefusion_debug,
+        )
+
         if ray_dashboard_address != "None":
             dashboard_host, dashboard_port = ray_dashboard_address.rsplit(":", 1)
             dashboard_port = int(dashboard_port)
@@ -279,7 +412,8 @@ class RayInitializerAdvanced(RayInitializer):
             "required": {
                 "ray_cluster_address": (
                     "STRING",
-                    {"default": "local", "tooltip": "Address of Ray cluster to connect to. Use local for single-machine."}),
+                    {"default": "local", "tooltip": "Address of Ray cluster to connect to. Use local for single-machine."},
+                ),
                 "ray_cluster_namespace": ("STRING", {"default": "default", "tooltip": "Namespace for Ray cluster isolation."}),
                 "ray_object_store_gb": ("FLOAT", {"default": 2.0, "tooltip": "Ray global object store, default is plenty enough"}),
                 "ray_dashboard_address": (
@@ -290,8 +424,14 @@ class RayInitializerAdvanced(RayInitializer):
                 "GPU": ("INT", {"default": 2, "tooltip": "Number of GPUs to use for distributed processing."}),
                 "ulysses_degree": ("INT", {"default": 2, "tooltip": "Ulysses parallelism degree. Divide GPUs across sequence dimension."}),
                 "ring_degree": ("INT", {"default": 1, "tooltip": "Ring attention parallelism degree. Divide GPUs across ring dimension."}),
-                "cfg_degree": ("INT", {"default": 1, "tooltip": "CFG parallelism degree. Divide GPUs across conditional/unconditional batches."}),
-                "sync_ulysses": ("BOOLEAN", {"default": False, "tooltip": "Could fix some VRAM spillage in some workflow when using Ring instead of Ulysses"}),
+                "cfg_degree": (
+                    "INT",
+                    {"default": 1, "tooltip": "CFG parallelism degree. Divide GPUs across conditional/unconditional batches."},
+                ),
+                "sync_ulysses": (
+                    "BOOLEAN",
+                    {"default": False, "tooltip": "Could fix some VRAM spillage in some workflow when using Ring instead of Ulysses"},
+                ),
                 "FSDP": ("BOOLEAN", {"default": False, "tooltip": "Enable to shard, and split model among GPUs"}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False, "tooltip": "Offload non active compute model into CPU"}),
                 "XFuser_attention": (
@@ -302,11 +442,48 @@ class RayInitializerAdvanced(RayInitializer):
             "optional": {
                 "skip_comm_test": (
                     "BOOLEAN",
-                    {"default": True, "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early."},
+                    {
+                        "default": True,
+                        "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early.",
+                    },
                 ),
                 "use_mmap": (
                     "BOOLEAN",
-                    {"default": True, "tooltip": "Use lazy mmap-backed safetensor loading for non-FSDP models. Disable if a model has compatibility issues."},
+                    {
+                        "default": True,
+                        "tooltip": "Use lazy mmap-backed safetensor loading for non-FSDP models. Disable if a model has compatibility issues.",
+                    },
+                ),
+                "pipefusion_enabled": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Enable PipeFusion v1 for base Wan. The xFuser topology can include PP and future SP, but current Wan execution stays PP-only.",
+                    },
+                ),
+                "pp_degree": (
+                    "INT",
+                    {
+                        "default": 2,
+                        "min": 1,
+                        "tooltip": "Pipeline stage count. With xFuser topology enabled, total GPUs must match pp_degree * ulysses_degree * ring_degree * cfg_degree.",
+                    },
+                ),
+                "num_pipeline_patch": (
+                    "INT",
+                    {"default": 4, "min": 1, "tooltip": "Number of token-axis micro-patches after Wan patch embedding."},
+                ),
+                "warmup_steps": (
+                    "INT",
+                    {"default": 1, "min": 0, "tooltip": "Number of synchronous denoising steps before steady-state PipeFusion mode."},
+                ),
+                "pipefusion_stage_splits": (
+                    "STRING",
+                    {"default": "", "tooltip": "Optional comma-separated manual stage splits, for example: 20,20"},
+                ),
+                "pipefusion_debug": (
+                    "BOOLEAN",
+                    {"default": False, "tooltip": "Enable verbose PipeFusion per-rank tracing."},
                 ),
             },
         }
@@ -316,6 +493,112 @@ class RayInitializerAdvanced(RayInitializer):
 
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
+
+
+class RayInitializerPipeFusion(RayInitializer):
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ray_cluster_address": (
+                    "STRING",
+                    {"default": "local", "tooltip": "Address of Ray cluster to connect to. Use local for single-machine."},
+                ),
+                "ray_cluster_namespace": ("STRING", {"default": "default", "tooltip": "Namespace for Ray cluster isolation."}),
+                "GPU": ("INT", {"default": 2, "min": 2, "tooltip": "Number of GPUs to use for PipeFusion."}),
+                "pp_degree": (
+                    "INT",
+                    {"default": 2, "min": 2, "tooltip": "Pipeline stage count. PipeFusion v1 requires this to match the GPU count."},
+                ),
+                "num_pipeline_patch": (
+                    "INT",
+                    {"default": 4, "min": 1, "tooltip": "Number of Wan token micro-patches after patch embedding."},
+                ),
+                "warmup_steps": (
+                    "INT",
+                    {"default": 1, "min": 0, "tooltip": "Number of synchronous denoising steps before steady-state pipeline mode."},
+                ),
+            },
+            "optional": {
+                "ray_object_store_gb": (
+                    "FLOAT",
+                    {"default": 2.0, "tooltip": "Ray global object store, default is plenty enough"},
+                ),
+                "ray_dashboard_address": (
+                    "STRING",
+                    {"default": "None", "tooltip": "Same format as torch_dist_address, you need to install ray dashboard to monitor"},
+                ),
+                "torch_dist_address": ("STRING", {"default": "127.0.0.1:29500", "tooltip": "Might need to restart ComfyUI to apply"}),
+                "skip_comm_test": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early.",
+                    },
+                ),
+                "use_mmap": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Use lazy mmap-backed safetensor loading for non-FSDP models. Disable if a model has compatibility issues.",
+                    },
+                ),
+                "pipefusion_stage_splits": (
+                    "STRING",
+                    {"default": "", "tooltip": "Optional comma-separated manual stage splits, for example: 20,20"},
+                ),
+                "pipefusion_debug": (
+                    "BOOLEAN",
+                    {"default": False, "tooltip": "Enable verbose PipeFusion per-rank tracing."},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("RAY_ACTORS_INIT",)
+    RETURN_NAMES = ("ray_actors_init",)
+
+    FUNCTION = "spawn_pipefusion_actor"
+    CATEGORY = "Raylight"
+
+    def spawn_pipefusion_actor(
+        self,
+        ray_cluster_address: str,
+        ray_cluster_namespace: str,
+        GPU: int,
+        pp_degree: int,
+        num_pipeline_patch: int,
+        warmup_steps: int,
+        ray_object_store_gb: float = 2.0,
+        ray_dashboard_address: str = "None",
+        torch_dist_address: str = "127.0.0.1:29500",
+        skip_comm_test: bool = True,
+        use_mmap: bool = True,
+        pipefusion_stage_splits: str = "",
+        pipefusion_debug: bool = False,
+    ):
+        return super().spawn_actor(
+            ray_cluster_address=ray_cluster_address,
+            ray_cluster_namespace=ray_cluster_namespace,
+            GPU=GPU,
+            ulysses_degree=0,
+            ring_degree=0,
+            cfg_degree=0,
+            sync_ulysses=False,
+            FSDP=False,
+            FSDP_CPU_OFFLOAD=False,
+            XFuser_attention=AttnType.TORCH_FLASH.name,
+            ray_object_store_gb=ray_object_store_gb,
+            ray_dashboard_address=ray_dashboard_address,
+            torch_dist_address=torch_dist_address,
+            skip_comm_test=skip_comm_test,
+            use_mmap=use_mmap,
+            pipefusion_enabled=True,
+            pp_degree=pp_degree,
+            num_pipeline_patch=num_pipeline_patch,
+            warmup_steps=warmup_steps,
+            pipefusion_stage_splits=pipefusion_stage_splits,
+            pipefusion_debug=pipefusion_debug,
+        )
 
 
 class RayUNETLoader:
@@ -414,11 +697,13 @@ class RayUNETLoader:
             loaded_futures = []
 
         for actor in gpu_actors:
-            if parallel_dict["is_xdit"]:
+            if parallel_dict["is_xdit"] and not parallel_dict.get("pipefusion_enabled"):
                 if (parallel_dict["ulysses_degree"]) > 1 or (parallel_dict["ring_degree"] > 1):
                     patched_futures.append(actor.patch_usp.remote())
                 if parallel_dict["cfg_degree"] > 1:
                     patched_futures.append(actor.patch_cfg.remote())
+            if parallel_dict.get("pipefusion_enabled"):
+                patched_futures.append(actor.patch_pipefusion.remote())
 
         ray.get(patched_futures)
 
@@ -744,9 +1029,18 @@ class RayVAEDecodeDistributed:
                 "vae_name": (folder_paths.get_filename_list("vae"), {"tooltip": "Name of the VAE model to use for decoding."}),
                 "tile_size": (
                     "INT",
-                    {"default": 512, "min": 64, "max": 4096, "step": 32, "tooltip": "Tile size for spatial decoding. Larger tiles use more memory."},
+                    {
+                        "default": 512,
+                        "min": 64,
+                        "max": 4096,
+                        "step": 32,
+                        "tooltip": "Tile size for spatial decoding. Larger tiles use more memory.",
+                    },
                 ),
-                "overlap": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 32, "tooltip": "Pixel overlap between tiles to prevent artifacts."}),
+                "overlap": (
+                    "INT",
+                    {"default": 64, "min": 0, "max": 4096, "step": 32, "tooltip": "Pixel overlap between tiles to prevent artifacts."},
+                ),
                 "temporal_size": (
                     "INT",
                     {
@@ -798,6 +1092,7 @@ NODE_CLASS_MAPPINGS = {
     "RayLoraLoader": RayLoraLoader,
     "RayInitializer": RayInitializer,
     "RayInitializerAdvanced": RayInitializerAdvanced,
+    "RayInitializerPipeFusion": RayInitializerPipeFusion,
     "DPNoiseList": DPNoiseList,
     "RayVAEDecodeDistributed": RayVAEDecodeDistributed,
 }
@@ -809,6 +1104,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayLoraLoader": "Load Lora Model (Ray)",
     "RayInitializer": "Ray Init Actor",
     "RayInitializerAdvanced": "Ray Init Actor (Advanced)",
+    "RayInitializerPipeFusion": "Ray Init Actor (PipeFusion)",
     "DPNoiseList": "Data Parallel Noise List",
     "RayVAEDecodeDistributed": "Distributed VAE (Ray)",
 }
