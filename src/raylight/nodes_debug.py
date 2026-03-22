@@ -7,11 +7,7 @@ import torch
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
-from .distributed_worker.ray_worker import (
-    make_ray_actor_fn,
-    ensure_fresh_actors,
-    ray_nccl_tester
-)
+from .distributed_worker.ray_worker import make_ray_actor_fn, ensure_fresh_actors, ray_nccl_tester
 
 
 class RayInitializerDebug:
@@ -82,24 +78,22 @@ class RayInitializerDebug:
         if world_size == 0:
             raise ValueError("Num of cuda/cudalike device is 0")
         if world_size < ulysses_degree * ring_degree * cfg_degree:
-            raise ValueError(
-                f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=} mul {cfg_degree=}"
-            )
+            raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=} mul {cfg_degree=}")
         if cfg_degree > 2:
-            raise ValueError(
-                "CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2"
-            )
+            raise ValueError("CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2")
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
         self.parallel_dict["sync_ulysses"] = False
         self.parallel_dict["global_world_size"] = world_size
+        self.parallel_dict["pp_degree"] = 1
+        self.parallel_dict["pipefusion_enabled"] = False
+        self.parallel_dict["num_pipeline_patch"] = 1
+        self.parallel_dict["warmup_steps"] = 0
+        self.parallel_dict["pipefusion_stage_splits"] = None
+        self.parallel_dict["pipefusion_debug"] = False
 
-        if (
-            ulysses_degree > 0
-            or ring_degree > 0
-            or cfg_degree > 0
-        ):
+        if ulysses_degree > 0 or ring_degree > 0 or cfg_degree > 0:
             if ulysses_degree * ring_degree * cfg_degree == 0:
                 raise ValueError(f"""ERROR, parallel product of {ulysses_degree=} mul {ring_degree=} mul {cfg_degree=} is 0.
                  Please make sure to set any parallel degree to be greater than 0.
@@ -139,6 +133,7 @@ class RayInitializerDebug:
         ray_actors = ray_actor_fn()
         return ([ray_actors, ray_actor_fn],)
 
+
 class RayLoraLoader2:
     def __init__(self):
         self.loaded_lora_path = None
@@ -177,7 +172,7 @@ class RayLoraLoader2:
 
         if self.loaded_lora_path is not None:
             if self.loaded_lora_path == lora_path:
-                lora_path = self.loaded_lora
+                lora_path = self.loaded_lora_path
             else:
                 self.loaded_lora_path = None
 
@@ -188,91 +183,11 @@ class RayLoraLoader2:
         return (ray_actors,)
 
 
-class RayNF4Loader:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "unet_name": (folder_paths.get_filename_list("checkpoints"),),
-                "ray_actors_init": (
-                    "RAY_ACTORS_INIT",
-                    {"tooltip": "Ray Actor to submit the model into"},
-                ),
-            },
-            "optional": {"lora": ("RAY_LORA", {"default": None})},
-        }
-
-    RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
-    FUNCTION = "load_ray_unet"
-
-    CATEGORY = "Raylight"
-
-    def load_ray_unet(
-        self,
-        ray_actors_init,
-        unet_name,
-        lora=None,
-    ):
-        ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
-
-        unet_path = folder_paths.get_full_path_or_raise("checkpoints", unet_name)
-
-        loaded_futures = []
-        patched_futures = []
-
-        for actor in gpu_actors:
-            loaded_futures.append(actor.set_lora_list.remote(lora))
-        ray.get(loaded_futures)
-        loaded_futures = []
-
-        if parallel_dict["is_fsdp"] is True:
-            worker0 = ray.get_actor("RayWorker:0")
-            ray.get(
-                worker0.load_bnb_unet.remote(
-                    unet_path,
-                )
-            )
-            meta_model = ray.get(worker0.get_meta_model.remote())
-
-            for actor in gpu_actors:
-                if actor != worker0:
-                    loaded_futures.append(actor.set_meta_model.remote(meta_model))
-
-            ray.get(loaded_futures)
-            loaded_futures = []
-
-            for actor in gpu_actors:
-                loaded_futures.append(actor.set_state_dict.remote())
-
-            ray.get(loaded_futures)
-            loaded_futures = []
-        else:
-            for actor in gpu_actors:
-                loaded_futures.append(
-                    actor.load_bnb_unet.remote(
-                        unet_path,
-                    )
-                )
-            ray.get(loaded_futures)
-            loaded_futures = []
-
-        for actor in gpu_actors:
-            if parallel_dict["is_xdit"]:
-                patched_futures.append(actor.patch_usp.remote())
-
-        ray.get(patched_futures)
-
-        return (ray_actors,)
-
-
 NODE_CLASS_MAPPINGS = {
     "RayInitializerDebug": RayInitializerDebug,
     "RayLoraLoader2": RayLoraLoader2,
-    "RayNF4Loader": RayNF4Loader
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RayInitializerDebug": "Ray Init Actor (Debug)",
-    "RayNF4Loader": "Load Diffusion BNB Model (Ray)",
 }

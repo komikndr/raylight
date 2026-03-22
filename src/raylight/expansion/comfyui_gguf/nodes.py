@@ -53,7 +53,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         else:
             inplace_update = self.weight_inplace_update or inplace_update
             if key not in self.backup:
-                self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(
+                self.backup[key] = collections.namedtuple("Dimension", ["weight", "inplace_update"])(
                     weight.to(device=self.offload_device, copy=inplace_update), inplace_update
                 )
 
@@ -82,7 +82,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         return super().unpatch_model(device_to=device_to, unpatch_weights=unpatch_weights)
 
     def pin_weight_to_device(self, key):
-        op_key = key.rsplit('.', 1)[0]
+        op_key = key.rsplit(".", 1)[0]
         if not self.mmap_released and op_key in self.named_modules_to_munmap:
             # TODO: possible to OOM, find better way to detach
             self.named_modules_to_munmap[op_key].to(self.load_device).to(self.offload_device)
@@ -220,8 +220,10 @@ class RayGGUFLoader:
             loaded_futures = []
 
         for actor in gpu_actors:
-            if parallel_dict["is_xdit"]:
+            if parallel_dict["is_xdit"] and not parallel_dict.get("pipefusion_enabled"):
                 patched_futures.append(actor.patch_usp.remote())
+            if parallel_dict.get("pipefusion_enabled"):
+                patched_futures.append(actor.patch_pipefusion.remote())
 
         ray.get(patched_futures)
 

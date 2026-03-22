@@ -1,7 +1,7 @@
 import torch
 import torch.distributed as dist
-import comfy
 import functools
+from ray.experimental import tqdm_ray as ray_tqdm_module
 from ray.experimental.tqdm_ray import tqdm as ray_tqdm
 import tqdm.auto as tqdm_auto
 
@@ -25,17 +25,37 @@ class Noise_RandomNoise:
         self.seed = seed
 
     def generate_noise(self, input_latent):
+        import comfy.sample as comfy_sample
+
         latent_image = input_latent["samples"]
         batch_inds = (
             input_latent["batch_index"] if "batch_index" in input_latent else None
         )
-        return comfy.sample.prepare_noise(latent_image, self.seed, batch_inds)
+        return comfy_sample.prepare_noise(latent_image, self.seed, batch_inds)
 
 
 # Monkey patch-unpatch tqdm and trange so it does not broke the progress bar
+def _patch_ray_tqdm_close_once():
+    if getattr(ray_tqdm_module, "_raylight_clear_on_close", False):
+        return
+
+    original_close = ray_tqdm_module._Bar.close
+
+    def close_and_clear(self):
+        try:
+            self.bar.clear()
+        except Exception:
+            pass
+        original_close(self)
+
+    ray_tqdm_module._Bar.close = close_and_clear
+    ray_tqdm_module._raylight_clear_on_close = True
+
+
 def patch_ray_tqdm(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        _patch_ray_tqdm_close_once()
 
         rank = dist.get_rank()
         orig_tqdm = tqdm_auto.tqdm

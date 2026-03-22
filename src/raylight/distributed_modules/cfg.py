@@ -45,7 +45,7 @@ if hasattr(model_base, "QwenImage"):
 
     @CFGParallelInjectRegistry.register(model_base.QwenImage)
     def _inject_qwen():
-        from ..diffusion_models.qwen.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+        from ..diffusion_models.qwen_image.xdit_cfg_parallel import cfg_parallel_forward_wrapper
 
         return cfg_parallel_forward_wrapper
 
@@ -73,7 +73,16 @@ if hasattr(model_base, "Hunyuan3Dv2"):
 
     @CFGParallelInjectRegistry.register(model_base.Hunyuan3Dv2)
     def _inject_hunyuan_3dv2():
-        from ..diffusion_models.hunyuan3dv2_1.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+        from ..diffusion_models.hunyuan3d.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "Hunyuan3Dv2_1"):
+
+    @CFGParallelInjectRegistry.register(model_base.Hunyuan3Dv2_1)
+    def _inject_hunyuan_3dv2_1():
+        from ..diffusion_models.hunyuan3d.xdit_cfg_parallel import cfg_parallel_forward_wrapper
 
         return cfg_parallel_forward_wrapper
 
@@ -100,6 +109,15 @@ if hasattr(model_base, "CosmosVideo"):
 
     @CFGParallelInjectRegistry.register(model_base.CosmosVideo)
     def _inject_cosmos():
+        from ..diffusion_models.cosmos.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "CosmosPredict2"):
+
+    @CFGParallelInjectRegistry.register(model_base.CosmosPredict2)
+    def _inject_cosmos_predict2():
         from ..diffusion_models.cosmos.xdit_cfg_parallel import cfg_parallel_forward_wrapper
 
         return cfg_parallel_forward_wrapper

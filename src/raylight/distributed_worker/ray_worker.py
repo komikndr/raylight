@@ -1,30 +1,35 @@
 import os
 import sys
 import gc
-import types
+import functools
 from datetime import timedelta
 
 import torch
 import torch.distributed as dist
 import ray
 
-import comfy
-from comfy import (
-    sd,
-    sample,
-    utils,
-)  # Must manually insert comfy package or ray cannot import raylight to cluster
 import comfy.patcher_extension as pe
 
-import raylight.distributed_modules.attention as xfuser_attn
-
+from raylight.distributed_modules.pipefusion import (
+    PipeFusionInjectRegistry,
+    pipefusion_diffusion_model_wrapper,
+    pipefusion_outer_sample_wrapper,
+    pipefusion_predict_noise_wrapper,
+)
 from raylight.distributed_modules.usp import USPInjectRegistry
 from raylight.distributed_modules.cfg import CFGParallelInjectRegistry
-from raylight.comfy_dist.kitchen_distributed import patch_enable_comfy_kitchen_fsdp
-
-from raylight.comfy_dist.sd import (
-    load_lora_for_models as ray_load_lora_for_models,
-    load_lora_for_models_quantized as ray_load_lora_for_models_quantized,
+from raylight.distributed_worker.pipefusion_schema import (
+    PipeFusionConfig,
+    build_stage_plan,
+)
+from raylight.distributed_worker.pipefusion_state import (
+    PIPEFUSION_RUNTIME_ATTACHMENT,
+    PIPEFUSION_WRAPPER_KEY,
+    PipeFusionRuntime,
+)
+from raylight.distributed_worker.parallel_group_manager import (
+    initialize_xfuser_parallel,
+    requires_xfuser_parallel,
 )
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
@@ -40,6 +45,16 @@ from ray.exceptions import RayActorError
 
 
 # Comfy cli args, does not get pass through into ray actor
+def patch_enable_comfy_kitchen_fsdp(fn):
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        from raylight.comfy_dist.kitchen_distributed import patch_enable_comfy_kitchen_fsdp as patcher
+
+        return patcher(fn)(self, *args, **kwargs)
+
+    return wrapper
+
+
 class RayWorker:
     def __init__(self, local_rank, device_id, parallel_dict):
         self.model = None
@@ -61,6 +76,9 @@ class RayWorker:
         self.device = torch.device(f"cuda:{self.device_id}")
         self.device_mesh = None
         self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
+        self.pipefusion_config = PipeFusionConfig.from_parallel_dict(self.parallel_dict)
+        self.pipefusion_stage = None
+        self.xfuser_parallel = None
 
         self.is_model_loaded = False
         self.is_cpu_offload = self.parallel_dict.get("fsdp_cpu_offload", False)
@@ -80,35 +98,27 @@ class RayWorker:
         # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
             self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
-        else:
+        elif not self.parallel_dict.get("pipefusion_enabled"):
             print(f"Running Ray in normal seperate sampler with: {self.global_world_size} number of workers")
 
-        # From mochi-xdit, xdit, pipelines.py
-        if self.parallel_dict["is_xdit"]:
-            from xfuser.core.distributed import (
-                init_distributed_environment,
-                initialize_model_parallel,
+        if requires_xfuser_parallel(self.parallel_dict):
+            self.xfuser_parallel = initialize_xfuser_parallel(
+                local_rank=self.local_rank,
+                world_size=self.global_world_size,
+                parallel_dict=self.parallel_dict,
             )
-
-            xfuser_attn.set_attn_type(self.parallel_dict["attention"])
-            xfuser_attn.set_sync_ulysses(self.parallel_dict["sync_ulysses"])
-
-            self.cp_degree = self.parallel_dict["ulysses_degree"] * parallel_dict["ring_degree"]
-            self.cfg_degree = self.parallel_dict["cfg_degree"]
-            self.ulysses_degree = self.parallel_dict["ulysses_degree"]
-            self.ring_degree = self.parallel_dict["ring_degree"]
-            self.cfg_degree = self.parallel_dict["cfg_degree"]
-
-            init_distributed_environment(rank=self.local_rank, world_size=self.global_world_size)
-            print("XDiT is enable")
-
-            initialize_model_parallel(
-                sequence_parallel_degree=self.cp_degree,
-                classifier_free_guidance_degree=self.cfg_degree,
-                ring_degree=self.ring_degree,
-                ulysses_degree=self.ulysses_degree,
+            if self.parallel_dict["is_xdit"]:
+                print("XDiT is enable")
+            if self.parallel_dict.get("pipefusion_enabled"):
+                print("PipeFusion xFuser topology is enable")
+            print(
+                "Parallel Degree: "
+                f"Ulysses={self.xfuser_parallel.config.ulysses_degree}, "
+                f"Ring={self.xfuser_parallel.config.ring_degree}, "
+                f"CFG={self.xfuser_parallel.config.cfg_degree}, "
+                f"PP={self.xfuser_parallel.config.pp_degree}, "
+                f"DP={self.xfuser_parallel.config.data_parallel_degree}"
             )
-            print(f"Parallel Degree: Ulysses={self.ulysses_degree}, Ring={self.ring_degree}, CFG={self.cfg_degree}")
 
     def get_meta_model(self):
         first_param_device = next(self.model.model.parameters()).device
@@ -156,6 +166,8 @@ class RayWorker:
         return self._base_model_key(unet_path, model_options) + (self._lora_signature(lora_list),)
 
     def _reset_active_model(self):
+        import comfy.model_management as comfy_model_management
+
         if self.model is not None:
             try:
                 self.model.detach()
@@ -169,7 +181,7 @@ class RayWorker:
         self.model = None
         self.overwrite_cast_dtype = None
         self.active_request_key = None
-        comfy.model_management.soft_empty_cache()
+        comfy_model_management.soft_empty_cache()
         gc.collect()
 
     def _invalidate_non_fsdp_cache(self):
@@ -204,6 +216,7 @@ class RayWorker:
 
     def set_parallel_dict(self, parallel_dict):
         self.parallel_dict = parallel_dict
+        self.pipefusion_config = PipeFusionConfig.from_parallel_dict(self.parallel_dict)
 
     def model_function_runner(self, fn, *args, **kwargs):
         self.model = fn(self.model, *args, **kwargs)
@@ -226,8 +239,82 @@ class RayWorker:
             USPInjectRegistry.inject,
         )
 
+    def patch_pipefusion(self):
+        if not self.pipefusion_config.enabled:
+            return
+        if self.parallel_dict.get("is_fsdp"):
+            raise ValueError("PipeFusion v1 cannot be enabled together with FSDP")
+        if self.xfuser_parallel is None:
+            raise RuntimeError("PipeFusion requires xFuser model parallel state to be initialized")
+        if self.xfuser_parallel.config.cfg_degree != 1:
+            raise NotImplementedError("PipeFusion currently ignores CFG parallel execution; keep cfg_degree at 1")
+        if self.xfuser_parallel.sequence_world_size != 1:
+            raise NotImplementedError(
+                "PipeFusion topology is now initialized through xFuser, but the Wan execution path does not yet combine PP with USP"
+            )
+
+        base_model = self.model.model
+        if not hasattr(base_model, "diffusion_model") or not hasattr(base_model.diffusion_model, "blocks"):
+            raise ValueError(f"PipeFusion requires a Wan diffusion model with blocks, got {type(base_model).__name__}")
+
+        self.pipefusion_stage = getattr(self.model, "pipefusion_stage", None)
+        if self.pipefusion_stage is None:
+            self.pipefusion_stage = build_stage_plan(
+                total_blocks=getattr(
+                    base_model.diffusion_model, "_raylight_pipefusion_total_blocks", len(base_model.diffusion_model.blocks)
+                ),
+                rank=self.xfuser_parallel.pipeline_rank,
+                world_size=self.xfuser_parallel.pipeline_world_size,
+                config=self.pipefusion_config,
+                group_ranks=tuple(self.xfuser_parallel.pp_group().ranks),
+            )
+
+        runtime = PipeFusionRuntime(
+            config=self.pipefusion_config,
+            stage=self.pipefusion_stage,
+            model_name=type(base_model).__name__,
+            parallel=self.xfuser_parallel,
+        )
+        if runtime.debug:
+            print(
+                "[PipeFusion] "
+                f"global_rank={self.xfuser_parallel.global_rank} "
+                f"pp_group={self.pipefusion_stage.group_ranks} "
+                f"stage={self.pipefusion_stage.stage_start}:{self.pipefusion_stage.stage_end} "
+                f"patches={self.pipefusion_stage.num_pipeline_patch}"
+            )
+        self.model.set_attachments(PIPEFUSION_RUNTIME_ATTACHMENT, runtime)
+
+        self.model.remove_callbacks_with_key(pe.CallbacksMP.ON_LOAD, PIPEFUSION_WRAPPER_KEY)
+        self.model.remove_wrappers_with_key(pe.WrappersMP.OUTER_SAMPLE, PIPEFUSION_WRAPPER_KEY)
+        self.model.remove_wrappers_with_key(pe.WrappersMP.PREDICT_NOISE, PIPEFUSION_WRAPPER_KEY)
+        self.model.remove_wrappers_with_key(pe.WrappersMP.DIFFUSION_MODEL, PIPEFUSION_WRAPPER_KEY)
+
+        self.model.add_callback_with_key(
+            pe.CallbacksMP.ON_LOAD,
+            PIPEFUSION_WRAPPER_KEY,
+            PipeFusionInjectRegistry.inject,
+        )
+        self.model.add_wrapper_with_key(
+            pe.WrappersMP.OUTER_SAMPLE,
+            PIPEFUSION_WRAPPER_KEY,
+            pipefusion_outer_sample_wrapper,
+        )
+        self.model.add_wrapper_with_key(
+            pe.WrappersMP.PREDICT_NOISE,
+            PIPEFUSION_WRAPPER_KEY,
+            pipefusion_predict_noise_wrapper,
+        )
+        self.model.add_wrapper_with_key(
+            pe.WrappersMP.DIFFUSION_MODEL,
+            PIPEFUSION_WRAPPER_KEY,
+            pipefusion_diffusion_model_wrapper,
+        )
+
     def load_unet(self, unet_path, model_options):
         if self.parallel_dict["is_fsdp"] is True:
+            import comfy.model_management as comfy_model_management
+
             if self.cached_base_model is not None or self.active_request_key is not None:
                 self._reset_active_model()
             self._invalidate_non_fsdp_cache()
@@ -241,6 +328,9 @@ class RayWorker:
 
             from raylight.comfy_dist.sd import fsdp_load_diffusion_model
 
+            fsdp_model_options = dict(model_options)
+            fsdp_model_options["use_mmap"] = self.parallel_dict.get("use_mmap", True)
+
             # Monkey patch
             model_patcher.LowVramPatch = LowVramPatch
             model_management.cleanup_models_gc = cleanup_models_gc
@@ -250,7 +340,7 @@ class RayWorker:
             self.model = None
             self.state_dict = None
             torch.cuda.synchronize()
-            comfy.model_management.soft_empty_cache()
+            comfy_model_management.soft_empty_cache()
             gc.collect()
 
             self.model, self.state_dict = fsdp_load_diffusion_model(
@@ -258,14 +348,21 @@ class RayWorker:
                 self.local_rank,
                 self.device_mesh,
                 self.is_cpu_offload,
-                model_options=model_options,
+                model_options=fsdp_model_options,
             )
             torch.cuda.synchronize()
-            comfy.model_management.soft_empty_cache()
+            comfy_model_management.soft_empty_cache()
             gc.collect()
         else:
+            import comfy.sd as comfy_sd
+
             base_key = self._base_model_key(unet_path, model_options)
             active_key = self._active_model_key(unet_path, model_options)
+            use_mmap = (
+                self.parallel_dict.get("use_mmap", True)
+                and not self.parallel_dict.get("is_quant", False)
+                and unet_path.lower().endswith(".safetensors")
+            )
 
             if self.model is not None and self.active_request_key == active_key:
                 self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
@@ -278,10 +375,39 @@ class RayWorker:
 
             self._reset_active_model()
             self._invalidate_non_fsdp_cache()
-            loaded_model = comfy.sd.load_diffusion_model(
-                unet_path,
-                model_options=model_options,
-            )
+            if self.parallel_dict.get("pipefusion_enabled"):
+                from raylight.comfy_dist.sd import pipefusion_load_diffusion_model
+
+                if self.xfuser_parallel is None:
+                    raise RuntimeError("PipeFusion model loading requires xFuser parallel context")
+
+                pipefusion_model_options = dict(model_options)
+                pipefusion_model_options["use_mmap"] = use_mmap
+                loaded_model = pipefusion_load_diffusion_model(
+                    unet_path,
+                    pipefusion_config=self.pipefusion_config,
+                    parallel_context=self.xfuser_parallel,
+                    model_options=pipefusion_model_options,
+                )
+            elif use_mmap:
+                from raylight.comfy_dist.sd import lazy_load_diffusion_model
+
+                try:
+                    loaded_model = lazy_load_diffusion_model(
+                        unet_path,
+                        model_options=model_options,
+                    )
+                except Exception as exc:
+                    print(f"[RayWorker {self.local_rank}] Lazy safetensor load failed, falling back to eager load: {exc}")
+                    loaded_model = comfy_sd.load_diffusion_model(
+                        unet_path,
+                        model_options=model_options,
+                    )
+            else:
+                loaded_model = comfy_sd.load_diffusion_model(
+                    unet_path,
+                    model_options=model_options,
+                )
             self.cached_base_model = loaded_model
             self.cached_base_key = base_key
             self._activate_cached_base_model(active_key)
@@ -308,45 +434,6 @@ class RayWorker:
 
         self.is_model_loaded = True
 
-    def load_bnb_unet(self, unet_path):
-        if self.parallel_dict["is_fsdp"] is False:
-            self._reset_active_model()
-        self._invalidate_non_fsdp_cache()
-        if self.parallel_dict["is_fsdp"] is True:
-            import comfy.model_patcher as model_patcher
-            import comfy.model_management as model_management
-
-            from raylight.comfy_dist.model_management import cleanup_models_gc
-            from raylight.comfy_dist.model_patcher import LowVramPatch
-
-            from raylight.comfy_dist.sd import fsdp_bnb_load_diffusion_model
-            from torch.distributed.fsdp import FSDPModule
-
-            model_patcher.LowVramPatch = LowVramPatch
-            model_management.cleanup_models_gc = cleanup_models_gc
-
-            m = getattr(self.model, "model", None)
-            if m is not None and isinstance(getattr(m, "diffusion_model", None), FSDPModule):
-                del self.model
-                self.model = None
-            self.model, self.state_dict = fsdp_bnb_load_diffusion_model(
-                unet_path,
-                self.local_rank,
-                self.device_mesh,
-                self.is_cpu_offload,
-            )
-        else:
-            from raylight.comfy_dist.sd import bnb_load_diffusion_model
-
-            self.model = bnb_load_diffusion_model(
-                unet_path,
-            )
-
-        if self.lora_list is not None:
-            self.load_lora()
-
-        self.is_model_loaded = True
-
     def set_lora_list(self, lora):
         self.lora_list = lora
 
@@ -358,12 +445,20 @@ class RayWorker:
     def load_lora(
         self,
     ):
+        import comfy.sd as comfy_sd
+        import comfy.utils as comfy_utils
+
         for lora in self.lora_list:
             lora_path = lora["path"]
             strength_model = lora["strength_model"]
-            lora_model = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            lora_model = comfy_utils.load_torch_file(lora_path, safe_load=True)
 
             if self.parallel_dict["is_fsdp"] is True:
+                from raylight.comfy_dist.sd import (
+                    load_lora_for_models as ray_load_lora_for_models,
+                    load_lora_for_models_quantized as ray_load_lora_for_models_quantized,
+                )
+
                 if self.parallel_dict["is_quant"] is True:
                     self.model = ray_load_lora_for_models_quantized(
                         self.model,
@@ -377,7 +472,7 @@ class RayWorker:
                         strength_model,
                     )
             else:
-                self.model = comfy.sd.load_lora_for_models(self.model, None, lora_model, strength_model, 0)[0]
+                self.model = comfy_sd.load_lora_for_models(self.model, None, lora_model, strength_model, 0)[0]
             del lora_model
 
     def kill(self):
@@ -387,15 +482,18 @@ class RayWorker:
         ray.actor.exit_actor()
 
     def ray_vae_loader(self, vae_path):
+        import comfy.sd as comfy_sd
+        import comfy.utils as comfy_utils
+
         from ..comfy_dist.sd import decode_tiled_1d, decode_tiled_, decode_tiled_3d
 
         state_dict = {}
         if "pixel_space" in vae_path:
             state_dict["pixel_space_vae"] = torch.tensor(1.0)
         else:
-            state_dict = comfy.utils.load_torch_file(vae_path)
+            state_dict = comfy_utils.load_torch_file(vae_path)
 
-        vae_model = comfy.sd.VAE(sd=state_dict)
+        vae_model = comfy_sd.VAE(sd=state_dict)
         vae_model.throw_exception_if_invalid()
 
         vae_model.decode_tiled_1d = types.MethodType(decode_tiled_1d, vae_model)
@@ -448,10 +546,14 @@ class RayWorker:
         sigmas,
         latent_image,
     ):
+        import comfy.model_management as comfy_model_management
+        import comfy.sample as comfy_sample
+        import comfy.utils as comfy_utils
+
         latent = latent_image
         latent_image = latent["samples"]
         latent = latent.copy()
-        latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
+        latent_image = comfy_sample.fix_empty_latent_channels(self.model, latent_image)
         latent["samples"] = latent_image
 
         if not add_noise:
@@ -468,15 +570,15 @@ class RayWorker:
             del self.state_dict
             self.state_dict = None
             torch.cuda.synchronize()
-            comfy.model_management.soft_empty_cache()
+            comfy_model_management.soft_empty_cache()
             gc.collect()
 
-        disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
+        disable_pbar = comfy_utils.PROGRESS_BAR_ENABLED
         if self.local_rank == 0:
-            disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+            disable_pbar = not comfy_utils.PROGRESS_BAR_ENABLED
 
         with torch.no_grad():
-            samples = comfy.sample.sample_custom(
+            samples = comfy_sample.sample_custom(
                 self.model,
                 noise,
                 cfg,
@@ -496,7 +598,7 @@ class RayWorker:
             self.model.detach()
         else:
             self.model.detach()
-        comfy.model_management.soft_empty_cache()
+        comfy_model_management.soft_empty_cache()
         gc.collect()
         return out
 
@@ -519,8 +621,12 @@ class RayWorker:
         last_step=None,
         force_full_denoise=False,
     ):
+        import comfy.model_management as comfy_model_management
+        import comfy.sample as comfy_sample
+        import comfy.utils as comfy_utils
+
         latent_image = latent["samples"]
-        latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
+        latent_image = comfy_sample.fix_empty_latent_channels(self.model, latent_image)
 
         if self.parallel_dict["is_fsdp"] is True:
             self.model.patch_fsdp()
@@ -534,18 +640,18 @@ class RayWorker:
             )
         else:
             batch_inds = latent["batch_index"] if "batch_index" in latent else None
-            noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
+            noise = comfy_sample.prepare_noise(latent_image, seed, batch_inds)
 
         noise_mask = None
         if "noise_mask" in latent:
             noise_mask = latent["noise_mask"]
 
-        disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
+        disable_pbar = comfy_utils.PROGRESS_BAR_ENABLED
         if self.local_rank == 0:
-            disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+            disable_pbar = not comfy_utils.PROGRESS_BAR_ENABLED
 
         with torch.no_grad():
-            samples = comfy.sample.sample(
+            samples = comfy_sample.sample(
                 self.model,
                 noise,
                 steps,
@@ -573,7 +679,7 @@ class RayWorker:
         # I haven't implemented for non FSDP detached, so all rank model will be move into RAM
         else:
             self.model.detach()
-        comfy.model_management.soft_empty_cache()
+        comfy_model_management.soft_empty_cache()
         gc.collect()
         return (out,)
 
