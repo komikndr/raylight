@@ -47,6 +47,9 @@ def pipefusion_outer_sample_wrapper(executor, *args, **kwargs):
     sigmas = args[3] if len(args) > 3 else kwargs.get("sigmas", ())
     transformer_options = guider.model_options.setdefault("transformer_options", {})
     transformer_options[PIPEFUSION_SESSION_KEY] = PipeFusionSession(runtime).prepare(sigmas)
+    diffusion_model = getattr(guider.model_patcher.model, "diffusion_model", None)
+    if diffusion_model is not None and hasattr(diffusion_model, "reset_activation_cache"):
+        diffusion_model.reset_activation_cache()
 
     try:
         return executor(*args, **kwargs)

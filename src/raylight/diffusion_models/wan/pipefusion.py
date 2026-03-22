@@ -5,11 +5,18 @@ import types
 import torch
 
 from comfy import model_base
-from comfy.ldm.wan.model import sinusoidal_embedding_1d
+from comfy.ldm.flux.math import apply_rope1
+from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.wan.model import WanSelfAttention, sinusoidal_embedding_1d
 
 from xfuser.core.distributed import get_pp_group, get_world_group
 
 from raylight.distributed_worker.pipefusion_state import PIPEFUSION_CONTEXT_KEY
+
+
+PIPEFUSION_PATCH_MODE_KEY = "pipefusion_patch_mode"
+PIPEFUSION_PATCH_TOKEN_INDICES_KEY = "pipefusion_patch_token_indices"
+PIPEFUSION_TOTAL_TOKENS_KEY = "pipefusion_total_tokens"
 
 
 def _fallback_forward(self, x, t, context, clip_fea=None, freqs=None, transformer_options=None, **kwargs):
@@ -48,10 +55,34 @@ def inject_wan21_pipefusion(model_patcher, base_model, *args):
         base_model.concat_cond = types.MethodType(pipefusion_concat_cond, base_model)
     if not hasattr(model, "_raylight_pipefusion_original_forward_orig"):
         model._raylight_pipefusion_original_forward_orig = model.forward_orig
+    if not hasattr(model, "reset_activation_cache"):
+        model.reset_activation_cache = types.MethodType(reset_wan_pipefusion_cache, model)
+    _patch_wan_self_attention_modules(model)
     if getattr(model, "_raylight_pipefusion_patched", False):
         return
     model.forward_orig = types.MethodType(pipefusion_dit_forward, model)
     model._raylight_pipefusion_patched = True
+
+
+def _patch_wan_self_attention_modules(model):
+    for module in model.modules():
+        if not isinstance(module, WanSelfAttention):
+            continue
+        if getattr(module, "_raylight_pipefusion_patched", False):
+            continue
+        module._raylight_pipefusion_original_forward = module.forward
+        module.forward = types.MethodType(pipefusion_wan_self_attention_forward, module)
+        module._raylight_pipefusion_patched = True
+        module._raylight_pipefusion_k_cache = None
+        module._raylight_pipefusion_v_cache = None
+
+
+def reset_wan_pipefusion_cache(self):
+    for module in self.modules():
+        if not isinstance(module, WanSelfAttention):
+            continue
+        module._raylight_pipefusion_k_cache = None
+        module._raylight_pipefusion_v_cache = None
 
 
 def _wan_patch_in_channels(base_model):
@@ -169,7 +200,7 @@ def _split_tensor(tensor, num_chunks, dim=1):
 
 def _split_wan_tensor_by_grid(tensor, grid_sizes, num_chunks):
     if tensor is None:
-        return [None] * num_chunks, None
+        return [None] * num_chunks, [None] * num_chunks, None
 
     t_grid, h_grid, w_grid = grid_sizes
     orig_size = tensor.shape[1]
@@ -179,30 +210,72 @@ def _split_wan_tensor_by_grid(tensor, grid_sizes, num_chunks):
 
     tensor = tensor.contiguous().reshape(tensor.shape[0], t_grid, h_grid, w_grid, *tensor.shape[2:])
 
-    padded_w_grid = ((w_grid + num_chunks - 1) // num_chunks) * num_chunks
-    if padded_w_grid != w_grid:
-        pad_shape = list(tensor.shape)
-        pad_shape[3] = padded_w_grid - w_grid
-        tensor = torch.cat([tensor, tensor.new_zeros(pad_shape)], dim=3)
-
+    token_indices = torch.arange(orig_size, device=tensor.device, dtype=torch.long).reshape(1, t_grid, h_grid, w_grid)
     tail_shape = tensor.shape[4:]
-    chunks = [chunk.contiguous().reshape(chunk.shape[0], -1, *tail_shape) for chunk in torch.chunk(tensor, num_chunks, dim=3)]
-    return chunks, orig_size
+    chunks = [chunk.contiguous().reshape(chunk.shape[0], -1, *tail_shape) for chunk in torch.tensor_split(tensor, num_chunks, dim=3)]
+    index_chunks = [chunk.contiguous().reshape(-1) for chunk in torch.tensor_split(token_indices, num_chunks, dim=3)]
+    return chunks, index_chunks, orig_size
 
 
-def _merge_wan_tensor_chunks_by_grid(chunks, grid_sizes, num_chunks, orig_size):
+def _merge_wan_tensor_chunks_by_grid(chunks, chunk_indices, orig_size):
     if not chunks:
         raise RuntimeError("PipeFusion Wan merge requires at least one chunk")
 
-    t_grid, h_grid, w_grid = grid_sizes
-    padded_w_grid = ((w_grid + num_chunks - 1) // num_chunks) * num_chunks
-    chunk_w_grid = padded_w_grid // num_chunks
     tail_shape = chunks[0].shape[2:]
+    tensor = chunks[0].new_zeros((chunks[0].shape[0], orig_size, *tail_shape))
+    for chunk, token_indices in zip(chunks, chunk_indices):
+        tensor.index_copy_(1, token_indices, chunk)
+    return tensor
 
-    grid_chunks = [chunk.contiguous().reshape(chunk.shape[0], t_grid, h_grid, chunk_w_grid, *tail_shape) for chunk in chunks]
-    tensor = torch.cat(grid_chunks, dim=3)
-    tensor = tensor[:, :, :, :w_grid, ...]
-    return tensor.contiguous().reshape(tensor.shape[0], orig_size, *tail_shape)
+
+def _update_wan_attention_cache(attn, k, v, token_indices, total_tokens):
+    k_cache = getattr(attn, "_raylight_pipefusion_k_cache", None)
+    v_cache = getattr(attn, "_raylight_pipefusion_v_cache", None)
+    cache_shape = (k.shape[0], total_tokens, k.shape[2], k.shape[3])
+
+    if k_cache is None or tuple(k_cache.shape) != cache_shape or k_cache.dtype != k.dtype or k_cache.device != k.device:
+        k_cache = k.new_zeros(cache_shape)
+        v_cache = v.new_zeros(cache_shape)
+
+    k_cache.index_copy_(1, token_indices, k)
+    v_cache.index_copy_(1, token_indices, v)
+    attn._raylight_pipefusion_k_cache = k_cache
+    attn._raylight_pipefusion_v_cache = v_cache
+    return k_cache, v_cache
+
+
+def pipefusion_wan_self_attention_forward(self, x, freqs, transformer_options={}):
+    patches = transformer_options.get("patches", {})
+    b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+
+    q = apply_rope1(self.norm_q(self.q(x)).view(b, s, n, d), freqs)
+    k = apply_rope1(self.norm_k(self.k(x)).view(b, s, n, d), freqs)
+    v = self.v(x).view(b, s, n, d)
+
+    if transformer_options.get(PIPEFUSION_PATCH_MODE_KEY, False):
+        token_indices = transformer_options.get(PIPEFUSION_PATCH_TOKEN_INDICES_KEY)
+        total_tokens = transformer_options.get(PIPEFUSION_TOTAL_TOKENS_KEY)
+        if token_indices is None or total_tokens is None:
+            raise RuntimeError("PipeFusion patch-mode Wan attention is missing token index metadata")
+        k_attn, v_attn = _update_wan_attention_cache(self, k, v, token_indices, total_tokens)
+    else:
+        self._raylight_pipefusion_k_cache = k.contiguous()
+        self._raylight_pipefusion_v_cache = v.contiguous()
+        k_attn, v_attn = k, v
+
+    x = optimized_attention(
+        q.view(b, s, n * d),
+        k_attn.view(b, k_attn.shape[1], n * d),
+        v_attn.view(b, v_attn.shape[1], n * d),
+        heads=self.num_heads,
+        transformer_options=transformer_options,
+    )
+
+    if "attn1_patch" in patches:
+        for p in patches["attn1_patch"]:
+            x = p({"x": x, "q": q, "k": k_attn, "transformer_options": transformer_options})
+
+    return self.o(x)
 
 
 def _run_wan_block(block, block_idx, x, context, e0, freqs, context_img_len, transformer_options, blocks_replace):
@@ -243,23 +316,44 @@ def _run_wan_block(block, block_idx, x, context, e0, freqs, context_img_len, tra
     )
 
 
-def _run_local_stage(self, chunk, chunk_freqs, context, e0, context_img_len, transformer_options, stage, blocks_replace):
-    for block_idx in range(stage.stage_start, stage.stage_end):
-        block = self.blocks[block_idx]
-        if block is None:
-            raise RuntimeError(f"PipeFusion stage {stage.rank} is missing owned Wan block {block_idx}")
-        chunk = _run_wan_block(
-            block,
-            block_idx,
-            chunk,
-            context,
-            e0,
-            chunk_freqs,
-            context_img_len,
-            transformer_options,
-            blocks_replace,
-        )
-    return chunk
+def _run_local_stage(
+    self,
+    chunk,
+    chunk_freqs,
+    context,
+    e0,
+    context_img_len,
+    transformer_options,
+    stage,
+    blocks_replace,
+    patch_mode=False,
+    patch_token_indices=None,
+    total_tokens=None,
+):
+    transformer_options[PIPEFUSION_PATCH_MODE_KEY] = patch_mode
+    transformer_options[PIPEFUSION_PATCH_TOKEN_INDICES_KEY] = patch_token_indices
+    transformer_options[PIPEFUSION_TOTAL_TOKENS_KEY] = total_tokens
+    try:
+        for block_idx in range(stage.stage_start, stage.stage_end):
+            block = self.blocks[block_idx]
+            if block is None:
+                raise RuntimeError(f"PipeFusion stage {stage.rank} is missing owned Wan block {block_idx}")
+            chunk = _run_wan_block(
+                block,
+                block_idx,
+                chunk,
+                context,
+                e0,
+                chunk_freqs,
+                context_img_len,
+                transformer_options,
+                blocks_replace,
+            )
+        return chunk
+    finally:
+        transformer_options.pop(PIPEFUSION_PATCH_MODE_KEY, None)
+        transformer_options.pop(PIPEFUSION_PATCH_TOKEN_INDICES_KEY, None)
+        transformer_options.pop(PIPEFUSION_TOTAL_TOKENS_KEY, None)
 
 
 def _prepare_pp_group(dtype):
@@ -269,42 +363,55 @@ def _prepare_pp_group(dtype):
     return pp_group
 
 
-def _run_sync_warmup(self, pp_group, x_chunks, freqs_chunks, context, e0, context_img_len, transformer_options, blocks_replace, pf_context):
+def _run_sync_warmup(
+    self, pp_group, x_full, freqs_full, context, e0, context_img_len, transformer_options, blocks_replace, pf_context, total_tokens
+):
     stage = pf_context.stage
-    final_chunks = []
+    if stage.is_first:
+        chunk = x_full
+    else:
+        pf_context.trace(f"recv_start full from={pp_group.prev_rank}")
+        chunk = pp_group.pipeline_recv(idx=0)
+        pf_context.trace(f"recv_done full from={pp_group.prev_rank}")
 
-    for micro_idx in range(stage.num_pipeline_patch):
-        if stage.is_first:
-            chunk = x_chunks[micro_idx]
-        else:
-            pf_context.trace(f"recv_start micro={micro_idx} from={pp_group.prev_rank}")
-            chunk = pp_group.pipeline_recv(idx=micro_idx)
-            pf_context.trace(f"recv_done micro={micro_idx} from={pp_group.prev_rank}")
+    chunk = _run_local_stage(
+        self,
+        chunk,
+        freqs_full,
+        context,
+        e0,
+        context_img_len,
+        transformer_options,
+        stage,
+        blocks_replace,
+        patch_mode=False,
+        patch_token_indices=None,
+        total_tokens=total_tokens,
+    )
 
-        chunk = _run_local_stage(
-            self,
-            chunk,
-            freqs_chunks[micro_idx],
-            context,
-            e0,
-            context_img_len,
-            transformer_options,
-            stage,
-            blocks_replace,
-        )
+    if stage.is_last:
+        return chunk
 
-        if stage.is_last:
-            final_chunks.append(chunk)
-            continue
-
-        pf_context.trace(f"send_start micro={micro_idx} to={pp_group.next_rank} shape={tuple(chunk.shape)}")
-        pp_group.pipeline_send(chunk, segment_idx=micro_idx)
-        pf_context.trace(f"send_done micro={micro_idx} to={pp_group.next_rank}")
-
-    return final_chunks
+    pf_context.trace(f"send_start full to={pp_group.next_rank} shape={tuple(chunk.shape)}")
+    pp_group.pipeline_send(chunk, segment_idx=0)
+    pf_context.trace(f"send_done full to={pp_group.next_rank}")
+    return None
 
 
-def _run_pipeline(self, pp_group, x_chunks, freqs_chunks, context, e0, context_img_len, transformer_options, blocks_replace, pf_context):
+def _run_pipeline(
+    self,
+    pp_group,
+    x_chunks,
+    freqs_chunks,
+    chunk_indices,
+    context,
+    e0,
+    context_img_len,
+    transformer_options,
+    blocks_replace,
+    pf_context,
+    total_tokens,
+):
     stage = pf_context.stage
     final_chunks = [None] * stage.num_pipeline_patch
 
@@ -335,6 +442,9 @@ def _run_pipeline(self, pp_group, x_chunks, freqs_chunks, context, e0, context_i
             transformer_options,
             stage,
             blocks_replace,
+            patch_mode=True,
+            patch_token_indices=chunk_indices[micro_idx],
+            total_tokens=total_tokens,
         )
 
         if stage.is_last:
@@ -407,30 +517,38 @@ def pipefusion_dit_forward(
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
-    freqs_chunks, orig_token_count = _split_wan_tensor_by_grid(freqs, grid_sizes, stage.num_pipeline_patch)
+    freqs_chunks, chunk_indices, orig_token_count = _split_wan_tensor_by_grid(freqs, grid_sizes, stage.num_pipeline_patch)
 
-    x_chunks = None
+    full_freqs = freqs[:, :orig_token_count, ...]
+    full_tokens = None
+
     if stage.is_first:
         if self.patch_embedding is None:
             raise RuntimeError("PipeFusion first stage requires Wan patch_embedding to be present")
-        tokens = self.patch_embedding(latent_x.float()).to(latent_x.dtype)
-        tokens = tokens.flatten(2).transpose(1, 2)
-        x_chunks, x_orig_token_count = _split_wan_tensor_by_grid(tokens, grid_sizes, stage.num_pipeline_patch)
+        full_tokens = self.patch_embedding(latent_x.float()).to(latent_x.dtype)
+        full_tokens = full_tokens.flatten(2).transpose(1, 2)
+        x_chunks, x_chunk_indices, x_orig_token_count = _split_wan_tensor_by_grid(full_tokens, grid_sizes, stage.num_pipeline_patch)
         if x_orig_token_count != orig_token_count:
             raise RuntimeError(f"PipeFusion token/freq count mismatch: tokens={x_orig_token_count} freqs={orig_token_count}")
+        for expected, actual in zip(chunk_indices, x_chunk_indices):
+            if not torch.equal(expected, actual):
+                raise RuntimeError("PipeFusion token/freq chunk index mismatch")
+    else:
+        x_chunks = None
 
     if pf_context.is_warmup():
-        final_chunks = _run_sync_warmup(
+        full_tokens = _run_sync_warmup(
             self,
             pp_group,
-            x_chunks,
-            freqs_chunks,
+            full_tokens,
+            full_freqs,
             context,
             e0,
             context_img_len,
             transformer_options,
             blocks_replace,
             pf_context,
+            orig_token_count,
         )
     else:
         final_chunks = _run_pipeline(
@@ -438,18 +556,23 @@ def pipefusion_dit_forward(
             pp_group,
             x_chunks,
             freqs_chunks,
+            chunk_indices,
             context,
             e0,
             context_img_len,
             transformer_options,
             blocks_replace,
             pf_context,
+            orig_token_count,
         )
 
     if stage.is_last:
         if self.head is None:
             raise RuntimeError("PipeFusion last stage requires Wan head to be present")
-        tokens = _merge_wan_tensor_chunks_by_grid(final_chunks, grid_sizes, stage.num_pipeline_patch, orig_token_count)
+        if pf_context.is_warmup():
+            tokens = full_tokens
+        else:
+            tokens = _merge_wan_tensor_chunks_by_grid(final_chunks, chunk_indices, orig_token_count)
         tokens = self.head(tokens, e)
         output = self.unpatchify(tokens, grid_sizes)
     else:
