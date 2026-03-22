@@ -177,20 +177,32 @@ def _split_wan_tensor_by_grid(tensor, grid_sizes, num_chunks):
     if orig_size != expected_tokens:
         raise RuntimeError(f"PipeFusion Wan tensor/grid mismatch: tokens={orig_size} grid={t_grid}x{h_grid}x{w_grid}")
 
+    tensor = tensor.contiguous().reshape(tensor.shape[0], t_grid, h_grid, w_grid, *tensor.shape[2:])
+
     padded_w_grid = ((w_grid + num_chunks - 1) // num_chunks) * num_chunks
     if padded_w_grid != w_grid:
-        pad_tokens = t_grid * h_grid * (padded_w_grid - w_grid)
         pad_shape = list(tensor.shape)
-        pad_shape[1] = pad_tokens
-        tensor = torch.cat([tensor, tensor.new_zeros(pad_shape)], dim=1)
+        pad_shape[3] = padded_w_grid - w_grid
+        tensor = torch.cat([tensor, tensor.new_zeros(pad_shape)], dim=3)
 
-    if tensor.ndim == 3:
-        tensor = tensor.view(tensor.shape[0], t_grid, h_grid, padded_w_grid, tensor.shape[-1])
-        chunks = [chunk.contiguous().view(chunk.shape[0], -1, chunk.shape[-1]) for chunk in torch.chunk(tensor, num_chunks, dim=3)]
-    else:
-        tensor = tensor.view(tensor.shape[0], t_grid, h_grid, padded_w_grid, *tensor.shape[2:])
-        chunks = [chunk.contiguous().view(chunk.shape[0], -1, *chunk.shape[4:]) for chunk in torch.chunk(tensor, num_chunks, dim=3)]
+    tail_shape = tensor.shape[4:]
+    chunks = [chunk.contiguous().reshape(chunk.shape[0], -1, *tail_shape) for chunk in torch.chunk(tensor, num_chunks, dim=3)]
     return chunks, orig_size
+
+
+def _merge_wan_tensor_chunks_by_grid(chunks, grid_sizes, num_chunks, orig_size):
+    if not chunks:
+        raise RuntimeError("PipeFusion Wan merge requires at least one chunk")
+
+    t_grid, h_grid, w_grid = grid_sizes
+    padded_w_grid = ((w_grid + num_chunks - 1) // num_chunks) * num_chunks
+    chunk_w_grid = padded_w_grid // num_chunks
+    tail_shape = chunks[0].shape[2:]
+
+    grid_chunks = [chunk.contiguous().reshape(chunk.shape[0], t_grid, h_grid, chunk_w_grid, *tail_shape) for chunk in chunks]
+    tensor = torch.cat(grid_chunks, dim=3)
+    tensor = tensor[:, :, :, :w_grid, ...]
+    return tensor.contiguous().reshape(tensor.shape[0], orig_size, *tail_shape)
 
 
 def _run_wan_block(block, block_idx, x, context, e0, freqs, context_img_len, transformer_options, blocks_replace):
@@ -437,7 +449,7 @@ def pipefusion_dit_forward(
     if stage.is_last:
         if self.head is None:
             raise RuntimeError("PipeFusion last stage requires Wan head to be present")
-        tokens = torch.cat(final_chunks, dim=1)[:, :orig_token_count, :]
+        tokens = _merge_wan_tensor_chunks_by_grid(final_chunks, grid_sizes, stage.num_pipeline_patch, orig_token_count)
         tokens = self.head(tokens, e)
         output = self.unpatchify(tokens, grid_sizes)
     else:
