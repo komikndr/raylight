@@ -181,12 +181,12 @@ def _apply_pipefusion_runtime_config(
     effective_ulysses = _effective_parallel_degree(parallel_dict.get("ulysses_degree"))
     effective_ring = _effective_parallel_degree(parallel_dict.get("ring_degree"))
     effective_cfg = _effective_parallel_degree(parallel_dict.get("cfg_degree"))
-    expected_world_size = pp_degree * effective_ulysses * effective_ring * effective_cfg
-    if expected_world_size != world_size:
+    model_parallel_size = pp_degree * effective_ulysses * effective_ring * effective_cfg
+    if world_size % model_parallel_size != 0:
         raise ValueError(
-            "PipeFusion currently requires the Ray worker count to match "
+            "PipeFusion requires the Ray worker count to be divisible by "
             "pp_degree * ulysses_degree * ring_degree * cfg_degree: "
-            f"{world_size} != {pp_degree} * {effective_ulysses} * {effective_ring} * {effective_cfg}"
+            f"{world_size} is not divisible by {pp_degree} * {effective_ulysses} * {effective_ring} * {effective_cfg}"
         )
 
     parallel_dict["pipefusion_enabled"] = True

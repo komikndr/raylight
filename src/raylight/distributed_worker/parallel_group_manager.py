@@ -31,6 +31,7 @@ class XFuserParallelConfig:
     ring_degree: int = 1
     cfg_degree: int = 1
     pp_degree: int = 1
+    data_parallel_degree: int = 1
 
     @property
     def sequence_parallel_degree(self) -> int:
@@ -38,6 +39,10 @@ class XFuserParallelConfig:
 
     @property
     def dit_parallel_size(self) -> int:
+        return self.sequence_parallel_degree * self.cfg_degree * self.pp_degree * self.data_parallel_degree
+
+    @property
+    def model_parallel_size(self) -> int:
         return self.sequence_parallel_degree * self.cfg_degree * self.pp_degree
 
     @classmethod
@@ -79,13 +84,20 @@ def requires_xfuser_parallel(parallel_dict: dict) -> bool:
 
 
 def initialize_xfuser_parallel(local_rank: int, world_size: int, parallel_dict: dict) -> XFuserParallelContext:
-    config = XFuserParallelConfig.from_parallel_dict(parallel_dict)
-    if parallel_dict.get("pipefusion_enabled") and world_size != config.dit_parallel_size:
+    base_config = XFuserParallelConfig.from_parallel_dict(parallel_dict)
+    if world_size % base_config.model_parallel_size != 0:
         raise ValueError(
-            "PipeFusion currently requires the Ray worker count to match "
+            "Ray worker count must be divisible by "
             "pp_degree * ulysses_degree * ring_degree * cfg_degree: "
-            f"{world_size} != {config.pp_degree} * {config.ulysses_degree} * {config.ring_degree} * {config.cfg_degree}"
+            f"{world_size} is not divisible by {base_config.pp_degree} * {base_config.ulysses_degree} * {base_config.ring_degree} * {base_config.cfg_degree}"
         )
+    config = XFuserParallelConfig(
+        ulysses_degree=base_config.ulysses_degree,
+        ring_degree=base_config.ring_degree,
+        cfg_degree=base_config.cfg_degree,
+        pp_degree=base_config.pp_degree,
+        data_parallel_degree=world_size // base_config.model_parallel_size,
+    )
 
     if parallel_dict.get("is_xdit"):
         xfuser_attn.set_attn_type(parallel_dict["attention"])
@@ -93,6 +105,7 @@ def initialize_xfuser_parallel(local_rank: int, world_size: int, parallel_dict: 
 
     init_distributed_environment(rank=local_rank, world_size=world_size)
     initialize_model_parallel(
+        data_parallel_degree=config.data_parallel_degree,
         sequence_parallel_degree=config.sequence_parallel_degree,
         classifier_free_guidance_degree=config.cfg_degree,
         ring_degree=config.ring_degree,
@@ -105,7 +118,7 @@ def initialize_xfuser_parallel(local_rank: int, world_size: int, parallel_dict: 
         config.sequence_parallel_degree,
         config.pp_degree,
         config.cfg_degree,
-        1,
+        config.data_parallel_degree,
         "tp-sp-pp-cfg-dp",
     )
     return XFuserParallelContext(

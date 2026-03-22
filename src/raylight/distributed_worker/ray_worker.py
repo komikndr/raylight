@@ -116,7 +116,8 @@ class RayWorker:
                 f"Ulysses={self.xfuser_parallel.config.ulysses_degree}, "
                 f"Ring={self.xfuser_parallel.config.ring_degree}, "
                 f"CFG={self.xfuser_parallel.config.cfg_degree}, "
-                f"PP={self.xfuser_parallel.config.pp_degree}"
+                f"PP={self.xfuser_parallel.config.pp_degree}, "
+                f"DP={self.xfuser_parallel.config.data_parallel_degree}"
             )
 
     def get_meta_model(self):
