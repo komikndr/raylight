@@ -105,6 +105,32 @@ def _split_tensor(tensor, num_chunks, dim=1):
     return [chunk.contiguous() for chunk in torch.tensor_split(tensor, num_chunks, dim=dim)]
 
 
+def _split_wan_tensor_by_grid(tensor, grid_sizes, num_chunks):
+    if tensor is None:
+        return [None] * num_chunks, None
+
+    t_grid, h_grid, w_grid = grid_sizes
+    orig_size = tensor.shape[1]
+    expected_tokens = t_grid * h_grid * w_grid
+    if orig_size != expected_tokens:
+        raise RuntimeError(f"PipeFusion Wan tensor/grid mismatch: tokens={orig_size} grid={t_grid}x{h_grid}x{w_grid}")
+
+    padded_w_grid = ((w_grid + num_chunks - 1) // num_chunks) * num_chunks
+    if padded_w_grid != w_grid:
+        pad_tokens = t_grid * h_grid * (padded_w_grid - w_grid)
+        pad_shape = list(tensor.shape)
+        pad_shape[1] = pad_tokens
+        tensor = torch.cat([tensor, tensor.new_zeros(pad_shape)], dim=1)
+
+    if tensor.ndim == 3:
+        tensor = tensor.view(tensor.shape[0], t_grid, h_grid, padded_w_grid, tensor.shape[-1])
+        chunks = [chunk.contiguous().view(chunk.shape[0], -1, chunk.shape[-1]) for chunk in torch.chunk(tensor, num_chunks, dim=3)]
+    else:
+        tensor = tensor.view(tensor.shape[0], t_grid, h_grid, padded_w_grid, *tensor.shape[2:])
+        chunks = [chunk.contiguous().view(chunk.shape[0], -1, *chunk.shape[4:]) for chunk in torch.chunk(tensor, num_chunks, dim=3)]
+    return chunks, orig_size
+
+
 def _run_wan_block(block, block_idx, x, context, e0, freqs, context_img_len, transformer_options, blocks_replace):
     transformer_options["block_index"] = block_idx
     if ("double_block", block_idx) in blocks_replace:
@@ -307,7 +333,7 @@ def pipefusion_dit_forward(
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
-    freqs_chunks = _split_tensor(freqs, stage.num_pipeline_patch, dim=1)
+    freqs_chunks, orig_token_count = _split_wan_tensor_by_grid(freqs, grid_sizes, stage.num_pipeline_patch)
 
     x_chunks = None
     if stage.is_first:
@@ -315,7 +341,9 @@ def pipefusion_dit_forward(
             raise RuntimeError("PipeFusion first stage requires Wan patch_embedding to be present")
         tokens = self.patch_embedding(latent_x.float()).to(latent_x.dtype)
         tokens = tokens.flatten(2).transpose(1, 2)
-        x_chunks = _split_tensor(tokens, stage.num_pipeline_patch, dim=1)
+        x_chunks, x_orig_token_count = _split_wan_tensor_by_grid(tokens, grid_sizes, stage.num_pipeline_patch)
+        if x_orig_token_count != orig_token_count:
+            raise RuntimeError(f"PipeFusion token/freq count mismatch: tokens={x_orig_token_count} freqs={orig_token_count}")
 
     if pf_context.is_warmup():
         final_chunks = _run_sync_warmup(
@@ -347,7 +375,7 @@ def pipefusion_dit_forward(
     if stage.is_last:
         if self.head is None:
             raise RuntimeError("PipeFusion last stage requires Wan head to be present")
-        tokens = torch.cat(final_chunks, dim=1)
+        tokens = torch.cat(final_chunks, dim=1)[:, :orig_token_count, :]
         tokens = self.head(tokens, e)
         output = self.unpatchify(tokens, grid_sizes)
     else:
