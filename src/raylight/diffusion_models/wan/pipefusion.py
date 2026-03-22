@@ -66,7 +66,7 @@ def inject_wan21_pipefusion(model_patcher, base_model, *args):
 
 def _patch_wan_self_attention_modules(model):
     for module in model.modules():
-        if not isinstance(module, WanSelfAttention):
+        if type(module) is not WanSelfAttention:
             continue
         if getattr(module, "_raylight_pipefusion_patched", False):
             continue
@@ -79,7 +79,7 @@ def _patch_wan_self_attention_modules(model):
 
 def reset_wan_pipefusion_cache(self):
     for module in self.modules():
-        if not isinstance(module, WanSelfAttention):
+        if not getattr(module, "_raylight_pipefusion_patched", False):
             continue
         module._raylight_pipefusion_k_cache = None
         module._raylight_pipefusion_v_cache = None
