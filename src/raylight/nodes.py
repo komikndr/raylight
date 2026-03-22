@@ -228,14 +228,6 @@ class RayInitializer:
                     "INT",
                     {"default": 1, "tooltip": "CFG parallel degree. `2` splits conditional and unconditional passes across GPUs."},
                 ),
-                "pp_degree": (
-                    "INT",
-                    {
-                        "default": 1,
-                        "min": 1,
-                        "tooltip": "Pipeline parallel stage count. `1` disables PP, higher values create more pipeline stages.",
-                    },
-                ),
                 "sync_ulysses": (
                     "BOOLEAN",
                     {
@@ -283,7 +275,6 @@ class RayInitializer:
         ulysses_degree: int,
         ring_degree: int,
         cfg_degree: int,
-        pp_degree: int,
         sync_ulysses: bool,
         FSDP: bool,
         FSDP_CPU_OFFLOAD: bool,
@@ -327,7 +318,7 @@ class RayInitializer:
         self.parallel_dict["sync_ulysses"] = False
         self.parallel_dict["global_world_size"] = world_size
         self.parallel_dict["use_mmap"] = use_mmap
-        self.parallel_dict["pp_degree"] = pp_degree
+        self.parallel_dict["pp_degree"] = 1
         _reset_pipefusion_runtime_config(self.parallel_dict)
 
         if ulysses_degree > 0 or ring_degree > 0 or cfg_degree > 0:
@@ -417,14 +408,6 @@ class RayInitializerAdvanced(RayInitializer):
                 "cfg_degree": (
                     "INT",
                     {"default": 1, "tooltip": "CFG parallel degree. `2` splits conditional and unconditional passes across GPUs."},
-                ),
-                "pp_degree": (
-                    "INT",
-                    {
-                        "default": 1,
-                        "min": 1,
-                        "tooltip": "Pipeline parallel stage count. `1` disables PP, higher values create more pipeline stages.",
-                    },
                 ),
                 "sync_ulysses": (
                     "BOOLEAN",
@@ -1047,7 +1030,6 @@ NODE_CLASS_MAPPINGS = {
     "RayLoraLoader": RayLoraLoader,
     "RayInitializer": RayInitializer,
     "RayInitializerAdvanced": RayInitializerAdvanced,
-    "RayPipeFusionConfig": RayPipeFusionConfig,
     "DPNoiseList": DPNoiseList,
     "RayVAEDecodeDistributed": RayVAEDecodeDistributed,
 }
@@ -1059,7 +1041,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayLoraLoader": "Load Lora Model (Ray)",
     "RayInitializer": "Ray Init Actor",
     "RayInitializerAdvanced": "Ray Init Actor (Advanced)",
-    "RayPipeFusionConfig": "Ray PipeFusion Config",
     "DPNoiseList": "Data Parallel Noise List",
     "RayVAEDecodeDistributed": "Distributed VAE (Ray)",
 }

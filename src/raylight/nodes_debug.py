@@ -21,7 +21,6 @@ class RayInitializerDebug:
                 "ulysses_degree": ("INT", {"default": 2}),
                 "ring_degree": ("INT", {"default": 1}),
                 "cfg_degree": ("INT", {"default": 1}),
-                "pp_degree": ("INT", {"default": 1}),
                 "sync_ulysses": ("BOOLEAN", {"default": False}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
@@ -55,7 +54,6 @@ class RayInitializerDebug:
         ulysses_degree,
         ring_degree,
         cfg_degree,
-        pp_degree,
         sync_ulysses,
         FSDP,
         FSDP_CPU_OFFLOAD,
@@ -88,7 +86,7 @@ class RayInitializerDebug:
         self.parallel_dict["is_fsdp"] = False
         self.parallel_dict["sync_ulysses"] = False
         self.parallel_dict["global_world_size"] = world_size
-        self.parallel_dict["pp_degree"] = pp_degree
+        self.parallel_dict["pp_degree"] = 1
         self.parallel_dict["pipefusion_enabled"] = False
         self.parallel_dict["num_pipeline_patch"] = 1
         self.parallel_dict["warmup_steps"] = 0
