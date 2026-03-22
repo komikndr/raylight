@@ -51,7 +51,7 @@ class XFuserParallelConfig:
             ulysses_degree=_normalized_degree(parallel_dict.get("ulysses_degree")),
             ring_degree=_normalized_degree(parallel_dict.get("ring_degree")),
             cfg_degree=_normalized_degree(parallel_dict.get("cfg_degree")),
-            pp_degree=_normalized_degree(parallel_dict.get("pp_degree")) if parallel_dict.get("pipefusion_enabled") else 1,
+            pp_degree=_normalized_degree(parallel_dict.get("pp_degree")),
         )
 
 
