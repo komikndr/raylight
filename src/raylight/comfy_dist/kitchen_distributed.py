@@ -24,6 +24,7 @@ from comfy_kitchen.tensor import (
     QuantizedLayout,
     QuantizedTensor,
     TensorCoreFP8Layout,
+    TensorCoreGGUFLayout,
     TensorCoreNVFP4Layout,
     get_layout_class,
     register_layout_class,
@@ -31,11 +32,13 @@ from comfy_kitchen.tensor import (
 )
 
 from .kitchen_patches.fp8 import install_fp8_patches, restore_fp8_patches
+from .kitchen_patches.gguf import install_gguf_patches, restore_gguf_patches
 from .kitchen_patches.nvfp4 import install_nvfp4_patches, restore_nvfp4_patches
 
 
 _SITEPKG_LAYOUT_PATCHERS = {
     "fp8": (install_fp8_patches, restore_fp8_patches),
+    "gguf": (install_gguf_patches, restore_gguf_patches),
     "nvfp4": (install_nvfp4_patches, restore_nvfp4_patches),
 }
 
@@ -47,17 +50,17 @@ def _normalize_layouts(layouts):
         return (layouts,)
     if isinstance(layouts, Iterable):
         return tuple(layouts)
-    return ("fp8", "nvfp4")
+    return ("fp8", "gguf", "nvfp4")
 
 
-def install_sitepkg_ck_patches(layouts=("fp8", "nvfp4")):
+def install_sitepkg_ck_patches(layouts=("fp8", "gguf", "nvfp4")):
     for layout in _normalize_layouts(layouts):
         patcher = _SITEPKG_LAYOUT_PATCHERS.get(layout)
         if patcher is not None:
             patcher[0]()
 
 
-def restore_sitepkg_ck_patches(layouts=("fp8", "nvfp4")):
+def restore_sitepkg_ck_patches(layouts=("fp8", "gguf", "nvfp4")):
     for layout in _normalize_layouts(layouts):
         patcher = _SITEPKG_LAYOUT_PATCHERS.get(layout)
         if patcher is not None:
@@ -72,7 +75,7 @@ def patch_enable_comfy_kitchen_fsdp(fn):
     @wraps(fn)
     def wrapper(self, *args, **kwargs):
         patched = False
-        layouts = self.parallel_dict.get("comfy_kitchen_layouts", ("fp8", "nvfp4"))
+        layouts = self.parallel_dict.get("comfy_kitchen_layouts", ("fp8", "gguf", "nvfp4"))
         if self.parallel_dict.get("is_fsdp", False):
             install_sitepkg_ck_patches(layouts=layouts)
             patched = True
@@ -103,6 +106,7 @@ __all__ = [
     "QuantizedLayout",
     "QuantizedTensor",
     "TensorCoreFP8Layout",
+    "TensorCoreGGUFLayout",
     "TensorCoreNVFP4Layout",
     "register_layout_op",
     "register_layout_class",

@@ -509,6 +509,36 @@ def _build_quantized_tensor(
         block_scale = _shard_tensor(block_scale, sharded_meta_param, device, pad_to_local_meta=False)
         params_kwargs["scale"] = tensor_scale
         params_kwargs["block_scale"] = block_scale
+    elif quant_format == "gguf":
+        n_blocks_per_superblock = conf.get("n_blocks_per_superblock", 8)
+        super_block_scale_scale = full_sd.get(f"{prefix}super_block_scale_scale")
+        super_block_min_scale = full_sd.get(f"{prefix}super_block_min_scale")
+        quantized_block_scale = full_sd.get(f"{prefix}quantized_block_scale")
+        quantized_block_min = full_sd.get(f"{prefix}quantized_block_min")
+        if (
+            super_block_scale_scale is None
+            or super_block_min_scale is None
+            or quantized_block_scale is None
+            or quantized_block_min is None
+        ):
+            raise ValueError(f"Missing GGUF scales for {param_name}")
+        super_block_scale_scale = super_block_scale_scale.to(device=device)
+        super_block_min_scale = super_block_min_scale.to(device=device)
+        quantized_block_scale = quantized_block_scale.to(device=device)
+        quantized_block_min = quantized_block_min.to(device=device)
+        super_block_scale_scale = _shard_tensor(super_block_scale_scale, sharded_meta_param, device, pad_to_local_meta=False)
+        super_block_min_scale = _shard_tensor(super_block_min_scale, sharded_meta_param, device, pad_to_local_meta=False)
+        quantized_block_scale = _shard_tensor(quantized_block_scale, sharded_meta_param, device, pad_to_local_meta=False)
+        quantized_block_min = _shard_tensor(quantized_block_min, sharded_meta_param, device, pad_to_local_meta=False)
+        params_kwargs["n_blocks_per_superblock"] = n_blocks_per_superblock
+        params_kwargs["super_block_scale_scale"] = super_block_scale_scale
+        params_kwargs["super_block_min_scale"] = super_block_min_scale
+        params_kwargs["quantized_block_scale"] = quantized_block_scale
+        params_kwargs["quantized_block_min"] = quantized_block_min
+        if f"{prefix}scale" in full_sd:
+            scale = full_sd.get(f"{prefix}scale")
+            if scale is not None:
+                params_kwargs["scale"] = scale.to(device=device)
     else:
         raise ValueError(f"Unsupported quantization format: {quant_format}")
 
@@ -526,6 +556,10 @@ def _release_quant_keys(full_sd: dict[str, Any], param_name: str) -> None:
         f"{prefix}scale_weight",
         f"{prefix}scale_input",
         f"{prefix}comfy_quant",
+        f"{prefix}super_block_scale_scale",
+        f"{prefix}super_block_min_scale",
+        f"{prefix}quantized_block_scale",
+        f"{prefix}quantized_block_min",
     ):
         if key in full_sd:
             full_sd[key] = None
