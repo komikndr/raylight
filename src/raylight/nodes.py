@@ -625,10 +625,10 @@ class DPKSamplerAdvanced:
 
         if len(latent_image) != len(gpu_actors):
             latent_image = [latent_image[0]] * len(gpu_actors)
-        if len(positive) != len(gpu_actors):
-            positive = [positive[0]] * len(gpu_actors)
-        if len(negative) != len(gpu_actors):
-            negative = [negative[0]] * len(gpu_actors)
+        if len(positive) == 1:
+            positive = positive * len(gpu_actors)
+        if len(negative) == 1:
+            negative = negative * len(gpu_actors)
 
         # Clean VRAM for preparation to load model
         gc.collect()

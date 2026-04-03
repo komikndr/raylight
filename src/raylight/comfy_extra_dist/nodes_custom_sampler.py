@@ -340,10 +340,10 @@ class DPSamplerCustom:
         comfy.model_management.soft_empty_cache()
         gpu_actors = ray_actors["workers"]
 
-        if len(positive) != len(gpu_actors):
-            positive = [positive[0]] * len(gpu_actors)
-        if len(negative) != len(gpu_actors):
-            negative = [negative[0]] * len(gpu_actors)
+        if len(positive) == 1:
+            positive = positive * len(gpu_actors)
+        if len(negative) == 1:
+            negative = negative * len(gpu_actors)
 
         futures = [
             actor.custom_sampler.remote(
