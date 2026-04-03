@@ -709,6 +709,39 @@ class DPNoiseList:
         return (noise_list,)
 
 
+class DPConditioningList:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                **{
+                    f"positive_{i}": ("CONDITIONING",)
+                    for i in range(8)
+                },
+                **{
+                    f"negative_{i}": ("CONDITIONING",)
+                    for i in range(8)
+                },
+            }
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("positive", "negative")
+    OUTPUT_IS_LIST = (True, True)
+    FUNCTION = "assemble"
+    CATEGORY = "Raylight"
+
+    def assemble(self, **kwargs):
+        positives = []
+        negatives = []
+        for key, value in kwargs.items():
+            if key.startswith("positive_"):
+                positives.append(value)
+            elif key.startswith("negative_"):
+                negatives.append(value)
+        return (positives, negatives)
+
+
 class RayVAEDecodeDistributed:
     @classmethod
     def INPUT_TYPES(s):
@@ -774,6 +807,7 @@ NODE_CLASS_MAPPINGS = {
     "RayInitializer": RayInitializer,
     "RayInitializerAdvanced": RayInitializerAdvanced,
     "DPNoiseList": DPNoiseList,
+    "DPConditioningList": DPConditioningList,
     "RayVAEDecodeDistributed": RayVAEDecodeDistributed,
 }
 
@@ -785,5 +819,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayInitializer": "Ray Init Actor",
     "RayInitializerAdvanced": "Ray Init Actor (Advanced)",
     "DPNoiseList": "Data Parallel Noise List",
+    "DPConditioningList": "Data Parallel Conditioning List",
     "RayVAEDecodeDistributed": "Distributed VAE (Ray)",
 }
