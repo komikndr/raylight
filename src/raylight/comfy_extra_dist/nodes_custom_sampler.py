@@ -331,8 +331,10 @@ class DPSamplerCustom:
         ray_actors = ray_actors[0]
         add_noise = add_noise[0]
         cfg = cfg[0]
-        positive = positive[0]
-        negative = negative[0]
+        if len(positive) != len(gpu_actors):
+            positive = [positive[0]] * len(gpu_actors)
+        if len(negative) != len(gpu_actors):
+            negative = [negative[0]] * len(gpu_actors)
         sampler = sampler[0]
         sigmas = sigmas[0]
         latent_image = latent_image[0]
@@ -347,8 +349,8 @@ class DPSamplerCustom:
                 add_noise,
                 noise_list[i],
                 cfg,
-                positive,
-                negative,
+                positive[i],
+                negative[i],
                 sampler,
                 sigmas,
                 latent_image,
