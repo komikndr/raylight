@@ -608,10 +608,6 @@ class DPKSamplerAdvanced:
         cfg = cfg[0]
         sampler_name = sampler_name[0]
         scheduler = scheduler[0]
-        if len(positive) != len(gpu_actors):
-            positive = [positive[0]] * len(gpu_actors)
-        if len(negative) != len(gpu_actors):
-            negative = [negative[0]] * len(gpu_actors)
         start_at_step = start_at_step[0]
         end_at_step = end_at_step[0]
         return_with_leftover_noise = return_with_leftover_noise[0]
@@ -629,6 +625,10 @@ class DPKSamplerAdvanced:
 
         if len(latent_image) != len(gpu_actors):
             latent_image = [latent_image[0]] * len(gpu_actors)
+        if len(positive) != len(gpu_actors):
+            positive = [positive[0]] * len(gpu_actors)
+        if len(negative) != len(gpu_actors):
+            negative = [negative[0]] * len(gpu_actors)
 
         # Clean VRAM for preparation to load model
         gc.collect()

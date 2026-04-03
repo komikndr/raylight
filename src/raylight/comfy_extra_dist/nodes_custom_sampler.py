@@ -331,10 +331,6 @@ class DPSamplerCustom:
         ray_actors = ray_actors[0]
         add_noise = add_noise[0]
         cfg = cfg[0]
-        if len(positive) != len(gpu_actors):
-            positive = [positive[0]] * len(gpu_actors)
-        if len(negative) != len(gpu_actors):
-            negative = [negative[0]] * len(gpu_actors)
         sampler = sampler[0]
         sigmas = sigmas[0]
         latent_image = latent_image[0]
@@ -343,6 +339,11 @@ class DPSamplerCustom:
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
         gpu_actors = ray_actors["workers"]
+
+        if len(positive) != len(gpu_actors):
+            positive = [positive[0]] * len(gpu_actors)
+        if len(negative) != len(gpu_actors):
+            negative = [negative[0]] * len(gpu_actors)
 
         futures = [
             actor.custom_sampler.remote(
