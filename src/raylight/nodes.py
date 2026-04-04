@@ -714,13 +714,13 @@ class DPConditioningList:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "positive_1": ("CONDITIONING",),
-                "negative_1": ("CONDITIONING",),
+                "positive_0": ("CONDITIONING",),
+                "negative_0": ("CONDITIONING",),
             },
             "optional": {
                 **{
                     k: ("CONDITIONING",)
-                    for i in range(2, 9)
+                    for i in range(1, 8)
                     for k in (f"positive_{i}", f"negative_{i}")
                 },
             }
@@ -732,12 +732,12 @@ class DPConditioningList:
     FUNCTION = "assemble"
     CATEGORY = "Raylight"
 
-    def assemble(self, positive_1, negative_1, **kwargs):
-        positives = [positive_1]
-        negatives = [negative_1]
-        for i in range(2, 9):
-            positives.append(kwargs.get(f"positive_{i}", positive_1))
-            negatives.append(kwargs.get(f"negative_{i}", negative_1))
+    def assemble(self, positive_0, negative_0, **kwargs):
+        positives = [positive_0]
+        negatives = [negative_0]
+        for i in range(1, 8):
+            positives.append(kwargs.get(f"positive_{i}", positive_0))
+            negatives.append(kwargs.get(f"negative_{i}", negative_0))
         return (positives, negatives)
 
 
