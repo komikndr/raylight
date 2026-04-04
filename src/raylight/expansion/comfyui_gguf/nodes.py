@@ -13,7 +13,7 @@ import comfy.model_patcher
 import comfy.model_management
 import folder_paths
 
-from .ops import move_patch_to_device
+from .ops import GGMLTensor, move_patch_to_device
 from .dequant import is_quantized, is_torch_compatible
 
 from raylight.distributed_worker.ray_worker import ensure_fresh_actors
@@ -46,6 +46,10 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
 
         patches = self.patches[key]
         if is_quantized(weight):
+            if key not in self.backup:
+                self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(
+                    weight, inplace_update
+                )
             out_weight = weight.to(device_to)
             patches = move_patch_to_device(patches, self.load_device if self.patch_on_device else self.offload_device)
             # TODO: do we ever have legitimate duplicate patches? (i.e. patch on top of patched weight)
@@ -78,7 +82,33 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 patches = getattr(p, "patches", [])
                 if len(patches) > 0:
                     p.patches = []
-        # TODO: Find another way to not unload after patches
+
+        # Restore mmap-backed parameters to preserve OS page sharing across workers.
+        # Without this, super().unpatch_model() calls model.to(cpu) which copies
+        # GPU tensors to private CPU memory (~16GB per worker), breaking mmap sharing.
+        mmap_backup = getattr(self, '_mmap_param_backup', None)
+        if mmap_backup:
+            for name, param in self.model.named_parameters():
+                if name in mmap_backup:
+                    param.data = mmap_backup[name]
+            # Move only non-mmap-backed params to offload device
+            if device_to is not None:
+                for name, param in self.model.named_parameters():
+                    if name not in mmap_backup:
+                        param.data = param.data.to(device_to)
+            # Clear backup so super() skips weight restoration (already done above).
+            # Also clear self.backup which may contain GPU tensor references from
+            # patch_weight_to_device — keeping them would prevent GC of GPU memory.
+            self.backup.clear()
+            # Delegate all other cleanup to super() (hooks, pins, lowvram state,
+            # comfy_patched_weights flags, memory tracking, object patches).
+            # Pass device_to=None so super() skips model.to(device_to) since we
+            # already moved params above.
+            super().unpatch_model(device_to=None, unpatch_weights=unpatch_weights)
+
+            return
+
+        # Fallback: no mmap backup available
         return super().unpatch_model(device_to=device_to, unpatch_weights=unpatch_weights)
 
     def pin_weight_to_device(self, key):
@@ -95,6 +125,20 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     def load(self, *args, force_patch_weights=False, **kwargs):
         if not self.mmap_released:
             self.named_modules_to_munmap = dict(self.model.named_modules())
+            # Save mmap-backed quantized params before super().load() moves them to GPU.
+            # super().load() calls m.to(device_to) on all modules (model_patcher.py:865),
+            # which replaces mmap references with GPU copies. We save them here so
+            # unpatch_model() can restore them instead of calling model.to(cpu) which
+            # would create private ~16GB copies per worker.
+            if not hasattr(self, '_mmap_param_backup') or self._mmap_param_backup is None:
+                self._mmap_param_backup = {}
+                for name, param in self.model.named_parameters():
+                    # Save ALL mmap-backed params (both quantized and F16/F32),
+                    # not just quantized ones. F16/F32 GGMLTensor params are also
+                    # backed by mmap and lose their sharing when m.to(device) replaces
+                    # them with GPU copies.
+                    if isinstance(param.data, GGMLTensor):
+                        self._mmap_param_backup[name] = param.data
 
         # always call `patch_weight_to_device` even for lowvram
         super().load(*args, force_patch_weights=True, **kwargs)
@@ -131,6 +175,9 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         # GGUF specific clone values below
         n.patch_on_device = getattr(self, "patch_on_device", False)
         n.mmap_released = getattr(self, "mmap_released", False)
+        mmap_backup = getattr(self, '_mmap_param_backup', None)
+        if mmap_backup is not None:
+            n._mmap_param_backup = dict(mmap_backup)
         if src_cls != GGUFModelPatcher:
             n.size = 0  # force recalc
         return n
