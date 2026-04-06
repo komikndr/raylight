@@ -210,6 +210,7 @@ class RayWorker:
                 return
             raise ValueError("Worker state_dict is None before set_state_dict")
         self.model.set_fsdp_state_dict(self.state_dict)
+        self.state_dict = None
 
     def get_compute_capability(self):
         return self.compute_capability

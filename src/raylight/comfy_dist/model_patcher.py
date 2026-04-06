@@ -166,6 +166,7 @@ def patch_fsdp(self):
             broadcast_from_rank0=True,
         )
         set_model_state_dict(self.model, self.fsdp_state_dict, options=options)
+        self.fsdp_state_dict = None
 
     print("FSDP registered successfully.")
     return self.model
@@ -396,6 +397,12 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
             if device_to is not None:
                 if next(self.model.parameters()).device == torch.device("meta"):
+                    pass
+                elif isinstance(self.model.diffusion_model, FSDPModule):
+                    # FSDP-wrapped model: self.model.to(device_to) would call
+                    # DTensor.to(device) on each parameter, which materializes
+                    # full tensors per worker (breaking sharding). The backup
+                    # DTensor shards are already on the offload device, so skip.
                     pass
                 else:
                     self.model.to(device_to)
