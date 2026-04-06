@@ -65,6 +65,16 @@ def _ensure_runtime_workdir(module_dir: Path) -> Path:
     return runtime_dir
 
 
+def _get_ray_cuda_visible_devices() -> str | None:
+    """Read RAY_CUDA_VISIBLE_DEVICES env var to restrict which GPUs Ray can use.
+
+    Format: comma-separated GPU indices, e.g. "1,2,3,4,5,6,7"
+    When set, Ray will only see and schedule actors on these GPUs,
+    while ComfyUI's main process continues using all GPUs normally.
+    """
+    return os.environ.get("RAY_CUDA_VISIBLE_DEVICES")
+
+
 def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir: Path):
     python_path_entries = [str(repo_root)]
     existing = os.environ.get("PYTHONPATH")
@@ -76,6 +86,10 @@ def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir:
         "PYTHONPATH": python_path,
         "COMFYUI_BASE_DIRECTORY": str(repo_root),
     }
+
+    ray_cuda_devices = _get_ray_cuda_visible_devices()
+    if ray_cuda_devices is not None:
+        env_vars["CUDA_VISIBLE_DEVICES"] = ray_cuda_devices
 
     return {
         "py_modules": [str(module_dir)],
@@ -188,9 +202,13 @@ class RayInitializer:
         _monkey()
 
         world_size = GPU
-        max_world_size = torch.cuda.device_count()
+        ray_cuda_devices = _get_ray_cuda_visible_devices()
+        if ray_cuda_devices is not None:
+            max_world_size = len(ray_cuda_devices.split(","))
+        else:
+            max_world_size = torch.cuda.device_count()
         if world_size > max_world_size:
-            raise ValueError("Too many gpus")
+            raise ValueError(f"Too many gpus: requested {world_size} but only {max_world_size} available (RAY_CUDA_VISIBLE_DEVICES={ray_cuda_devices})")
         if world_size == 0:
             raise ValueError("Num of cuda/cudalike device is 0")
         if world_size < ulysses_degree * ring_degree * cfg_degree:
@@ -235,15 +253,28 @@ class RayInitializer:
         try:
             # Shut down so if comfy user try another workflow it will not cause error
             ray.shutdown()
-            ray.init(
-                ray_cluster_address,
-                namespace=ray_cluster_namespace,
-                runtime_env=deepcopy(runtime_env_base),
-                object_store_memory=ray_object_store_gb,
-                include_dashboard=enable_dashboard,
-                dashboard_host=dashboard_host,
-                dashboard_port=dashboard_port,
-            )
+
+            ray_cuda_devices = _get_ray_cuda_visible_devices()
+            orig_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+            if ray_cuda_devices is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = ray_cuda_devices
+
+            try:
+                ray.init(
+                    ray_cluster_address,
+                    namespace=ray_cluster_namespace,
+                    runtime_env=deepcopy(runtime_env_base),
+                    object_store_memory=ray_object_store_gb,
+                    include_dashboard=enable_dashboard,
+                    dashboard_host=dashboard_host,
+                    dashboard_port=dashboard_port,
+                )
+            finally:
+                if ray_cuda_devices is not None:
+                    if orig_cuda_visible is not None:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = orig_cuda_visible
+                    else:
+                        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         except Exception as e:
             ray.shutdown()
             ray.init(runtime_env=deepcopy(runtime_env_base))
