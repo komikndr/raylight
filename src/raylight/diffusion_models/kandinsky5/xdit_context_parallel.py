@@ -6,6 +6,7 @@ from xfuser.core.distributed import (
 )
 import raylight.distributed_modules.attention as xfuser_attn
 from ..utils import pad_to_world_size
+
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
@@ -36,7 +37,7 @@ def usp_dit_forward(self, x, timestep, context, y, freqs, freqs_text, transforme
         context = block(context, time_embed, freqs_text, transformer_options=transformer_options)
 
     context = get_sp_group().all_gather(context.contiguous(), dim=1)
-    context = torch.chunk(context, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    context = context[:, :context_orig_size, :]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     visual_embed = self.visual_embeddings(x)
@@ -57,25 +58,28 @@ def usp_dit_forward(self, x, timestep, context, y, freqs, freqs_text, transforme
     for i, block in enumerate(self.visual_transformer_blocks):
         transformer_options["block_index"] = i
         if ("double_block", i) in blocks_replace:
-            def block_wrap(args):
-                return block(x=args["x"],
-                             context=args["context"],
-                             time_embed=args["time_embed"],
-                             freqs=args["freqs"],
-                             transformer_options=args.get("transformer_options"))
 
-            visual_embed = blocks_replace[("double_block", i)]({"x": visual_embed,
-                                                                "context": context,
-                                                                "time_embed": time_embed,
-                                                                "freqs": freqs,
-                                                                "transformer_options": transformer_options},
-                                                               {"original_block": block_wrap})["x"]
+            def block_wrap(args):
+                return block(
+                    x=args["x"],
+                    context=args["context"],
+                    time_embed=args["time_embed"],
+                    freqs=args["freqs"],
+                    transformer_options=args.get("transformer_options"),
+                )
+
+            visual_embed = blocks_replace[("double_block", i)](
+                {
+                    "x": visual_embed,
+                    "context": context,
+                    "time_embed": time_embed,
+                    "freqs": freqs,
+                    "transformer_options": transformer_options,
+                },
+                {"original_block": block_wrap},
+            )["x"]
         else:
-            visual_embed = block(visual_embed,
-                                 context,
-                                 time_embed,
-                                 freqs=freqs,
-                                 transformer_options=transformer_options)
+            visual_embed = block(visual_embed, context, time_embed, freqs=freqs, transformer_options=transformer_options)
 
     visual_embed = get_sp_group().all_gather(visual_embed.contiguous(), dim=1)
     visual_embed = visual_embed[:, :visual_embed_orig_size, :]

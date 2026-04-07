@@ -608,9 +608,7 @@ def usp_t2v_cross_attn_gather_forward(self, x, context, transformer_options={}, 
     # Handle video spatial structure
     q = q.reshape(k.shape[0], -1, n, d).transpose(1, 2)
 
-    x = xfuser_optimized_attention(
-        q, k, v, heads=self.num_heads, skip_reshape=True, skip_output_reshape=True
-    )
+    x = xfuser_optimized_attention(q, k, v, heads=self.num_heads, skip_reshape=True, skip_output_reshape=True)
 
     x = x.transpose(1, 2).reshape(b, -1, n * d)
     x = x.flatten(2)
@@ -638,22 +636,20 @@ def usp_scail_dit_forward(
     x = self.patch_embedding(x.float()).to(x.dtype)
     grid_sizes = x.shape[2:]
     transformer_options["grid_sizes"] = grid_sizes
-
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
-    sp_world = get_sequence_parallel_world_size()
-    sp_rank = get_sequence_parallel_rank()
-
-    x, orig_size = _pad_and_split_for_sp(x, dim=1)
-    freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    x = x.flatten(2).transpose(1, 2)
 
     scail_pose_seq_len = 0
     if pose_latents is not None:
         scail_x = self.patch_embedding_pose(pose_latents.float()).to(x.dtype)
-        scail_x, _ = _pad_and_split_for_sp(scail_x, dim=1)
+        scail_x = scail_x.flatten(2).transpose(1, 2)
         scail_pose_seq_len = scail_x.shape[1]
         x = torch.cat([x, scail_x], dim=1)
         del scail_x
+
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    x, orig_size = _pad_and_split_for_sp(x, dim=1)
+    freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype=x[0].dtype))
     e = e.reshape(t.shape[0], -1, e.shape[-1])
@@ -675,6 +671,7 @@ def usp_scail_dit_forward(
     for i, block in enumerate(self.blocks):
         transformer_options["block_index"] = i
         if ("double_block", i) in blocks_replace:
+
             def block_wrap(args):
                 out = {}
                 out["img"] = block(
@@ -715,7 +712,7 @@ def usp_scail_dit_forward(
     x = self.unpatchify(x, grid_sizes)
 
     if reference_latent is not None:
-        x = x[:, :, reference_latent.shape[2]:]
+        x = x[:, :, reference_latent.shape[2] :]
 
     return x
 
@@ -764,6 +761,7 @@ def usp_multitalk_dit_forward(
     for i, block in enumerate(self.blocks):
         transformer_options["block_index"] = i
         if ("double_block", i) in blocks_replace:
+
             def block_wrap(args):
                 out = {}
                 out["img"] = block(

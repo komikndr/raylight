@@ -25,6 +25,8 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 import raylight.distributed_modules.attention as xfuser_attn
+from ..utils import pad_to_world_size
+
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
@@ -107,27 +109,40 @@ def usp_general_dit_forward(
         inputs["adaln_lora_B_3D"],
         inputs["original_shape"],
     )
-    extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = inputs["extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D"].to(x.dtype)
+    extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = inputs["extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D"]
+    if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
+        extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.to(x.dtype)
     del inputs
 
     if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
-        assert (
-            x.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape
-        ), f"{x.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape} {original_shape}"
+        assert x.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape, (
+            f"{x.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape} {original_shape}"
+        )
+
+    if self.blocks["block0"].x_format != "THWBD":
+        raise ValueError(f"CosmosVideo USP only supports THWBD, got {self.blocks['block0'].x_format}")
 
     # ================ SEQUENCE PARALLEL ================== #
-    x, is_padded = pad_if_odd(x, 2)
-    B, T, H, W, D = x.shape
-    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+    sp_world = get_sequence_parallel_world_size()
+    sp_rank = get_sequence_parallel_rank()
+    T, H, W, B, D = x.shape
     rope_emb_L_1_1_D = rearrange(rope_emb_L_1_1_D, "(t h w) s c d -> t h w s c d", t=T, h=H, w=W)
-    rope_emb_L_1_1_D = torch.chunk(rope_emb_L_1_1_D, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+
+    x, t_orig_size = pad_to_world_size(x, dim=0)
+    rope_emb_L_1_1_D, _ = pad_to_world_size(rope_emb_L_1_1_D, dim=0)
+    if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
+        extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D, _ = pad_to_world_size(extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D, dim=0)
+
+    x = torch.chunk(x, sp_world, dim=0)[sp_rank]
+    rope_emb_L_1_1_D = torch.chunk(rope_emb_L_1_1_D, sp_world, dim=0)[sp_rank]
+    if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
+        extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = torch.chunk(extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D, sp_world, dim=0)[sp_rank]
+
     rope_emb_L_1_1_D = rearrange(rope_emb_L_1_1_D, "t h w s c d -> (t h w) s c d")
     # ================ SEQUENCE PARALLEL ================== #
     transformer_options = kwargs.get("transformer_options", {})
     for _, block in self.blocks.items():
-        assert (
-            self.blocks["block0"].x_format == block.x_format
-        ), f"First block has x_format {self.blocks[0].x_format}, got {block.x_format}"
+        assert self.blocks["block0"].x_format == block.x_format, f"First block has x_format {self.blocks[0].x_format}, got {block.x_format}"
 
         if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
             x += extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D
@@ -141,9 +156,8 @@ def usp_general_dit_forward(
             transformer_options=transformer_options,
         )
 
-    x = get_sp_group().all_gather(x, dim=1)
-    if is_padded is True:
-        x = x[:, :, :-1, :]
+    x = get_sp_group().all_gather(x, dim=0)
+    x = x[:t_orig_size, ...]
     x_B_T_H_W_D = rearrange(x, "T H W B D -> B T H W D")
 
     x_B_D_T_H_W = self.decoder_head(
@@ -160,7 +174,9 @@ def usp_general_dit_forward(
 
 # ============================ PREDICT2 ======================== #
 # original code from: https://github.com/nvidia-cosmos/cosmos-predict2
-def usp_xfuser_attention_op(q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H_D: torch.Tensor, transformer_options: Optional[dict] = {}) -> torch.Tensor:
+def usp_xfuser_attention_op(
+    q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H_D: torch.Tensor, transformer_options: Optional[dict] = {}
+) -> torch.Tensor:
     in_q_shape = q_B_S_H_D.shape
     in_k_shape = k_B_S_H_D.shape
     q_B_H_S_D = rearrange(q_B_S_H_D, "b ... h k -> b h ... k").view(in_q_shape[0], in_q_shape[-2], -1, in_q_shape[-1])
@@ -207,9 +223,9 @@ def usp_mini_train_dit_forward(
     self.crossattn_emb = crossattn_emb
 
     if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
-        assert (
-            x_B_T_H_W_D.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape
-        ), f"{x_B_T_H_W_D.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape}"
+        assert x_B_T_H_W_D.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape, (
+            f"{x_B_T_H_W_D.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape}"
+        )
 
     # ================ SEQUENCE PARALLEL ================== #
     x_B_T_H_W_D, is_padded = pad_if_odd(x_B_T_H_W_D, 2)

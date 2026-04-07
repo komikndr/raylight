@@ -82,13 +82,17 @@ if hasattr(model_base, "WAN21_Camera"):
         from ..diffusion_models.wan.xdit_context_parallel import (
             usp_camera_dit_forward,
             usp_self_attn_forward,
+            usp_i2v_cross_attn_forward,
             usp_t2v_cross_attn_forward,
         )
 
         model = base_model.diffusion_model
-        for block in model.blocks:
-            block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
-            block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
+        _patch_wan_attention_blocks(
+            model,
+            usp_self_attn_forward,
+            usp_t2v_cross_attn_forward,
+            usp_i2v_cross_attn_forward,
+        )
         model.forward_orig = types.MethodType(usp_camera_dit_forward, model)
 
 
@@ -122,13 +126,17 @@ if hasattr(model_base, "WAN22_Animate"):
         )
         from ..diffusion_models.wan.xdit_context_parallel import (
             usp_self_attn_forward,
+            usp_i2v_cross_attn_forward,
             usp_t2v_cross_attn_forward,
         )
 
         model = base_model.diffusion_model
-        for block in model.blocks:
-            block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
-            block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
+        _patch_wan_attention_blocks(
+            model,
+            usp_self_attn_forward,
+            usp_t2v_cross_attn_forward,
+            usp_i2v_cross_attn_forward,
+        )
         for face_block in model.face_adapter.fuser_blocks:
             face_block.forward = types.MethodType(usp_face_block_forward, face_block)
         model.forward_orig = types.MethodType(usp_animate_dit_forward, model)
@@ -267,7 +275,7 @@ if hasattr(model_base, "Hunyuan3Dv2"):
             block.forward = types.MethodType(usp_double_stream_forward, block)
         for block in model.single_blocks:
             block.forward = types.MethodType(usp_single_stream_forward, block)
-        model.forward_orig = types.MethodType(usp_dit_forward, model)
+        model._forward = types.MethodType(usp_dit_forward, model)
 
 
 if hasattr(model_base, "HunyuanVideo"):
@@ -319,10 +327,14 @@ if hasattr(model_base, "CosmosVideo"):
 
     @USPInjectRegistry.register(model_base.CosmosVideo)
     def _inject_cosmos_video(model_patcher, base_model, *args):
-        pass
         from ..diffusion_models.cosmos.xdit_context_parallel import usp_general_dit_forward, usp_general_attention_forward
 
         model = base_model.diffusion_model
+        for transformer_block in model.blocks.values():
+            for block in transformer_block.blocks:
+                attn = getattr(getattr(block, "block", None), "attn", None)
+                if attn is not None:
+                    attn.forward = types.MethodType(usp_general_attention_forward, attn)
         model._forward = types.MethodType(usp_general_dit_forward, model)
 
 
