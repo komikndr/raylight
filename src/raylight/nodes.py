@@ -858,8 +858,6 @@ class DPKSamplerAdvanced:
         cfg = cfg[0]
         sampler_name = sampler_name[0]
         scheduler = scheduler[0]
-        positive = positive[0]
-        negative = negative[0]
         start_at_step = start_at_step[0]
         end_at_step = end_at_step[0]
         return_with_leftover_noise = return_with_leftover_noise[0]
@@ -877,6 +875,10 @@ class DPKSamplerAdvanced:
 
         if len(latent_image) != len(gpu_actors):
             latent_image = [latent_image[0]] * len(gpu_actors)
+        if len(positive) == 1:
+            positive = positive * len(gpu_actors)
+        if len(negative) == 1:
+            negative = negative * len(gpu_actors)
 
         # Clean VRAM for preparation to load model
         gc.collect()
@@ -896,8 +898,8 @@ class DPKSamplerAdvanced:
                 cfg,
                 sampler_name,
                 scheduler,
-                positive,
-                negative,
+                positive[i],
+                negative[i],
                 latent_image[i],
                 denoise=denoise,
                 disable_noise=disable_noise,
@@ -955,6 +957,38 @@ class DPNoiseList:
             if key.startswith("noise_seed_"):
                 noise_list.append(seed)
         return (noise_list,)
+
+
+class DPConditioningList:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "positive_0": ("CONDITIONING",),
+                "negative_0": ("CONDITIONING",),
+            },
+            "optional": {
+                **{
+                    k: ("CONDITIONING",)
+                    for i in range(1, 8)
+                    for k in (f"positive_{i}", f"negative_{i}")
+                },
+            }
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("positive", "negative")
+    OUTPUT_IS_LIST = (True, True)
+    FUNCTION = "assemble"
+    CATEGORY = "Raylight"
+
+    def assemble(self, positive_0, negative_0, **kwargs):
+        positives = [positive_0]
+        negatives = [negative_0]
+        for i in range(1, 8):
+            positives.append(kwargs.get(f"positive_{i}", positive_0))
+            negatives.append(kwargs.get(f"negative_{i}", negative_0))
+        return (positives, negatives)
 
 
 class RayVAEDecodeDistributed:
@@ -1031,6 +1065,7 @@ NODE_CLASS_MAPPINGS = {
     "RayInitializer": RayInitializer,
     "RayInitializerAdvanced": RayInitializerAdvanced,
     "DPNoiseList": DPNoiseList,
+    "DPConditioningList": DPConditioningList,
     "RayVAEDecodeDistributed": RayVAEDecodeDistributed,
 }
 
@@ -1042,5 +1077,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayInitializer": "Ray Init Actor",
     "RayInitializerAdvanced": "Ray Init Actor (Advanced)",
     "DPNoiseList": "Data Parallel Noise List",
+    "DPConditioningList": "Data Parallel Conditioning List",
     "RayVAEDecodeDistributed": "Distributed VAE (Ray)",
 }
