@@ -185,6 +185,8 @@ class RayGGUFLoader:
         loaded_futures = []
 
         if parallel_dict["is_fsdp"] is True:
+            # GGUF FSDP stays disabled for now.
+            raise RuntimeError("FSDP on GGUF is not supported")
             worker0 = ray.get_actor("RayWorker:0")
             ray.get(
                 worker0.load_gguf_unet.remote(

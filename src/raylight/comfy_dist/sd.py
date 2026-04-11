@@ -394,6 +394,46 @@ def gguf_load_diffusion_model(unet_path, model_options={}, dequant_dtype=None, p
     return model
 
 
+# Disabled for now: GGUF FSDP support is blocked at the loader level.
+# Keep this helper around for when the path is re-enabled.
+def fsdp_gguf_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload, model_options={}, dequant_dtype=None, patch_dtype=None):
+    from raylight.expansion.comfyui_gguf.ops import GGMLOps
+    from raylight.expansion.comfyui_gguf.loader import gguf_sd_loader
+
+    ops = GGMLOps()
+
+    if dequant_dtype in ("default", None):
+        ops.Linear.dequant_dtype = None
+    elif dequant_dtype in ["target"]:
+        ops.Linear.dequant_dtype = dequant_dtype
+    else:
+        ops.Linear.dequant_dtype = getattr(torch, dequant_dtype)
+
+    if patch_dtype in ("default", None):
+        ops.Linear.patch_dtype = None
+    elif patch_dtype in ["target"]:
+        ops.Linear.patch_dtype = patch_dtype
+    else:
+        ops.Linear.patch_dtype = getattr(torch, patch_dtype)
+
+    load_options = dict(model_options)
+    load_options["custom_operations"] = ops
+
+    sd = gguf_sd_loader(unet_path)
+    model, state_dict = fsdp_load_diffusion_model_stat_dict(
+        sd,
+        rank,
+        device_mesh,
+        is_cpu_offload,
+        model_options=load_options,
+        metadata=None,
+    )
+    if model is None:
+        logging.error("ERROR UNSUPPORTED DIFFUSION MODEL %s", unet_path)
+        raise RuntimeError(f"ERROR: Could not detect model type of: {unet_path}")
+    return model, state_dict
+
+
 def decode_tiled_(self, samples, tile_x=64, tile_y=64, overlap=16):
     steps = samples.shape[0] * comfy.utils.get_tiled_scale_steps(samples.shape[3], samples.shape[2], tile_x, tile_y, overlap)
     steps += samples.shape[0] * comfy.utils.get_tiled_scale_steps(samples.shape[3], samples.shape[2], tile_x // 2, tile_y * 2, overlap)

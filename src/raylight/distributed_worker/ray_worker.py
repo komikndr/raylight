@@ -423,7 +423,8 @@ class RayWorker:
         self._reset_active_model()
         self._invalidate_non_fsdp_cache()
         if self.parallel_dict["is_fsdp"] is True:
-            raise ValueError("FSDP Sharding for GGUF is not supported")
+            # GGUF FSDP stays disabled for now.
+            raise RuntimeError("FSDP on GGUF is not supported")
         else:
             from raylight.comfy_dist.sd import gguf_load_diffusion_model
 

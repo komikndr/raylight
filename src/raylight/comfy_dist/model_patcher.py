@@ -100,6 +100,28 @@ def _state_dict_has_quant_payload(state_dict) -> bool:
     return False
 
 
+def _get_parent_module_and_name(model: torch.nn.Module, param_name: str) -> tuple[torch.nn.Module, str]:
+    if "." not in param_name:
+        return model, param_name
+    parent_name, leaf_name = param_name.rsplit(".", 1)
+    return model.get_submodule(parent_name), leaf_name
+
+
+def _promote_nonfloating_params_to_meta(model: torch.nn.Module, target_dtype: torch.dtype) -> int:
+    replaced = 0
+    for name, param in list(model.named_parameters()):
+        if torch.is_floating_point(param) or torch.is_complex(param):
+            continue
+        parent_module, leaf_name = _get_parent_module_and_name(model, name)
+        meta_param = torch.nn.Parameter(
+            torch.empty(tuple(param.shape), device="meta", dtype=target_dtype),
+            requires_grad=param.requires_grad,
+        )
+        parent_module.register_parameter(leaf_name, meta_param)
+        replaced += 1
+    return replaced
+
+
 def patch_fsdp(self):
     print(f"[Rank {self.rank}] Applying FSDP to {type(self.model.diffusion_model).__name__}")
 
@@ -115,6 +137,12 @@ def patch_fsdp(self):
     has_qt_runtime = freeze_and_detect_qt(diffusion_model)
     has_quant_sd = _state_dict_has_quant_payload(self.fsdp_state_dict)
     use_quant_loader = has_qt_runtime or has_quant_sd
+
+    if use_quant_loader:
+        placeholder_dtype = getattr(self.model.model, "manual_cast_dtype", None) or torch.bfloat16
+        replaced = _promote_nonfloating_params_to_meta(diffusion_model, placeholder_dtype)
+        if replaced > 0:
+            print(f"[Rank {self.rank}] Promoted {replaced} non-floating quant params to meta placeholders before FSDP wrapping")
 
     fully_shard_bottom_up(diffusion_model, fsdp_kwargs=fsdp_kwargs, native_ignore_scale=not use_quant_loader)
 
