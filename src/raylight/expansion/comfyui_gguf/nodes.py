@@ -38,6 +38,10 @@ update_folder_names_and_paths("clip_gguf", ["text_encoders", "clip"])
 
 class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     patch_on_device = False
+    use_mmap = True
+    mmap_cache = None
+    unet_path = None
+    _mmap_param_backup = None
 
     def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
         if key not in self.patches:
@@ -78,6 +82,20 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 patches = getattr(p, "patches", [])
                 if len(patches) > 0:
                     p.patches = []
+            if getattr(self, "use_mmap", True) and getattr(self, "_mmap_param_backup", None):
+                # Adapted from avtc's GGUF mmap restore idea without merging that branch:
+                # https://github.com/avtc/raylight/tree/fix/ram-usage-in-data-parallel-cause-oom
+                super().unpatch_model(device_to=None, unpatch_weights=unpatch_weights)
+
+                for key, weight in self._mmap_param_backup.items():
+                    comfy.utils.set_attr_param(self.model, key, weight)
+
+                if device_to is not None:
+                    for _, buf in self.model.named_buffers():
+                        if buf is not None and getattr(buf, "device", None) != device_to:
+                            buf.data = buf.to(device_to)
+                    self.model.device = device_to
+                return self.model
         # TODO: Find another way to not unload after patches
         return super().unpatch_model(device_to=device_to, unpatch_weights=unpatch_weights)
 
@@ -93,6 +111,14 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     named_modules_to_munmap = {}
 
     def load(self, *args, force_patch_weights=False, **kwargs):
+        if getattr(self, "use_mmap", True) and self._mmap_param_backup is None:
+            # Preserve original mmap-backed GGUF params for later restore on detach.
+            self._mmap_param_backup = {}
+            for key, param in self.model.named_parameters():
+                weight = getattr(param, "data", None)
+                if is_quantized(weight):
+                    self._mmap_param_backup[key] = weight
+
         if not self.mmap_released:
             self.named_modules_to_munmap = dict(self.model.named_modules())
 
@@ -130,6 +156,10 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         self.__class__ = src_cls
         # GGUF specific clone values below
         n.patch_on_device = getattr(self, "patch_on_device", False)
+        n.use_mmap = getattr(self, "use_mmap", True)
+        n.mmap_cache = getattr(self, "mmap_cache", None)
+        n.unet_path = getattr(self, "unet_path", None)
+        n._mmap_param_backup = getattr(self, "_mmap_param_backup", None)
         n.mmap_released = getattr(self, "mmap_released", False)
         if src_cls != GGUFModelPatcher:
             n.size = 0  # force recalc
@@ -193,6 +223,7 @@ class RayGGUFLoader:
                     unet_path,
                     dequant_dtype=dequant_dtype,
                     patch_dtype=patch_dtype,
+                    use_mmap=parallel_dict.get("use_mmap", True),
                 )
             )
             meta_model = ray.get(worker0.get_meta_model.remote())
@@ -216,6 +247,7 @@ class RayGGUFLoader:
                         unet_path,
                         dequant_dtype=dequant_dtype,
                         patch_dtype=patch_dtype,
+                        use_mmap=parallel_dict.get("use_mmap", True),
                     )
                 )
             ray.get(loaded_futures)

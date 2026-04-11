@@ -384,13 +384,22 @@ def gguf_load_diffusion_model(unet_path, model_options={}, dequant_dtype=None, p
     else:
         ops.Linear.patch_dtype = getattr(torch, patch_dtype)
 
+    use_mmap = model_options.get("use_mmap", True)
+
     # init model
-    sd = gguf_sd_loader(unet_path)
+    sd = gguf_sd_loader(unet_path, use_mmap=use_mmap)
     model = comfy.sd.load_diffusion_model_state_dict(sd, model_options={"custom_operations": ops})
     if model is None:
         logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
         raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))
     model = GGUFModelPatcher.clone(model)
+    # Keep mmap-backed GGUF state so the patcher can restore it on detach.
+    # Related upstream idea: https://github.com/avtc/raylight/tree/fix/ram-usage-in-data-parallel-cause-oom
+    model.use_mmap = use_mmap
+    model.mmap_cache = sd if use_mmap else None
+    model.unet_path = unet_path
+    model._mmap_param_backup = None
+    model.mmap_released = not use_mmap
     return model
 
 
@@ -419,7 +428,7 @@ def fsdp_gguf_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload,
     load_options = dict(model_options)
     load_options["custom_operations"] = ops
 
-    sd = gguf_sd_loader(unet_path)
+    sd = gguf_sd_loader(unet_path, use_mmap=model_options.get("use_mmap", True))
     model, state_dict = fsdp_load_diffusion_model_stat_dict(
         sd,
         rank,

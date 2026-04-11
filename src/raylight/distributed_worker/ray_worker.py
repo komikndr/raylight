@@ -419,16 +419,23 @@ class RayWorker:
         self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
         self.is_model_loaded = True
 
-    def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype):
+    def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype, use_mmap=None):
         self._reset_active_model()
         self._invalidate_non_fsdp_cache()
+        if use_mmap is None:
+            use_mmap = self.parallel_dict.get("use_mmap", True)
         if self.parallel_dict["is_fsdp"] is True:
             # GGUF FSDP stays disabled for now.
             raise RuntimeError("FSDP on GGUF is not supported")
         else:
             from raylight.comfy_dist.sd import gguf_load_diffusion_model
 
-            self.model = gguf_load_diffusion_model(unet_path, dequant_dtype=dequant_dtype, patch_dtype=patch_dtype)
+            self.model = gguf_load_diffusion_model(
+                unet_path,
+                model_options={"use_mmap": use_mmap},
+                dequant_dtype=dequant_dtype,
+                patch_dtype=patch_dtype,
+            )
 
         if self.lora_list is not None:
             self.load_lora()
