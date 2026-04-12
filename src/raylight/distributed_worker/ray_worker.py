@@ -57,6 +57,9 @@ def patch_enable_comfy_kitchen_fsdp(fn):
 
 class RayWorker:
     def __init__(self, local_rank, device_id, parallel_dict):
+        from raylight.comfy_dist import patch_base_getattr
+
+        patch_base_getattr()
         self.model = None
         self.vae_model = None
         self.model_type = None

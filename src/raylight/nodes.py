@@ -24,13 +24,9 @@ from .distributed_worker.ray_worker import (
 # Workaround https://github.com/comfyanonymous/ComfyUI/pull/11134
 # since in FSDPModelPatcher mode, ray cannot pickle None type cause by getattr
 def _monkey():
-    from raylight.comfy_dist.supported_models_base import BASE as PatchedBASE
-    import comfy.supported_models_base as supported_models_base
+    from raylight.comfy_dist import patch_base_getattr
 
-    OriginalBASE = supported_models_base.BASE
-
-    if hasattr(PatchedBASE, "__getattr__"):
-        setattr(OriginalBASE, "__getattr__", PatchedBASE.__getattr__)
+    patch_base_getattr()
 
 
 def _resolve_module_dir(module):
