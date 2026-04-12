@@ -265,14 +265,6 @@ class RayInitializer:
                     "BOOLEAN",
                     {"default": False, "tooltip": "When FSDP is on, offload inactive model shards to CPU RAM."},
                 ),
-                "FSDP_model_replicas": (
-                    "INT",
-                    {
-                        "default": 1,
-                        "min": 1,
-                        "tooltip": "Number of independent model replicas. 1 = one model sharded across all GPUs (default). Must divide GPU count evenly. Only applies when FSDP is enabled.",
-                    },
-                ),
                 "XFuser_attention": (
                     [member.name for member in AttnType],
                     {"default": "TORCH_FLASH", "tooltip": "Attention backend used by xFuser-enabled execution."},
@@ -289,6 +281,14 @@ class RayInitializer:
                     {
                         "default": True,
                         "tooltip": "Use mmap-backed safetensor loading. This can reduce RAM spikes during model load, especially for large checkpoints.",
+                    },
+                ),
+                "FSDP_model_replicas": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "tooltip": "Number of independent model replicas. 1 = one model sharded across all GPUs (default). Must divide GPU count evenly. Only applies when FSDP is enabled.",
                     },
                 ),
             },
@@ -503,14 +503,6 @@ class RayInitializerAdvanced(RayInitializer):
                     "BOOLEAN",
                     {"default": False, "tooltip": "When FSDP is on, offload inactive model shards to CPU RAM."},
                 ),
-                "FSDP_model_replicas": (
-                    "INT",
-                    {
-                        "default": 1,
-                        "min": 1,
-                        "tooltip": "Number of independent model replicas. 1 = one model sharded across all GPUs (default). Must divide GPU count evenly. Only applies when FSDP is enabled.",
-                    },
-                ),
                 "XFuser_attention": (
                     [member.name for member in AttnType],
                     {"default": "TORCH_FLASH", "tooltip": "Attention backend used by xFuser-enabled execution."},
@@ -527,6 +519,14 @@ class RayInitializerAdvanced(RayInitializer):
                     {
                         "default": True,
                         "tooltip": "Use mmap-backed safetensor loading. This can reduce RAM spikes during model load, especially for large checkpoints.",
+                    },
+                ),
+                "FSDP_model_replicas": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "tooltip": "Number of independent model replicas. 1 = one model sharded across all GPUs (default). Must divide GPU count evenly. Only applies when FSDP is enabled.",
                     },
                 ),
             },
