@@ -239,7 +239,7 @@ class XFuserSamplerCustom:
         }
 
     RETURN_TYPES = ("LATENT", "RAY_ACTORS")
-    RETURN_NAMES = ("output", "ray_actors")
+    RETURN_NAMES = ("latent", "ray_actors")
 
     FUNCTION = "ray_sample"
 
@@ -306,7 +306,7 @@ class DPSamplerCustom:
         }
 
     RETURN_TYPES = ("LATENT", "RAY_ACTORS")
-    RETURN_NAMES = ("output", "ray_actors")
+    RETURN_NAMES = ("latent", "ray_actors")
     OUTPUT_IS_LIST = (True, False)
     INPUT_IS_LIST = True
     FUNCTION = "ray_sample"
