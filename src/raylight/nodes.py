@@ -460,7 +460,7 @@ class RayInitializerAdvanced(RayInitializer):
                     "STRING",
                     {
                         "default": "",
-                        "tooltip": "GPU Indices to select which GPU to be participate in Ray, useful if you want organized 0th GPU for CLIP and VAE",
+                        "tooltip": "GPU indices for Ray workers. Use comma separated values like 0,1,2 to limit Ray to those GPUs, or leave empty to use all visible GPUs. Useful if you want to reserve GPU 0 for CLIP or VAE.",
                     },
                 ),
                 "ulysses_degree": (
