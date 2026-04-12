@@ -41,10 +41,8 @@ class RayBasicScheduler:
                 return (torch.FloatTensor([]),)
             total_steps = int(steps / denoise)
 
-        sigmas = comfy.samplers.calculate_sigmas(
-            model.get_model_object("model_sampling"), scheduler, total_steps
-        ).cpu()
-        sigmas = sigmas[-(steps + 1):]
+        sigmas = comfy.samplers.calculate_sigmas(model.get_model_object("model_sampling"), scheduler, total_steps).cpu()
+        sigmas = sigmas[-(steps + 1) :]
         return (sigmas,)
 
 
@@ -85,9 +83,7 @@ class RayBetaSamplingScheduler:
 
     @ray_patch_with_return
     def get_sigmas(self, model, steps, alpha, beta):
-        sigmas = comfy.samplers.beta_scheduler(
-            model.get_model_object("model_sampling"), steps, alpha=alpha, beta=beta
-        )
+        sigmas = comfy.samplers.beta_scheduler(model.get_model_object("model_sampling"), steps, alpha=alpha, beta=beta)
         return (sigmas,)
 
 
@@ -242,8 +238,8 @@ class XFuserSamplerCustom:
             }
         }
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("output",)
+    RETURN_TYPES = ("LATENT", "RAY_ACTORS")
+    RETURN_NAMES = ("output", "ray_actors")
 
     FUNCTION = "ray_sample"
 
@@ -280,7 +276,7 @@ class XFuserSamplerCustom:
         ]
         results = ray.get(futures)
         out = results[0]
-        return (out,)
+        return (out, ray_actors)
 
 
 class DPSamplerCustom:
@@ -309,9 +305,9 @@ class DPSamplerCustom:
             }
         }
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("output", "denoised_output")
-    OUTPUT_IS_LIST = (True,)
+    RETURN_TYPES = ("LATENT", "RAY_ACTORS")
+    RETURN_NAMES = ("output", "ray_actors")
+    OUTPUT_IS_LIST = (True, False)
     INPUT_IS_LIST = True
     FUNCTION = "ray_sample"
     CATEGORY = "Raylight/extra/custom_sampling/samplers"
@@ -359,7 +355,7 @@ class DPSamplerCustom:
             for i, actor in enumerate(gpu_actors)
         ]
         out = ray.get(futures)
-        return (out,)
+        return (out, ray_actors)
 
 
 class RayAddNoise:
@@ -367,13 +363,16 @@ class RayAddNoise:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "noise_seed": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 0xffffffffffffffff,
-                    "control_after_generate": True,
-                }),
-                "force_empty_noise": ("BOOLEAN", ),
+                "noise_seed": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 0xFFFFFFFFFFFFFFFF,
+                        "control_after_generate": True,
+                    },
+                ),
+                "force_empty_noise": ("BOOLEAN",),
                 "ray_actors": ("RAY_ACTORS",),
                 "sigmas": ("SIGMAS",),
                 "latent_image": ("LATENT",),

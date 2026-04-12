@@ -803,7 +803,8 @@ class XFuserKSamplerAdvanced:
             }
         }
 
-    RETURN_TYPES = ("LATENT",)
+    RETURN_TYPES = ("LATENT", "RAY_ACTORS")
+    RETURN_NAMES = ("output", "ray_actors")
     FUNCTION = "ray_sample"
 
     CATEGORY = "Raylight"
@@ -857,7 +858,7 @@ class XFuserKSamplerAdvanced:
         ]
 
         results = ray.get(futures)
-        return (results[0][0],)
+        return (results[0][0], ray_actors)
 
 
 class DPKSamplerAdvanced:
@@ -893,8 +894,9 @@ class DPKSamplerAdvanced:
             }
         }
 
-    RETURN_TYPES = ("LATENT",)
-    OUTPUT_IS_LIST = (True,)
+    RETURN_TYPES = ("LATENT", "RAY_ACTORS")
+    RETURN_NAMES = ("output", "ray_actors")
+    OUTPUT_IS_LIST = (True, False)
     INPUT_IS_LIST = True
     FUNCTION = "ray_sample"
 
@@ -977,7 +979,41 @@ class DPKSamplerAdvanced:
 
         results = ray.get(futures)
         results = [result[0] for result in results]
-        return (results,)
+        return (results, ray_actors)
+
+
+class RayKill:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS", {"tooltip": "Ray actors to shut down cleanly."}),
+                "kill_mode": (
+                    ["Kill Workers Only", "Kill Entire Cluster"],
+                    {
+                        "tooltip": "This terminal node function to cleanly shutdown worker or entire cluster, this is usefull if you want to switch to regular WF without restarting ComfyUI, or incase of error in Raylight",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "kill_ray"
+    OUTPUT_NODE = True
+    CATEGORY = "Raylight"
+
+    def kill_ray(self, ray_actors, kill_mode):
+        gpu_actors = ray_actors["workers"]
+        futures = [actor.kill.remote() for actor in gpu_actors]
+        try:
+            ray.get(futures)
+        except ray.exceptions.RayActorError:
+            pass
+
+        if kill_mode == "Kill Entire Cluster":
+            ray.shutdown()
+
+        return ()
 
 
 class Noise_RandomNoise:
@@ -1121,6 +1157,7 @@ class RayVAEDecodeDistributed:
 NODE_CLASS_MAPPINGS = {
     "XFuserKSamplerAdvanced": XFuserKSamplerAdvanced,
     "DPKSamplerAdvanced": DPKSamplerAdvanced,
+    "RayKill": RayKill,
     "RayUNETLoader": RayUNETLoader,
     "RayLoraLoader": RayLoraLoader,
     "RayInitializer": RayInitializer,
@@ -1133,6 +1170,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "XFuserKSamplerAdvanced": "XFuser KSampler (Advanced)",
     "DPKSamplerAdvanced": "Data Parallel KSampler (Advanced)",
+    "RayKill": "Kill Ray",
     "RayUNETLoader": "Load Diffusion Model (Ray)",
     "RayLoraLoader": "Load Lora Model (Ray)",
     "RayInitializer": "Ray Init Actor",
