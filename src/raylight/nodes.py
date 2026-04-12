@@ -84,6 +84,35 @@ def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir:
     }
 
 
+def _parse_gpu_select(gpu_select: str | None) -> tuple[int, ...] | None:
+    if gpu_select is None:
+        return None
+    gpu_select = gpu_select.strip()
+    if not gpu_select:
+        return None
+
+    selected: list[int] = []
+    seen: set[int] = set()
+    for raw in gpu_select.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        try:
+            gpu_idx = int(token)
+        except ValueError as exc:
+            raise ValueError(f"GPU_SELECT contains non-integer entry: {token!r}") from exc
+        if gpu_idx < 0:
+            raise ValueError(f"GPU_SELECT only supports zero-based GPU indices, got {gpu_idx}")
+        if gpu_idx in seen:
+            raise ValueError(f"GPU_SELECT contains duplicate GPU index: {gpu_idx}")
+        seen.add(gpu_idx)
+        selected.append(gpu_idx)
+
+    if not selected:
+        return None
+    return tuple(selected)
+
+
 def _build_remote_runtime_env(module_dir: Path, repo_root: Path):
     excludes = [
         ".git",
@@ -281,6 +310,7 @@ class RayInitializer:
         XFuser_attention: str,
         skip_comm_test: bool = True,
         use_mmap: bool = True,
+        GPU_SELECT: str = "",
         ray_object_store_gb: float = 2.0,
         ray_dashboard_address: str = "None",
         torch_dist_address: str = "None",
@@ -303,9 +333,17 @@ class RayInitializer:
         _monkey()
 
         world_size = GPU
-        max_world_size = torch.cuda.device_count()
+        selected_gpus = _parse_gpu_select(GPU_SELECT)
+        if selected_gpus is None:
+            max_world_size = torch.cuda.device_count()
+        else:
+            visible_gpu_count = torch.cuda.device_count()
+            invalid = [gpu_idx for gpu_idx in selected_gpus if gpu_idx >= visible_gpu_count]
+            if invalid:
+                raise ValueError(f"GPU_SELECT contains GPU index outside visible range 0-{visible_gpu_count - 1}: {invalid}")
+            max_world_size = len(selected_gpus)
         if world_size > max_world_size:
-            raise ValueError("Too many gpus")
+            raise ValueError(f"Too many gpus: requested {world_size} but only {max_world_size} selected/visible")
         if world_size == 0:
             raise ValueError("Num of cuda/cudalike device is 0")
         if world_size < ulysses_degree * ring_degree * cfg_degree:
@@ -346,25 +384,49 @@ class RayInitializer:
             enable_dashboard = False
 
         ray_object_store_gb = int(ray_object_store_gb * 1024**3)
-        runtime_env_base = _RAY_RUNTIME_ENV_LOCAL
+        runtime_env_base = deepcopy(_RAY_RUNTIME_ENV_LOCAL)
         if ray_cluster_address not in _LOCAL_CLUSTER_ADDRESSES:
-            runtime_env_base = _RAY_RUNTIME_ENV_REMOTE
+            runtime_env_base = deepcopy(_RAY_RUNTIME_ENV_REMOTE)
+
+        if selected_gpus is not None:
+            # Adapted from avtc's Ray GPU visibility restriction idea.
+            runtime_env_base.setdefault("env_vars", {})["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_idx) for gpu_idx in selected_gpus)
 
         try:
             # Shut down so if comfy user try another workflow it will not cause error
             ray.shutdown()
-            ray.init(
-                ray_cluster_address,
-                namespace=ray_cluster_namespace,
-                runtime_env=deepcopy(runtime_env_base),
-                object_store_memory=ray_object_store_gb,
-                include_dashboard=enable_dashboard,
-                dashboard_host=dashboard_host,
-                dashboard_port=dashboard_port,
-            )
+            original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+            restricted_cuda_visible_devices = runtime_env_base.get("env_vars", {}).get("CUDA_VISIBLE_DEVICES")
+            if restricted_cuda_visible_devices is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = restricted_cuda_visible_devices
+            try:
+                ray.init(
+                    ray_cluster_address,
+                    namespace=ray_cluster_namespace,
+                    runtime_env=deepcopy(runtime_env_base),
+                    object_store_memory=ray_object_store_gb,
+                    include_dashboard=enable_dashboard,
+                    dashboard_host=dashboard_host,
+                    dashboard_port=dashboard_port,
+                )
+            finally:
+                if restricted_cuda_visible_devices is not None:
+                    if original_cuda_visible_devices is not None:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
+                    else:
+                        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         except Exception as e:
             ray.shutdown()
-            ray.init(runtime_env=deepcopy(runtime_env_base))
+            if restricted_cuda_visible_devices is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = restricted_cuda_visible_devices
+            try:
+                ray.init(runtime_env=deepcopy(runtime_env_base))
+            finally:
+                if restricted_cuda_visible_devices is not None:
+                    if original_cuda_visible_devices is not None:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
+                    else:
+                        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
             raise RuntimeError(f"Ray connection failed: {e}")
 
         if not skip_comm_test:
@@ -394,6 +456,13 @@ class RayInitializerAdvanced(RayInitializer):
                     {"default": "default", "tooltip": "Ray namespace used to isolate this session from other Ray jobs."},
                 ),
                 "GPU": ("INT", {"default": 2, "tooltip": "How many GPUs / Ray workers to launch."}),
+                "GPU_SELECT": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "GPU Indices to select which GPU to be participate in Ray, useful if you want organized 0th GPU for CLIP and VAE",
+                    },
+                ),
                 "ulysses_degree": (
                     "INT",
                     {"default": 2, "tooltip": "Sequence parallel degree for Ulysses. Set above 1 to split sequence work across GPUs."},
@@ -968,12 +1037,8 @@ class DPConditioningList:
                 "negative_0": ("CONDITIONING",),
             },
             "optional": {
-                **{
-                    k: ("CONDITIONING",)
-                    for i in range(1, 8)
-                    for k in (f"positive_{i}", f"negative_{i}")
-                },
-            }
+                **{k: ("CONDITIONING",) for i in range(1, 8) for k in (f"positive_{i}", f"negative_{i}")},
+            },
         }
 
     RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
