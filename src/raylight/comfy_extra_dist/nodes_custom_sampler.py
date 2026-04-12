@@ -10,6 +10,7 @@ from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
 import comfy.utils
 from .ray_patch_decorator import ray_patch_with_return
 
+from raylight.distributed_worker.ray_worker import ensure_fresh_actors
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise
 
 
@@ -260,7 +261,7 @@ class XFuserSamplerCustom:
         gc.collect()
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
-        gpu_actors = ray_actors["workers"]
+        ray_actors, gpu_actors, _ = ensure_fresh_actors(ray_actors)
         futures = [
             actor.custom_sampler.remote(
                 add_noise,
@@ -325,6 +326,7 @@ class DPSamplerCustom:
         latent_image,
     ):
         ray_actors = ray_actors[0]
+        ray_actors, gpu_actors, _ = ensure_fresh_actors(ray_actors)
         add_noise = add_noise[0]
         cfg = cfg[0]
         sampler = sampler[0]
@@ -334,8 +336,6 @@ class DPSamplerCustom:
         gc.collect()
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
-        gpu_actors = ray_actors["workers"]
-
         if len(positive) == 1:
             positive = positive * len(gpu_actors)
         if len(negative) == 1:

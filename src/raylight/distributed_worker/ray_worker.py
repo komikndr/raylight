@@ -2,6 +2,7 @@ import os
 import sys
 import gc
 import functools
+from copy import deepcopy
 from datetime import timedelta
 
 import torch
@@ -769,30 +770,101 @@ def make_ray_actor_fn(world_size, parallel_dict):
     return _init_ray_actor
 
 
-# (TODO-Komikndr) Should be removed since FSDP can be unloaded properly
-def ensure_fresh_actors(ray_actors_init):
-    ray_actors, ray_actor_fn = ray_actors_init
-    gpu_actors = ray_actors["workers"]
+def _decorate_ray_actors_payload(ray_actors, ray_actor_fn, parallel_dict, cluster_config):
+    payload = dict(ray_actors)
+    payload["ray_actor_fn"] = ray_actor_fn
+    payload["parallel_dict"] = deepcopy(parallel_dict)
+    payload["cluster_config"] = deepcopy(cluster_config)
+    return payload
 
-    needs_restart = False
+
+def _ray_init_from_cluster_config(cluster_config):
+    runtime_env = deepcopy(cluster_config["runtime_env"])
+    original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    restricted_cuda_visible_devices = runtime_env.get("env_vars", {}).get("CUDA_VISIBLE_DEVICES")
+    if restricted_cuda_visible_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = restricted_cuda_visible_devices
     try:
-        is_loaded = ray.get(gpu_actors[0].get_is_model_loaded.remote())
-        if is_loaded:
-            needs_restart = True
-    except RayActorError:
-        # Actor already dead or crashed
-        needs_restart = True
+        ray.init(
+            cluster_config["ray_cluster_address"],
+            namespace=cluster_config["ray_cluster_namespace"],
+            runtime_env=runtime_env,
+            object_store_memory=cluster_config["ray_object_store_memory"],
+            include_dashboard=cluster_config["include_dashboard"],
+            dashboard_host=cluster_config["dashboard_host"],
+            dashboard_port=cluster_config["dashboard_port"],
+        )
+    finally:
+        if restricted_cuda_visible_devices is not None:
+            if original_cuda_visible_devices is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
+            else:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
-    needs_restart = False
+
+def _rebuild_ray_actors(ray_actors):
+    cluster_config = ray_actors.get("cluster_config")
+    if cluster_config is None:
+        raise ValueError("No Cluster config present, did you forgot to run RayInit Actor?")
+
+    ray_actor_fn = ray_actors.get("ray_actor_fn")
+    if ray_actor_fn is None:
+        raise ValueError("No Cluster config present, did you forgot to run RayInit Actor?")
+
+    parallel_dict = ray_actors.get("parallel_dict")
+    if parallel_dict is None:
+        raise ValueError("No Cluster config present, did you forgot to run RayInit Actor?")
+
+    try:
+        ray.shutdown()
+    except Exception:
+        pass
+
+    _ray_init_from_cluster_config(cluster_config)
+    rebuilt = ray_actor_fn()
+    return _decorate_ray_actors_payload(rebuilt, ray_actor_fn, parallel_dict, cluster_config)
+
+
+# (TODO-Komikndr) Should be removed since FSDP can be unloaded properly
+def ensure_fresh_actors(ray_actors):
+    if isinstance(ray_actors, (list, tuple)) and len(ray_actors) == 2:
+        legacy_ray_actors, legacy_ray_actor_fn = ray_actors
+        ray_actors = dict(legacy_ray_actors)
+        ray_actors["ray_actor_fn"] = legacy_ray_actor_fn
+
+    if not isinstance(ray_actors, dict):
+        raise ValueError("No Cluster config present, did you forgot to run RayInit Actor?")
+
+    gpu_actors = ray_actors.get("workers")
+    if not gpu_actors:
+        raise ValueError("No Cluster config present, did you forgot to run RayInit Actor?")
+
+    expected_parallel_dict = ray_actors.get("parallel_dict")
+    if expected_parallel_dict is None:
+        raise ValueError("No Cluster config present, did you forgot to run RayInit Actor?")
+
+    needs_restart = len(gpu_actors) != int(expected_parallel_dict.get("global_world_size", len(gpu_actors)))
+    current_parallel_dict = None
+
+    if not needs_restart:
+        for actor in gpu_actors:
+            try:
+                current_parallel_dict = ray.get(actor.get_parallel_dict.remote())
+            except Exception:
+                needs_restart = True
+                break
+
+        if current_parallel_dict is not None and current_parallel_dict != expected_parallel_dict:
+            needs_restart = True
+
     if needs_restart:
         for actor in gpu_actors:
             try:
                 ray.get(actor.kill.remote())
             except Exception:
-                pass  # ignore already dead
-        ray_actors = ray_actor_fn()
+                pass
+        ray_actors = _rebuild_ray_actors(ray_actors)
         gpu_actors = ray_actors["workers"]
+        current_parallel_dict = ray_actors["parallel_dict"]
 
-    parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
-
-    return ray_actors, gpu_actors, parallel_dict
+    return ray_actors, gpu_actors, current_parallel_dict or expected_parallel_dict

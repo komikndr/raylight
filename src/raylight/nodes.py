@@ -16,6 +16,7 @@ from comfy import sd, sample, utils  # type: ignore
 
 from .distributed_worker.ray_worker import (
     make_ray_actor_fn,
+    _decorate_ray_actors_payload,
     ensure_fresh_actors,
     ray_nccl_tester,
 )
@@ -286,8 +287,8 @@ class RayInitializer:
             },
         }
 
-    RETURN_TYPES = ("RAY_ACTORS_INIT",)
-    RETURN_NAMES = ("ray_actors_init",)
+    RETURN_TYPES = ("RAY_ACTORS",)
+    RETURN_NAMES = ("ray_actors",)
 
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
@@ -431,8 +432,17 @@ class RayInitializer:
         else:
             print("Skipping NCCL test (skip_comm_test=True)")
         ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
-        ray_actors = ray_actor_fn()
-        return ([ray_actors, ray_actor_fn],)
+        cluster_config = {
+            "ray_cluster_address": ray_cluster_address,
+            "ray_cluster_namespace": ray_cluster_namespace,
+            "runtime_env": deepcopy(runtime_env_base),
+            "ray_object_store_memory": ray_object_store_gb,
+            "include_dashboard": enable_dashboard,
+            "dashboard_host": dashboard_host,
+            "dashboard_port": dashboard_port,
+        }
+        ray_actors = _decorate_ray_actors_payload(ray_actor_fn(), ray_actor_fn, self.parallel_dict, cluster_config)
+        return (ray_actors,)
 
 
 class RayInitializerAdvanced(RayInitializer):
@@ -527,8 +537,8 @@ class RayInitializerAdvanced(RayInitializer):
             },
         }
 
-    RETURN_TYPES = ("RAY_ACTORS_INIT",)
-    RETURN_NAMES = ("ray_actors_init",)
+    RETURN_TYPES = ("RAY_ACTORS",)
+    RETURN_NAMES = ("ray_actors",)
 
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
@@ -539,7 +549,7 @@ class RayPipeFusionConfig:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_actors_init": ("RAY_ACTORS_INIT", {"tooltip": "Ray actor initialization payload to decorate with PipeFusion config."}),
+                "ray_actors": ("RAY_ACTORS", {"tooltip": "Ray actors payload to decorate with PipeFusion config."}),
                 "num_pipeline_patch": (
                     "INT",
                     {
@@ -573,21 +583,21 @@ class RayPipeFusionConfig:
             },
         }
 
-    RETURN_TYPES = ("RAY_ACTORS_INIT",)
-    RETURN_NAMES = ("ray_actors_init",)
+    RETURN_TYPES = ("RAY_ACTORS",)
+    RETURN_NAMES = ("ray_actors",)
 
     FUNCTION = "configure_pipefusion"
     CATEGORY = "Raylight"
 
     def configure_pipefusion(
         self,
-        ray_actors_init,
+        ray_actors,
         num_pipeline_patch: int,
         warmup_steps: int,
         pipefusion_stage_splits: str = "",
         pipefusion_debug: bool = False,
     ):
-        ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
+        ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors)
 
         updated_parallel_dict = dict(parallel_dict)
         _apply_pipefusion_runtime_config(
@@ -601,7 +611,11 @@ class RayPipeFusionConfig:
 
         updated_actor_fn = make_ray_actor_fn(int(updated_parallel_dict.get("global_world_size", len(gpu_actors))), updated_parallel_dict)
         ray.get([actor.set_parallel_dict.remote(updated_parallel_dict) for actor in gpu_actors])
-        return ([ray_actors, updated_actor_fn],)
+        ray_actors["parallel_dict"] = deepcopy(updated_parallel_dict)
+        ray_actors["ray_actor_fn"] = updated_actor_fn
+        if ray_actors.get("cluster_config") is not None:
+            ray_actors["cluster_config"]["runtime_env"] = deepcopy(ray_actors["cluster_config"]["runtime_env"])
+        return (ray_actors,)
 
 
 class RayUNETLoader:
@@ -620,8 +634,8 @@ class RayUNETLoader:
                         "fp16",
                     ],
                 ),
-                "ray_actors_init": (
-                    "RAY_ACTORS_INIT",
+                "ray_actors": (
+                    "RAY_ACTORS",
                     {"tooltip": "Ray Actor to submit the model into"},
                 ),
             },
@@ -634,8 +648,8 @@ class RayUNETLoader:
 
     CATEGORY = "Raylight"
 
-    def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, lora=None):
-        ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
+    def load_ray_unet(self, ray_actors, unet_name, weight_dtype, lora=None):
+        ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors)
 
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
@@ -837,7 +851,7 @@ class XFuserKSamplerAdvanced:
         if add_noise == "disable":
             disable_noise = True
 
-        gpu_actors = ray_actors["workers"]
+        ray_actors, gpu_actors, _ = ensure_fresh_actors(ray_actors)
         futures = [
             actor.common_ksampler.remote(
                 noise_seed,
@@ -929,7 +943,7 @@ class DPKSamplerAdvanced:
         end_at_step = end_at_step[0]
         return_with_leftover_noise = return_with_leftover_noise[0]
 
-        gpu_actors = ray_actors["workers"]
+        ray_actors, gpu_actors, _ = ensure_fresh_actors(ray_actors)
         parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
         if parallel_dict["is_xdit"] is True:
             raise ValueError(
@@ -1003,7 +1017,9 @@ class RayKill:
     CATEGORY = "Raylight"
 
     def kill_ray(self, ray_actors, kill_mode):
-        gpu_actors = ray_actors["workers"]
+        if isinstance(ray_actors, (list, tuple)) and len(ray_actors) == 2:
+            ray_actors = ray_actors[0]
+        gpu_actors = ray_actors.get("workers", []) if isinstance(ray_actors, dict) else []
         futures = [actor.kill.remote() for actor in gpu_actors]
         try:
             ray.get(futures)
@@ -1139,7 +1155,7 @@ class RayVAEDecodeDistributed:
     CATEGORY = "Raylight"
 
     def ray_decode(self, ray_actors, vae_name, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8):
-        gpu_actors = ray_actors["workers"]
+        ray_actors, gpu_actors, _ = ensure_fresh_actors(ray_actors)
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
 
         for actor in gpu_actors:

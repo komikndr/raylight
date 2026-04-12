@@ -180,8 +180,8 @@ class RayGGUFLoader:
                     ["default", "target", "float32", "float16", "bfloat16"],
                     {"default": "default"},
                 ),
-                "ray_actors_init": (
-                    "RAY_ACTORS_INIT",
+                "ray_actors": (
+                    "RAY_ACTORS",
                     {"tooltip": "Ray Actor to submit the model into"},
                 ),
             },
@@ -196,13 +196,13 @@ class RayGGUFLoader:
 
     def load_ray_unet(
         self,
-        ray_actors_init,
+        ray_actors,
         unet_name,
         dequant_dtype,
         patch_dtype,
         lora=None,
     ):
-        ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
+        ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors)
 
         unet_path = folder_paths.get_full_path_or_raise("unet", unet_name)
 

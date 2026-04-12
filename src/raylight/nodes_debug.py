@@ -7,7 +7,7 @@ import torch
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
-from .distributed_worker.ray_worker import make_ray_actor_fn, ensure_fresh_actors, ray_nccl_tester
+from .distributed_worker.ray_worker import make_ray_actor_fn, _decorate_ray_actors_payload, ensure_fresh_actors, ray_nccl_tester
 
 
 class RayInitializerDebug:
@@ -40,8 +40,8 @@ class RayInitializerDebug:
             }
         }
 
-    RETURN_TYPES = ("RAY_ACTORS_INIT",)
-    RETURN_NAMES = ("ray_actors_init",)
+    RETURN_TYPES = ("RAY_ACTORS",)
+    RETURN_NAMES = ("ray_actors",)
 
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
@@ -130,8 +130,17 @@ class RayInitializerDebug:
 
         ray_nccl_tester(world_size)
         ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
-        ray_actors = ray_actor_fn()
-        return ([ray_actors, ray_actor_fn],)
+        cluster_config = {
+            "ray_cluster_address": ray_cluster_address,
+            "ray_cluster_namespace": ray_cluster_namespace,
+            "runtime_env": {"py_modules": [raylight]},
+            "ray_object_store_memory": None,
+            "include_dashboard": False,
+            "dashboard_host": "127.0.0.1",
+            "dashboard_port": None,
+        }
+        ray_actors = _decorate_ray_actors_payload(ray_actor_fn(), ray_actor_fn, self.parallel_dict, cluster_config)
+        return (ray_actors,)
 
 
 class RayLoraLoader2:
