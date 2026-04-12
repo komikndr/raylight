@@ -73,6 +73,7 @@ class RayWorker:
 
         self.local_rank = local_rank
         self.global_world_size = self.parallel_dict["global_world_size"]
+        self.group_id = self.parallel_dict.get("group_id", 0)
 
         self.device_id = device_id
         self.parallel_dict = parallel_dict
@@ -90,17 +91,26 @@ class RayWorker:
         os.environ["NCCL_DEBUG"] = "WARN"
         os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
 
+        # global_world_size is already set to shard_size (GPUs per replica) by spawn_actor
+        # when FSDP is enabled, or total GPU count when FSDP is disabled.
+        nccl_world_size = self.global_world_size
+        nccl_rank = local_rank
+
+        # Each group gets its own port for NCCL isolation
+        master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+        base_port = int(os.environ.get("MASTER_PORT", "29500"))
+        group_port = base_port + self.group_id
+
         dist.init_process_group(
             "nccl",
-            rank=local_rank,
-            world_size=self.global_world_size,
+            rank=nccl_rank,
+            world_size=nccl_world_size,
             timeout=timedelta(minutes=1),
-            # device_id=self.device
+            init_method=f"tcp://{master_addr}:{group_port}",
         )
 
-        # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
-            self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
+            self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(nccl_world_size,))
         elif not self.parallel_dict.get("pipefusion_enabled"):
             print(f"Running Ray in normal seperate sampler with: {self.global_world_size} number of workers")
 
@@ -747,19 +757,42 @@ def ray_nccl_tester(world_size):
 
 
 def make_ray_actor_fn(world_size, parallel_dict):
+    num_replicas = parallel_dict.get("FSDP_model_replicas", 1)
+    shard_size = parallel_dict.get("shard_size", world_size)
+
     def _init_ray_actor(world_size=world_size, parallel_dict=parallel_dict):
         ray_actors = dict()
         gpu_actor = ray.remote(RayWorker)
         gpu_actors = []
 
-        for local_rank in range(world_size):
-            gpu_actors.append(
-                gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
-                    local_rank=local_rank,
-                    device_id=0,
-                    parallel_dict=parallel_dict,
+        if num_replicas <= 1:
+            # Single replica — all GPUs in one group
+            for local_rank in range(world_size):
+                gpu_actors.append(
+                    gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
+                        local_rank=local_rank,
+                        device_id=0,
+                        parallel_dict=parallel_dict,
+                    )
                 )
-            )
+        else:
+            # Multiple replicas — each replica gets its own NCCL group
+            for group_id in range(num_replicas):
+                group_parallel_dict = dict(parallel_dict)
+                group_parallel_dict["group_id"] = group_id
+
+                for local_rank in range(shard_size):
+                    gpu_actors.append(
+                        gpu_actor.options(
+                            num_gpus=1,
+                            name=f"RayWorker:{group_id}_{local_rank}"
+                        ).remote(
+                            local_rank=local_rank,
+                            device_id=0,
+                            parallel_dict=group_parallel_dict,
+                        )
+                    )
+
         ray_actors["workers"] = gpu_actors
 
         for actor in ray_actors["workers"]:

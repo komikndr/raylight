@@ -265,6 +265,14 @@ class RayInitializer:
                     "BOOLEAN",
                     {"default": False, "tooltip": "When FSDP is on, offload inactive model shards to CPU RAM."},
                 ),
+                "FSDP_model_replicas": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "tooltip": "Number of independent model replicas. 1 = one model sharded across all GPUs (default). Must divide GPU count evenly. Only applies when FSDP is enabled.",
+                    },
+                ),
                 "XFuser_attention": (
                     [member.name for member in AttnType],
                     {"default": "TORCH_FLASH", "tooltip": "Attention backend used by xFuser-enabled execution."},
@@ -303,6 +311,7 @@ class RayInitializer:
         sync_ulysses: bool,
         FSDP: bool,
         FSDP_CPU_OFFLOAD: bool,
+        FSDP_model_replicas: int,
         XFuser_attention: str,
         skip_comm_test: bool = True,
         use_mmap: bool = True,
@@ -346,11 +355,18 @@ class RayInitializer:
             raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} x {ring_degree=} x {cfg_degree=}")
         if cfg_degree > 2:
             raise ValueError("CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2")
+        if FSDP_model_replicas > 1 and not FSDP:
+            raise ValueError("FSDP_model_replicas > 1 requires FSDP to be enabled. FSDP shards the model within each replica.")
+        if GPU % FSDP_model_replicas != 0:
+            raise ValueError(f"GPU count ({GPU}) must be evenly divisible by FSDP_model_replicas ({FSDP_model_replicas})")
+        shard_size = GPU // FSDP_model_replicas
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
         self.parallel_dict["sync_ulysses"] = False
         self.parallel_dict["global_world_size"] = world_size
+        self.parallel_dict["FSDP_model_replicas"] = FSDP_model_replicas
+        self.parallel_dict["shard_size"] = shard_size
         self.parallel_dict["use_mmap"] = use_mmap
         self.parallel_dict["pp_degree"] = 1
         _reset_pipefusion_runtime_config(self.parallel_dict)
@@ -370,6 +386,7 @@ class RayInitializer:
         if FSDP:
             self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
             self.parallel_dict["is_fsdp"] = True
+            self.parallel_dict["global_world_size"] = shard_size
 
         if ray_dashboard_address != "None":
             dashboard_host, dashboard_port = ray_dashboard_address.rsplit(":", 1)
@@ -485,6 +502,14 @@ class RayInitializerAdvanced(RayInitializer):
                 "FSDP_CPU_OFFLOAD": (
                     "BOOLEAN",
                     {"default": False, "tooltip": "When FSDP is on, offload inactive model shards to CPU RAM."},
+                ),
+                "FSDP_model_replicas": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "tooltip": "Number of independent model replicas. 1 = one model sharded across all GPUs (default). Must divide GPU count evenly. Only applies when FSDP is enabled.",
+                    },
                 ),
                 "XFuser_attention": (
                     [member.name for member in AttnType],
@@ -666,30 +691,66 @@ class RayUNETLoader:
         loaded_futures = []
 
         if parallel_dict["is_fsdp"] is True:
-            if parallel_dict["is_quant"] is False:
-                worker0 = ray.get_actor("RayWorker:0")
-                ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
-                meta_model = ray.get(worker0.get_meta_model.remote())
+            num_replicas = parallel_dict.get("FSDP_model_replicas", 1)
+            shard_size = parallel_dict.get("shard_size", len(gpu_actors))
 
-                for actor in gpu_actors:
-                    if actor != worker0:
-                        loaded_futures.append(actor.set_meta_model.remote(meta_model))
+            if num_replicas <= 1:
+                # Single replica — all GPUs share one FSDP-sharded model
+                if parallel_dict["is_quant"] is False:
+                    worker0 = ray.get_actor("RayWorker:0")
+                    ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
+                    meta_model = ray.get(worker0.get_meta_model.remote())
 
-                ray.get(loaded_futures)
-                loaded_futures = []
+                    for actor in gpu_actors:
+                        if actor != worker0:
+                            loaded_futures.append(actor.set_meta_model.remote(meta_model))
 
-                for actor in gpu_actors:
-                    loaded_futures.append(actor.set_state_dict.remote())
+                    ray.get(loaded_futures)
+                    loaded_futures = []
+
+                    for actor in gpu_actors:
+                        loaded_futures.append(actor.set_state_dict.remote())
+
+                else:
+                    for actor in gpu_actors:
+                        loaded_futures.append(actor.load_unet.remote(unet_path, model_options=model_options))
+
+                    ray.get(loaded_futures)
+                    loaded_futures = []
+
+                    for actor in gpu_actors:
+                        loaded_futures.append(actor.set_state_dict.remote())
 
             else:
-                for actor in gpu_actors:
-                    loaded_futures.append(actor.load_unet.remote(unet_path, model_options=model_options))
+                # Multiple replicas — load model per group
+                for group_id in range(num_replicas):
+                    group_actors = gpu_actors[group_id * shard_size : (group_id + 1) * shard_size]
 
-                ray.get(loaded_futures)
-                loaded_futures = []
+                    if parallel_dict["is_quant"] is False:
+                        rank0_name = f"RayWorker:{group_id}_0"
+                        worker0 = ray.get_actor(rank0_name)
+                        ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
+                        meta_model = ray.get(worker0.get_meta_model.remote())
 
-                for actor in gpu_actors:
-                    loaded_futures.append(actor.set_state_dict.remote())
+                        for actor in group_actors:
+                            if actor != worker0:
+                                loaded_futures.append(actor.set_meta_model.remote(meta_model))
+
+                        ray.get(loaded_futures)
+                        loaded_futures = []
+
+                        for actor in group_actors:
+                            loaded_futures.append(actor.set_state_dict.remote())
+
+                    else:
+                        for actor in group_actors:
+                            loaded_futures.append(actor.load_unet.remote(unet_path, model_options=model_options))
+
+                        ray.get(loaded_futures)
+                        loaded_futures = []
+
+                        for actor in group_actors:
+                            loaded_futures.append(actor.set_state_dict.remote())
 
             ray.get(loaded_futures)
             loaded_futures = []
@@ -940,12 +1001,19 @@ class DPKSamplerAdvanced:
             """
             )
 
-        if len(latent_image) != len(gpu_actors):
-            latent_image = [latent_image[0]] * len(gpu_actors)
+        # Auto-replicate: if fewer items than GPUs, fill remaining
+        num_gpus = len(gpu_actors)
+        if len(latent_image) != num_gpus:
+            latent_image = [latent_image[0]] * num_gpus
         if len(positive) == 1:
-            positive = positive * len(gpu_actors)
+            positive = positive * num_gpus
         if len(negative) == 1:
-            negative = negative * len(gpu_actors)
+            negative = negative * num_gpus
+        if len(noise_list) != num_gpus:
+            if len(noise_list) >= num_gpus:
+                noise_list = noise_list[:num_gpus]
+            else:
+                noise_list = [noise_list[0]] * num_gpus
 
         # Clean VRAM for preparation to load model
         gc.collect()
@@ -958,6 +1026,7 @@ class DPKSamplerAdvanced:
         if add_noise == "disable":
             disable_noise = True
 
+        # Each GPU gets its own noise/conditioning — decoupled from FSDP sharding
         futures = [
             actor.common_ksampler.remote(
                 noise_list[i],
