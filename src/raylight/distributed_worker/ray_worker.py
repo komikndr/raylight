@@ -172,20 +172,27 @@ class RayWorker:
         import comfy.model_management as comfy_model_management
 
         if self.model is not None:
-            try:
-                self.model.detach()
-            except Exception:
-                pass
+            if hasattr(self.model, "free_fsdp_vram"):
+                try:
+                    self.model.free_fsdp_vram()
+                except Exception as e:
+                    print(f"[Rank {self.local_rank}] free_fsdp_vram failed in _reset_active_model: {e}")
+            else:
+                from raylight.comfy_dist.model_patcher import free_model_vram
+                try:
+                    free_model_vram(self.model)
+                except Exception as e:
+                    print(f"[Rank {self.local_rank}] free_model_vram failed in _reset_active_model: {e}")
             try:
                 self.model.cleanup()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Rank {self.local_rank}] model.cleanup() failed in _reset_active_model: {e}")
 
         self.model = None
         self.overwrite_cast_dtype = None
         self.active_request_key = None
-        comfy_model_management.soft_empty_cache()
         gc.collect()
+        comfy_model_management.soft_empty_cache()
 
     def _invalidate_non_fsdp_cache(self):
         self.cached_base_model = None
@@ -605,10 +612,15 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
-            self.model.detach()
+        if hasattr(self.model, "free_fsdp_vram"):
+            self.model.free_fsdp_vram()
         else:
-            self.model.detach()
+            from raylight.comfy_dist.model_patcher import free_model_vram
+            free_model_vram(self.model)
+        try:
+            self.model.cleanup()
+        except Exception:
+            pass
         comfy_model_management.soft_empty_cache()
         gc.collect()
         return out
@@ -684,12 +696,15 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
-            self.model.detach()
-
-        # I haven't implemented for non FSDP detached, so all rank model will be move into RAM
+        if hasattr(self.model, "free_fsdp_vram"):
+            self.model.free_fsdp_vram()
         else:
-            self.model.detach()
+            from raylight.comfy_dist.model_patcher import free_model_vram
+            free_model_vram(self.model)
+        try:
+            self.model.cleanup()
+        except Exception:
+            pass
         comfy_model_management.soft_empty_cache()
         gc.collect()
         return (out,)
