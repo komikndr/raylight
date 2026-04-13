@@ -177,12 +177,19 @@ class RayWorker:
                     self.model.free_fsdp_vram()
                 except Exception as e:
                     print(f"[Rank {self.local_rank}] free_fsdp_vram failed in _reset_active_model: {e}")
-            else:
-                from raylight.comfy_dist.model_patcher import free_model_vram
                 try:
-                    free_model_vram(self.model)
+                    self.model.detach()
                 except Exception as e:
-                    print(f"[Rank {self.local_rank}] free_model_vram failed in _reset_active_model: {e}")
+                    print(f"[Rank {self.local_rank}] model.detach() failed in _reset_active_model: {e}")
+            else:
+                # Non-FSDP: unpatch LoRA weights but do NOT move model to CPU.
+                # clone() shares the underlying model with cached_base_model,
+                # so free_model_vram() would corrupt the cache. Instead, restore
+                # original weights from backup (device_to=None skips .to(CPU)).
+                try:
+                    self.model.unpatch_model(device_to=None)
+                except Exception as e:
+                    print(f"[Rank {self.local_rank}] model.unpatch_model() failed in _reset_active_model: {e}")
             try:
                 self.model.cleanup()
             except Exception as e:
@@ -614,13 +621,19 @@ class RayWorker:
 
         if hasattr(self.model, "free_fsdp_vram"):
             self.model.free_fsdp_vram()
+            try:
+                self.model.cleanup()
+            except Exception:
+                pass
         else:
-            from raylight.comfy_dist.model_patcher import free_model_vram
-            free_model_vram(self.model)
-        try:
-            self.model.cleanup()
-        except Exception:
-            pass
+            try:
+                self.model.unpatch_model(device_to=None)
+            except Exception:
+                pass
+            try:
+                self.model.cleanup()
+            except Exception:
+                pass
         comfy_model_management.soft_empty_cache()
         gc.collect()
         return out
@@ -698,13 +711,19 @@ class RayWorker:
 
         if hasattr(self.model, "free_fsdp_vram"):
             self.model.free_fsdp_vram()
+            try:
+                self.model.cleanup()
+            except Exception:
+                pass
         else:
-            from raylight.comfy_dist.model_patcher import free_model_vram
-            free_model_vram(self.model)
-        try:
-            self.model.cleanup()
-        except Exception:
-            pass
+            try:
+                self.model.unpatch_model(device_to=None)
+            except Exception:
+                pass
+            try:
+                self.model.cleanup()
+            except Exception:
+                pass
         comfy_model_management.soft_empty_cache()
         gc.collect()
         return (out,)

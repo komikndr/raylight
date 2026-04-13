@@ -83,6 +83,11 @@ def free_model_vram(model_patcher) -> None:
     Unlike model.detach(), this does NOT copy weights to CPU RAM.
     Call before dropping the model reference so VRAM is released
     deterministically without relying on __del__ / gc.collect().
+
+    WARNING: ModelPatcher.clone() shares the underlying model object.
+    Calling this on a clone will corrupt all other clones sharing the
+    same model. Only use when the model is not shared (e.g. FSDP path
+    where there is no cached_base_model).
     """
     model = getattr(model_patcher, "model", None)
     if model is None:
