@@ -182,20 +182,34 @@ class RayWorker:
         import comfy.model_management as comfy_model_management
 
         if self.model is not None:
-            try:
-                self.model.detach()
-            except Exception:
-                pass
+            if hasattr(self.model, "free_fsdp_vram"):
+                try:
+                    self.model.free_fsdp_vram()
+                except Exception as e:
+                    print(f"[Rank {self.local_rank}] free_fsdp_vram failed in _reset_active_model: {e}")
+                try:
+                    self.model.detach()
+                except Exception as e:
+                    print(f"[Rank {self.local_rank}] model.detach() failed in _reset_active_model: {e}")
+            else:
+                # Non-FSDP: unpatch LoRA weights but do NOT move model to CPU.
+                # clone() shares the underlying model with cached_base_model,
+                # so free_model_vram() would corrupt the cache. Instead, restore
+                # original weights from backup (device_to=None skips .to(CPU)).
+                try:
+                    self.model.unpatch_model(device_to=None)
+                except Exception as e:
+                    print(f"[Rank {self.local_rank}] model.unpatch_model() failed in _reset_active_model: {e}")
             try:
                 self.model.cleanup()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Rank {self.local_rank}] model.cleanup() failed in _reset_active_model: {e}")
 
         self.model = None
         self.overwrite_cast_dtype = None
         self.active_request_key = None
-        comfy_model_management.soft_empty_cache()
         gc.collect()
+        comfy_model_management.soft_empty_cache()
 
     def _invalidate_non_fsdp_cache(self):
         self.cached_base_model = None
@@ -220,6 +234,7 @@ class RayWorker:
                 return
             raise ValueError("Worker state_dict is None before set_state_dict")
         self.model.set_fsdp_state_dict(self.state_dict)
+        self.state_dict = None
 
     def get_compute_capability(self):
         return self.compute_capability
@@ -326,16 +341,26 @@ class RayWorker:
 
     def load_unet(self, unet_path, model_options):
         if self.parallel_dict["is_fsdp"] is True:
-            import comfy.model_management as comfy_model_management
+            active_key = self._active_model_key(unet_path, model_options)
 
-            if self.cached_base_model is not None or self.active_request_key is not None:
-                self._reset_active_model()
-            self._invalidate_non_fsdp_cache()
+            # Fast path: same base model + same LoRA — reuse FSDP-wrapped model
+            if self.model is not None and self.active_request_key == active_key:
+                self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+                self.is_model_loaded = True
+                return
+
+            # Model or LoRA changed — free old VRAM deterministically, then reload
+            if self.model is not None:
+                try:
+                    self.model.free_fsdp_vram()
+                except Exception as e:
+                    print(f"[Rank {self.local_rank}] free_fsdp_vram failed: {e}")
+
+
             # Monkey patch
             import comfy.model_patcher as model_patcher
             import comfy.model_management as model_management
 
-            # Monkey patch
             from raylight.comfy_dist.model_management import cleanup_models_gc
             from raylight.comfy_dist.model_patcher import LowVramPatch
 
@@ -344,7 +369,6 @@ class RayWorker:
             fsdp_model_options = dict(model_options)
             fsdp_model_options["use_mmap"] = self.parallel_dict.get("use_mmap", True)
 
-            # Monkey patch
             model_patcher.LowVramPatch = LowVramPatch
             model_management.cleanup_models_gc = cleanup_models_gc
 
@@ -353,8 +377,8 @@ class RayWorker:
             self.model = None
             self.state_dict = None
             torch.cuda.synchronize()
-            comfy_model_management.soft_empty_cache()
             gc.collect()
+            model_management.soft_empty_cache()
 
             self.model, self.state_dict = fsdp_load_diffusion_model(
                 unet_path,
@@ -364,8 +388,16 @@ class RayWorker:
                 model_options=fsdp_model_options,
             )
             torch.cuda.synchronize()
-            comfy_model_management.soft_empty_cache()
+            model_management.soft_empty_cache()
             gc.collect()
+
+            if self.lora_list is not None:
+                self.load_lora()
+
+            self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+            self.is_model_loaded = True
+            self.active_request_key = active_key
+            return
         else:
             import comfy.sd as comfy_sd
 
@@ -383,8 +415,28 @@ class RayWorker:
                 return
 
             if self.cached_base_model is not None and self.cached_base_key == base_key:
-                self._activate_cached_base_model(active_key)
-                return
+                # If cached model has GPU weights (from a previous full-load run
+                # without LoRA), free them now. Otherwise partially_load() sees
+                # model_loaded_weight_memory=0 and does a full_load=True pass that
+                # converts fp8 weights to bf16 during LoRA patching, spiking VRAM
+                # from ~15Gb to ~23Gb on each GPU.
+                _cached_has_gpu_weights = False
+                try:
+                    _first_p = next(self.cached_base_model.model.parameters(), None)
+                    if _first_p is not None and _first_p.device.type == "cuda":
+                        _cached_has_gpu_weights = True
+                except Exception:
+                    pass
+
+                if _cached_has_gpu_weights:
+                    from raylight.comfy_dist.model_patcher import free_model_vram
+
+                    free_model_vram(self.cached_base_model)
+                    self._invalidate_non_fsdp_cache()
+                    # Fall through to reload from disk (mmap, no RAM spike)
+                else:
+                    self._activate_cached_base_model(active_key)
+                    return
 
             self._reset_active_model()
             self._invalidate_non_fsdp_cache()
@@ -426,12 +478,6 @@ class RayWorker:
             self._activate_cached_base_model(active_key)
             return
 
-        if self.lora_list is not None:
-            self.load_lora()
-
-        self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
-        self.is_model_loaded = True
-
     def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype, use_mmap=None):
         self._reset_active_model()
         self._invalidate_non_fsdp_cache()
@@ -442,6 +488,12 @@ class RayWorker:
             raise RuntimeError("FSDP on GGUF is not supported")
         else:
             from raylight.comfy_dist.sd import gguf_load_diffusion_model
+
+            if self.model is not None:
+                try:
+                    self.model.free_fsdp_vram()
+                except Exception as e:
+                    print(f"[Rank {self.local_rank}] free_fsdp_vram failed (bnb): {e}")
 
             self.model = gguf_load_diffusion_model(
                 unet_path,
@@ -615,10 +667,12 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
-            self.model.detach()
-        else:
-            self.model.detach()
+        if hasattr(self.model, "free_fsdp_vram"):
+            self.model.free_fsdp_vram()
+        try:
+            self.model.cleanup()
+        except Exception:
+            pass
         comfy_model_management.soft_empty_cache()
         gc.collect()
         return out
@@ -694,12 +748,12 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
-            self.model.detach()
-
-        # I haven't implemented for non FSDP detached, so all rank model will be move into RAM
-        else:
-            self.model.detach()
+        if hasattr(self.model, "free_fsdp_vram"):
+            self.model.free_fsdp_vram()
+        try:
+            self.model.cleanup()
+        except Exception:
+            pass
         comfy_model_management.soft_empty_cache()
         gc.collect()
         return (out,)

@@ -6,6 +6,15 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 
 ## UPDATE
+
+<details><summary><strong>Click to expand changelog</strong></summary>
+
+- GPU Selector: add `GPU_SELECT` input to `RayInitializerAdvanced` to restrict Ray workers to specific GPUs (for example `0,1,2`, or leave empty for all GPUs), credit to [avtc](https://github.com/avtc)
+- Multi-Prompt DP: add `DPConditioningList` node for per-GPU conditioning in Data Parallel mode, credit to avtc
+- GGUF mmap restore: properly restore mmap-backed quant params on unpatch when `use_mmap=True`, inspired by avtc's approach
+- Serialization fix: fix Ray/cloudpickle losing model config from `BASE.__getattr__`, credit to avtc
+- Samplers: pass `ray_actors` through sampler outputs for cleaner workflow chaining
+- Docs: add developer docs for FSDP, USP, CFG, and expansion modules
 - Now TensorCoreFP8 and NVFP4 works in FSDP2, check on [CK-Distributed](https://github.com/komikndr/comfy-kitchen-distributed)
 - LTX-2 USP
 - Kandinsky5 model
@@ -30,10 +39,13 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 - Full LoRA support.
 - FSDP CPU offload, analogous to block swap/DisTorch.
 
+</details>
+
 
 ## Table of Contents
 - [Raylight](#raylight)
 - [UPDATE](#update)
+- [Documentation](#documentation)
 - [What exactly is Raylight](#what-exactly-is-raylight)
 - [Raylight vs MultiGPU vs ComfyUI Worksplit vs ComfyUI-Distributed](#raylight-vs-multigpu-vs-comfyui-worksplit-branch-vs-comfyui-distributed)
 - [RTM and Known Issues](#rtm-and-known-issues)
@@ -47,6 +59,11 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 - [Installation](#installation)
 - [Support Me](#support)
 
+
+## Documentation
+
+For developers and advanced users, see the [docs](docs/) folder for detailed guides on USP, CFG, FSDP, and expansion modules.
+- Top most head is `dev`, pr merge into `dev` or any custom branch name e.g `komikndr:raylight/feat-something` <- `john_doe:raylight/feat-something`, DONT MERGE INTO MAIN
 
 ## What exactly is Raylight
 
