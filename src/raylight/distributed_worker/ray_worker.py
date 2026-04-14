@@ -667,8 +667,6 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        if hasattr(self.model, "free_fsdp_vram"):
-            self.model.free_fsdp_vram()
         try:
             self.model.cleanup()
         except Exception:
@@ -748,8 +746,6 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        if hasattr(self.model, "free_fsdp_vram"):
-            self.model.free_fsdp_vram()
         try:
             self.model.cleanup()
         except Exception:
