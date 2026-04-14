@@ -11,8 +11,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 - GPU Selector: add `GPU_SELECT` input to `RayInitializerAdvanced` to restrict Ray workers to specific GPUs (for example `0,1,2`, or leave empty for all GPUs), credit to [avtc](https://github.com/avtc)
 - Multi-Prompt DP: add `DPConditioningList` node for per-GPU conditioning in Data Parallel mode, credit to avtc
-- GGUF mmap restore: properly restore mmap-backed quant params on unpatch when `use_mmap=True`, inspired by avtc's approach
-- Serialization fix: fix Ray/cloudpickle losing model config from `BASE.__getattr__`, credit to avtc
+- `mmap` option for reduce RAM, GGUF implementation by avtc
 - Samplers: pass `ray_actors` through sampler outputs for cleaner workflow chaining
 - Docs: add developer docs for FSDP, USP, CFG, and expansion modules
 - Now TensorCoreFP8 and NVFP4 works in FSDP2, check on [CK-Distributed](https://github.com/komikndr/comfy-kitchen-distributed)
@@ -170,10 +169,6 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 3. **Ampere**: Tested
 4. **Ada Lovelace**: Tested
 5. **Blackwell**: Tested
-
-**Notes:**
-- Install latest Yunchang libs to enable FLASH_EFFICIENT, copy cmd inside the `requirements_experimental.txt`,
-  don't forget to refresh your nodes and select FLASH_EFFICIENT on XFuser_attention in Ray Init Actor node.
 
 ### AMD
 
