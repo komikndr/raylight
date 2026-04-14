@@ -77,6 +77,51 @@ def _safe_free_storage(tensor: torch.Tensor) -> None:
         raise
 
 
+def free_model_vram(model_patcher) -> None:
+    """Eagerly free GPU storage from a non-FSDP ModelPatcher.
+
+    Unlike model.detach(), this does NOT copy weights to CPU RAM.
+    Call before dropping the model reference so VRAM is released
+    deterministically without relying on __del__ / gc.collect().
+
+    WARNING: ModelPatcher.clone() shares the underlying model object.
+    Calling this on a clone will corrupt all other clones sharing the
+    same model. Only use when the model is not shared (e.g. FSDP path
+    where there is no cached_base_model).
+    """
+    model = getattr(model_patcher, "model", None)
+    if model is None:
+        return
+    # Break reference cycle (model.current_patcher -> model_patcher -> model)
+    # so __del__ -> detach(unpatch_all=False) won't re-copy to CPU.
+    if hasattr(model, "current_patcher"):
+        model.current_patcher = None
+
+    for m in model.modules():
+        for p in m.parameters(recurse=False):
+            try:
+                tensor = p.data
+                if not isinstance(tensor, torch.Tensor):
+                    continue
+                if tensor.device.type == "meta":
+                    continue
+                if _is_quantized_tensor_like(tensor):
+                    continue
+                _safe_free_storage(tensor)
+            except Exception:
+                continue
+        for b in m.buffers(recurse=False):
+            try:
+                tensor = b.data
+                if not isinstance(tensor, torch.Tensor):
+                    continue
+                if tensor.device.type == "meta":
+                    continue
+                _safe_free_storage(tensor)
+            except Exception:
+                continue
+
+
 def _is_quantized_tensor_like(tensor: torch.Tensor) -> bool:
     if not isinstance(tensor, torch.Tensor):
         return False

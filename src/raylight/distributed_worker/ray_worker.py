@@ -177,10 +177,19 @@ class RayWorker:
                     self.model.free_fsdp_vram()
                 except Exception as e:
                     print(f"[Rank {self.local_rank}] free_fsdp_vram failed in _reset_active_model: {e}")
-            try:
-                self.model.detach()
-            except Exception as e:
-                print(f"[Rank {self.local_rank}] model.detach() failed in _reset_active_model: {e}")
+                try:
+                    self.model.detach()
+                except Exception as e:
+                    print(f"[Rank {self.local_rank}] model.detach() failed in _reset_active_model: {e}")
+            else:
+                # Non-FSDP: unpatch LoRA weights but do NOT move model to CPU.
+                # clone() shares the underlying model with cached_base_model,
+                # so free_model_vram() would corrupt the cache. Instead, restore
+                # original weights from backup (device_to=None skips .to(CPU)).
+                try:
+                    self.model.unpatch_model(device_to=None)
+                except Exception as e:
+                    print(f"[Rank {self.local_rank}] model.unpatch_model() failed in _reset_active_model: {e}")
             try:
                 self.model.cleanup()
             except Exception as e:
@@ -396,8 +405,28 @@ class RayWorker:
                 return
 
             if self.cached_base_model is not None and self.cached_base_key == base_key:
-                self._activate_cached_base_model(active_key)
-                return
+                # If cached model has GPU weights (from a previous full-load run
+                # without LoRA), free them now. Otherwise partially_load() sees
+                # model_loaded_weight_memory=0 and does a full_load=True pass that
+                # converts fp8 weights to bf16 during LoRA patching, spiking VRAM
+                # from ~15Gb to ~23Gb on each GPU.
+                _cached_has_gpu_weights = False
+                try:
+                    _first_p = next(self.cached_base_model.model.parameters(), None)
+                    if _first_p is not None and _first_p.device.type == "cuda":
+                        _cached_has_gpu_weights = True
+                except Exception:
+                    pass
+
+                if _cached_has_gpu_weights:
+                    from raylight.comfy_dist.model_patcher import free_model_vram
+
+                    free_model_vram(self.cached_base_model)
+                    self._invalidate_non_fsdp_cache()
+                    # Fall through to reload from disk (mmap, no RAM spike)
+                else:
+                    self._activate_cached_base_model(active_key)
+                    return
 
             self._reset_active_model()
             self._invalidate_non_fsdp_cache()
@@ -628,10 +657,12 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
-            self.model.detach()
-        else:
-            self.model.detach()
+        if hasattr(self.model, "free_fsdp_vram"):
+            self.model.free_fsdp_vram()
+        try:
+            self.model.cleanup()
+        except Exception:
+            pass
         comfy_model_management.soft_empty_cache()
         gc.collect()
         return out
@@ -707,12 +738,12 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
-            self.model.detach()
-
-        # I haven't implemented for non FSDP detached, so all rank model will be move into RAM
-        else:
-            self.model.detach()
+        if hasattr(self.model, "free_fsdp_vram"):
+            self.model.free_fsdp_vram()
+        try:
+            self.model.cleanup()
+        except Exception:
+            pass
         comfy_model_management.soft_empty_cache()
         gc.collect()
         return (out,)
