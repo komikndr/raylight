@@ -143,11 +143,58 @@ class RayWorker:
     def set_meta_model(self, model):
         first_param_device = next(model.model.parameters()).device
         if first_param_device == torch.device("meta"):
+            # Free old model VRAM before replacing — without this, switching
+            # workflows leaves the previous FSDP model's DTensor shards on GPU
+            # and the new model's patch_fsdp() OOMs during set_model_state_dict.
+            self._free_current_model()
             self.state_dict = None
             self.model = model
             self.model.config_fsdp(self.local_rank, self.device_mesh)
         else:
             raise ValueError("Model being set is not meta, can cause OOM in large model")
+
+    def _free_current_model(self):
+        """Eagerly free the current model's GPU storage.
+
+        Handles both FSDP models (DTensor shards) and non-FSDP models.
+        Must be called before dropping the model reference so VRAM is
+        released deterministically without relying on __del__ / gc.
+        """
+        import comfy.model_management as comfy_model_management
+
+        if self.model is None:
+            return
+
+        if hasattr(self.model, "free_fsdp_vram"):
+            try:
+                self.model.free_fsdp_vram()
+            except Exception as e:
+                print(f"[Rank {self.local_rank}] free_fsdp_vram failed in _free_current_model: {e}")
+        else:
+            try:
+                self.model.unpatch_model(device_to=None)
+            except Exception as e:
+                print(f"[Rank {self.local_rank}] model.unpatch_model() failed in _free_current_model: {e}")
+
+        try:
+            self.model.cleanup()
+        except Exception as e:
+            print(f"[Rank {self.local_rank}] model.cleanup() failed in _free_current_model: {e}")
+
+        self.model = None
+        self.overwrite_cast_dtype = None
+        self.active_request_key = None
+        gc.collect()
+        comfy_model_management.soft_empty_cache()
+
+    def check_model_loaded(self, unet_path, model_options):
+        """Check if the currently loaded model matches the given parameters.
+
+        Used for reuse detection: when MCP or a different workflow runs with the
+        same model + lora + options, we can skip the full reload.
+        """
+        active_key = self._active_model_key(unet_path, model_options)
+        return self.model is not None and self.active_request_key == active_key
 
     def _normalize_model_options(self, model_options):
         if not model_options:
