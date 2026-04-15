@@ -668,6 +668,16 @@ class RayUNETLoader:
         if parallel_dict["is_fsdp"] is True:
             if parallel_dict["is_quant"] is False:
                 worker0 = ray.get_actor("RayWorker:0")
+
+                # Reuse detection: if all workers already have this exact
+                # model + lora combo loaded, skip the expensive reload.
+                # This handles MCP re-creating the same workflow and
+                # ComfyUI re-executing RayUNETLoader with identical inputs.
+                already_loaded = ray.get(worker0.check_model_loaded.remote(unet_path, model_options))
+
+                if already_loaded:
+                    return (ray_actors,)
+
                 ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
                 meta_model = ray.get(worker0.get_meta_model.remote())
 
