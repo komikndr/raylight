@@ -559,6 +559,8 @@ class RayWorker:
         vae_model = comfy_sd.VAE(sd=state_dict)
         vae_model.throw_exception_if_invalid()
 
+        import types
+        
         vae_model.decode_tiled_1d = types.MethodType(decode_tiled_1d, vae_model)
         vae_model.decode_tiled_ = types.MethodType(decode_tiled_, vae_model)
         vae_model.decode_tiled_3d = types.MethodType(decode_tiled_3d, vae_model)
