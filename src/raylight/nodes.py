@@ -283,9 +283,9 @@ class RayInitializer:
                 "dp_degree": (
                     "INT",
                     {
-                        "default": 0,
+                        "default": 1,
                         "min": 0,
-                        "tooltip": "Data-parallel degree. Leave 0 to auto use the remaining GPUs after ulysses/ring/cfg.",
+                        "tooltip": "Data-parallel degree. Just use 1 or leave 0 when using Unified Parallel Sampler to auto use the remaining GPUs after ulysses/ring/cfg.",
                     },
                 ),
                 "sync_ulysses": (
@@ -530,9 +530,9 @@ class RayInitializerAdvanced(RayInitializer):
                 "dp_degree": (
                     "INT",
                     {
-                        "default": 0,
+                        "default": 1,
                         "min": 0,
-                        "tooltip": "Data-parallel degree. Leave 0 to auto use the remaining GPUs after ulysses/ring/cfg.",
+                        "tooltip": "Data-parallel degree. Default 1 keeps the legacy layout. Leave 0 when using Unified Parallel Sampler to auto use the remaining GPUs after ulysses/ring/cfg.",
                     },
                 ),
                 "sync_ulysses": (
@@ -1346,7 +1346,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "XFuserKSamplerAdvanced": "XFuser KSampler (Advanced)",
-    "UnifiedParallelSampler": "Unified Parallel Sampler",
+    "UnifiedParallelSampler": "Unified Parallel Sampler (Advance)",
     "DPKSamplerAdvanced": "Data Parallel KSampler (Advanced)",
     "RayKill": "Kill Ray",
     "RayUNETLoader": "Load Diffusion Model (Ray)",

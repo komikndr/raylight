@@ -43,6 +43,8 @@ from ray.exceptions import RayActorError
 # If ray actor function being called from outside, ray.get([task in actor task]) will become sync between rank
 # If called from ray actor within. dist.barrier() become the sync.
 
+# PIPEFUSION STUFF IS ONLY TESTING, IT IS BREAKING DOWN ALLLL THE TIME
+
 
 # Comfy cli args, does not get pass through into ray actor
 def patch_enable_comfy_kitchen_fsdp(fn):
@@ -98,9 +100,10 @@ class RayWorker:
             # device_id=self.device
         )
 
-        # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
             self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
+
+        # Just experimenting, user can't trigger this
         elif not self.parallel_dict.get("pipefusion_enabled"):
             print(f"Running Ray in normal seperate sampler with: {self.global_world_size} number of workers")
 
@@ -638,6 +641,7 @@ class RayWorker:
         sampler,
         sigmas,
         latent_image,
+        grouped_output=False,
     ):
         import comfy.model_management as comfy_model_management
         import comfy.sample as comfy_sample
@@ -693,6 +697,8 @@ class RayWorker:
             pass
         comfy_model_management.soft_empty_cache()
         gc.collect()
+        if grouped_output:
+            return self._grouped_sampling_result(out)
         return out
 
     @patch_temp_fix_ck_ops
