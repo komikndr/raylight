@@ -232,6 +232,35 @@ class RayWorker:
     def get_parallel_dict(self):
         return self.parallel_dict
 
+    def get_exec_group_info(self):
+        if self.xfuser_parallel is None:
+            return {
+                "global_rank": self.local_rank,
+                "dp_rank": 0,
+                "dp_degree": 1,
+                "is_group_leader": self.local_rank == 0,
+            }
+
+        is_group_leader = (
+            self.xfuser_parallel.sequence_rank == 0 and self.xfuser_parallel.pipeline_rank == 0 and self.xfuser_parallel.cfg_rank == 0
+        )
+        return {
+            "global_rank": self.xfuser_parallel.global_rank,
+            "dp_rank": self.xfuser_parallel.data_parallel_rank,
+            "dp_degree": self.xfuser_parallel.data_parallel_world_size,
+            "is_group_leader": is_group_leader,
+        }
+
+    def _grouped_sampling_result(self, result):
+        group_info = self.get_exec_group_info()
+        if not group_info["is_group_leader"]:
+            return None
+
+        return {
+            "dp_rank": group_info["dp_rank"],
+            "result": result,
+        }
+
     def set_parallel_dict(self, parallel_dict):
         self.parallel_dict = parallel_dict
         self.pipefusion_config = PipeFusionConfig.from_parallel_dict(self.parallel_dict)
@@ -345,7 +374,6 @@ class RayWorker:
                     self.model.free_fsdp_vram()
                 except Exception as e:
                     print(f"[Rank {self.local_rank}] free_fsdp_vram failed: {e}")
-
 
             # Monkey patch
             import comfy.model_patcher as model_patcher
@@ -560,7 +588,7 @@ class RayWorker:
         vae_model.throw_exception_if_invalid()
 
         import types
-        
+
         vae_model.decode_tiled_1d = types.MethodType(decode_tiled_1d, vae_model)
         vae_model.decode_tiled_ = types.MethodType(decode_tiled_, vae_model)
         vae_model.decode_tiled_3d = types.MethodType(decode_tiled_3d, vae_model)
@@ -685,6 +713,7 @@ class RayWorker:
         start_step=None,
         last_step=None,
         force_full_denoise=False,
+        grouped_output=False,
     ):
         import comfy.model_management as comfy_model_management
         import comfy.sample as comfy_sample
@@ -744,6 +773,8 @@ class RayWorker:
             pass
         comfy_model_management.soft_empty_cache()
         gc.collect()
+        if grouped_output:
+            return self._grouped_sampling_result(out)
         return (out,)
 
 

@@ -5,6 +5,10 @@ from dataclasses import dataclass
 import raylight.distributed_modules.attention as xfuser_attn
 
 from xfuser.core.distributed import (
+    get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
+    get_data_parallel_rank,
+    get_data_parallel_world_size,
     get_pipeline_parallel_rank,
     get_pipeline_parallel_world_size,
     get_pp_group,
@@ -61,6 +65,10 @@ class XFuserParallelContext:
     rank_generator: RankGenerator
     global_rank: int
     global_world_size: int
+    data_parallel_rank: int
+    data_parallel_world_size: int
+    cfg_rank: int
+    cfg_world_size: int
     pipeline_rank: int
     pipeline_world_size: int
     sequence_rank: int
@@ -91,12 +99,20 @@ def initialize_xfuser_parallel(local_rank: int, world_size: int, parallel_dict: 
             "pp_degree * ulysses_degree * ring_degree * cfg_degree: "
             f"{world_size} is not divisible by {base_config.pp_degree} * {base_config.ulysses_degree} * {base_config.ring_degree} * {base_config.cfg_degree}"
         )
+    derived_data_parallel_degree = world_size // base_config.model_parallel_size
+    requested_data_parallel_degree = int(parallel_dict.get("dp_degree", 0) or 0)
+    if requested_data_parallel_degree not in (0, derived_data_parallel_degree):
+        raise ValueError(
+            "Ray worker count must equal "
+            "dp_degree * pp_degree * ulysses_degree * ring_degree * cfg_degree: "
+            f"{world_size} != {requested_data_parallel_degree} * {base_config.pp_degree} * {base_config.ulysses_degree} * {base_config.ring_degree} * {base_config.cfg_degree}"
+        )
     config = XFuserParallelConfig(
         ulysses_degree=base_config.ulysses_degree,
         ring_degree=base_config.ring_degree,
         cfg_degree=base_config.cfg_degree,
         pp_degree=base_config.pp_degree,
-        data_parallel_degree=world_size // base_config.model_parallel_size,
+        data_parallel_degree=derived_data_parallel_degree,
     )
 
     if parallel_dict.get("is_xdit"):
@@ -126,6 +142,10 @@ def initialize_xfuser_parallel(local_rank: int, world_size: int, parallel_dict: 
         rank_generator=rank_generator,
         global_rank=local_rank,
         global_world_size=world_size,
+        data_parallel_rank=get_data_parallel_rank(),
+        data_parallel_world_size=get_data_parallel_world_size(),
+        cfg_rank=get_classifier_free_guidance_rank(),
+        cfg_world_size=get_classifier_free_guidance_world_size(),
         pipeline_rank=get_pipeline_parallel_rank(),
         pipeline_world_size=get_pipeline_parallel_world_size(),
         sequence_rank=get_sequence_parallel_rank(),
