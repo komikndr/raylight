@@ -127,14 +127,16 @@ class RayWorker:
             )
 
     def get_meta_model(self):
-        first_param_device = next(self.model.model.parameters()).device
+        base_model = getattr(self.model, "model", self.model)
+        first_param_device = next(base_model.parameters()).device
         if first_param_device == torch.device("meta"):
             return self.model
         else:
             raise ValueError("Model recieved is not meta, can cause OOM in large model")
 
     def set_meta_model(self, model):
-        first_param_device = next(model.model.parameters()).device
+        base_model = getattr(model, "model", model)
+        first_param_device = next(base_model.parameters()).device
         if first_param_device == torch.device("meta"):
             self.state_dict = None
             self.model = model
@@ -216,7 +218,8 @@ class RayWorker:
         if self.lora_list is not None:
             self.load_lora()
 
-        self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+        base_model = getattr(self.model, "model", self.model)
+        self.overwrite_cast_dtype = getattr(base_model, "manual_cast_dtype", None)
         self.active_request_key = active_key
         self.is_model_loaded = True
 
@@ -303,7 +306,7 @@ class RayWorker:
                 "PipeFusion topology is now initialized through xFuser, but the Wan execution path does not yet combine PP with USP"
             )
 
-        base_model = self.model.model
+        base_model = getattr(self.model, "model", self.model)
         if not hasattr(base_model, "diffusion_model") or not hasattr(base_model.diffusion_model, "blocks"):
             raise ValueError(f"PipeFusion requires a Wan diffusion model with blocks, got {type(base_model).__name__}")
 
@@ -367,7 +370,8 @@ class RayWorker:
 
             # Fast path: same base model + same LoRA — reuse FSDP-wrapped model
             if self.model is not None and self.active_request_key == active_key:
-                self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+                base_model = getattr(self.model, "model", self.model)
+                self.overwrite_cast_dtype = getattr(base_model, "manual_cast_dtype", None)
                 self.is_model_loaded = True
                 return
 
@@ -415,7 +419,8 @@ class RayWorker:
             if self.lora_list is not None:
                 self.load_lora()
 
-            self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+            base_model = getattr(self.model, "model", self.model)
+            self.overwrite_cast_dtype = getattr(base_model, "manual_cast_dtype", None)
             self.is_model_loaded = True
             self.active_request_key = active_key
             return
@@ -431,7 +436,8 @@ class RayWorker:
             )
 
             if self.model is not None and self.active_request_key == active_key:
-                self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+                base_model = getattr(self.model, "model", self.model)
+                self.overwrite_cast_dtype = getattr(base_model, "manual_cast_dtype", None)
                 self.is_model_loaded = True
                 return
 
@@ -443,7 +449,8 @@ class RayWorker:
                 # from ~15Gb to ~23Gb on each GPU.
                 _cached_has_gpu_weights = False
                 try:
-                    _first_p = next(self.cached_base_model.model.parameters(), None)
+                    cached_base_model = getattr(self.cached_base_model, "model", self.cached_base_model)
+                    _first_p = next(cached_base_model.parameters(), None)
                     if _first_p is not None and _first_p.device.type == "cuda":
                         _cached_has_gpu_weights = True
                 except Exception:
