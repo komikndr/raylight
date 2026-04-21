@@ -6,6 +6,7 @@ import gc
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 from torch.distributed.utils import _free_storage
@@ -16,7 +17,7 @@ from comfy.patcher_extension import CallbacksMP
 from comfy.model_patcher import get_key_weight, string_to_seed, move_weight_functions
 
 from raylight import comfy_dist
-from .fsdp_utils import freeze_and_detect_qt, fully_shard_bottom_up, load_from_full_model_state_dict
+from .fsdp_utils import freeze_and_detect_qt, fully_shard_bottom_up, load_from_full_model_state_dict, materialize_excluded_params
 
 if TYPE_CHECKING:
     from raylight.distributed_worker.parallel_group_manager import XFuserParallelContext
@@ -167,6 +168,60 @@ def _promote_nonfloating_params_to_meta(model: torch.nn.Module, target_dtype: to
     return replaced
 
 
+def _pre_init_fsdp(diffusion_model: torch.nn.Module) -> None:
+    """Pre-initialize FSDP param groups so the root is always initialized first.
+
+    Without this, a ControlNet calling ``base_model.time_text_embed()`` directly
+    would trigger ``_lazy_init()`` on a *nested* FSDP unit instead of the root,
+    leaving some param groups with stale meta-device references.
+    """
+    from torch.distributed.fsdp._fully_shard._fsdp_state import (
+        _get_module_fsdp_state,
+        FSDPState,
+    )
+
+    root_state = _get_module_fsdp_state(diffusion_model)
+    if root_state is None or not isinstance(root_state, FSDPState):
+        return
+    if root_state._is_root is not None:
+        return  # already initialized
+
+    root_state._lazy_init()
+
+
+def _collect_controlnet_shared_modules(diffusion_model: torch.nn.Module) -> set[torch.nn.Module]:
+    """Collect base model sub-modules that ControlNet calls directly.
+
+    These modules must NOT be FSDP-wrapped because ControlNet invokes them
+    outside the base model's normal forward path.  If they were FSDP-wrapped,
+    each call would trigger an all_gather that only some ranks participate in,
+    causing an NCCL collective timeout.
+    """
+    # Modules called by ControlNet.forward() via base_model.* (getattr skips
+    # names that don't exist on a given architecture, so the union is safe).
+    #   QwenImage FunControlNet: process_img, pe_embedder, img_in, txt_norm,
+    #                             txt_in, time_text_embed
+    #   Flux ControlNet:          img_in, time_in, vector_in, guidance_in,
+    #                             txt_in, pe_embedder
+    _CONTROLNET_SHARED_NAMES = (
+        "process_img",
+        "pe_embedder",
+        "img_in",
+        "txt_norm",
+        "txt_in",
+        "time_text_embed",
+        "time_in",
+        "vector_in",
+        "guidance_in",
+    )
+    excluded: set[torch.nn.Module] = set()
+    for name in _CONTROLNET_SHARED_NAMES:
+        mod = getattr(diffusion_model, name, None)
+        if mod is not None and isinstance(mod, torch.nn.Module) and any(True for _ in mod.parameters()):
+            excluded.add(mod)
+    return excluded
+
+
 def patch_fsdp(self):
     print(f"[Rank {self.rank}] Applying FSDP to {type(self.model.diffusion_model).__name__}")
 
@@ -189,12 +244,23 @@ def patch_fsdp(self):
         if replaced > 0:
             print(f"[Rank {self.rank}] Promoted {replaced} non-floating quant params to meta placeholders before FSDP wrapping")
 
-    fully_shard_bottom_up(diffusion_model, fsdp_kwargs=fsdp_kwargs, native_ignore_scale=not use_quant_loader)
+    excluded_modules = _collect_controlnet_shared_modules(diffusion_model)
+    if excluded_modules:
+        print(f"[Rank {self.rank}] Excluding {len(excluded_modules)} ControlNet-shared modules from FSDP: "
+              f"{[n for n, m in diffusion_model.named_modules() if m in excluded_modules]}")
+
+    fully_shard_bottom_up(
+        diffusion_model,
+        fsdp_kwargs=fsdp_kwargs,
+        native_ignore_scale=not use_quant_loader,
+        ignored_modules=excluded_modules,
+    )
+
+    target_device = (
+        self.load_device if isinstance(self.load_device, torch.device) else torch.device("cuda", torch.cuda.current_device())
+    )
 
     if use_quant_loader:
-        target_device = (
-            self.load_device if isinstance(self.load_device, torch.device) else torch.device("cuda", torch.cuda.current_device())
-        )
         load_from_full_model_state_dict(
             model=self.model,
             full_sd=self.fsdp_state_dict,
@@ -211,7 +277,23 @@ def patch_fsdp(self):
             broadcast_from_rank0=True,
         )
         set_model_state_dict(self.model, self.fsdp_state_dict, options=options)
-        self.fsdp_state_dict = None
+
+    # Materialize excluded params AFTER state dict loading so that
+    # set_model_state_dict only sees meta-device params (single device).
+    if excluded_modules:
+        count = materialize_excluded_params(
+            model=self.model,
+            excluded_modules=excluded_modules,
+            full_sd=self.fsdp_state_dict,
+            device=target_device,
+            cpu_offload=self.is_cpu_offload,
+        )
+        if count > 0:
+            print(f"[Rank {self.rank}] Materialized {count} excluded ControlNet-shared params on {target_device}")
+
+    self.fsdp_state_dict = None
+
+    _pre_init_fsdp(diffusion_model)
 
     print("FSDP registered successfully.")
     return self.model
@@ -246,6 +328,17 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
     def is_dynamic(self):
         return True
+
+    def model_size(self):
+        if self.size > 0:
+            return self.size
+        total = comfy.model_management.module_size(self.model)
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        if world_size > 1:
+            self.size = total // world_size
+        else:
+            self.size = total
+        return self.size
 
     def config_fsdp(self, rank, device_mesh):
         self.rank = rank
@@ -445,6 +538,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
             self.model.model_loaded_weight_memory = mem_counter
             self.model.model_offload_buffer_memory = 0
             self.model.current_weight_patches_uuid = self.patches_uuid
+            self.model.current_patcher = self
 
             for callback in self.get_all_callbacks(CallbacksMP.ON_LOAD):
                 callback(self, device_to, lowvram_model_memory, force_patch_weights, full_load)
@@ -522,43 +616,6 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
             # Break reference cycle so the inner model can be collected
             if hasattr(model, "current_patcher"):
                 model.current_patcher = None
-            try:
-                has_qt_hint = self._has_quantized_dtensor_shards
-                for m in model.modules():
-                    for p in m.parameters(recurse=False):
-                        try:
-                            tensor = p.data if isinstance(p, torch.Tensor) else None
-                            if tensor is None:
-                                continue
-
-                            if isinstance(tensor, DTensor):
-                                if has_qt_hint is True:
-                                    continue
-
-                                try:
-                                    local = getattr(tensor, "_local_tensor", None)
-                                    if local is None:
-                                        local = tensor.to_local()
-                                except Exception:
-                                    continue
-
-                                if has_qt_hint is None:
-                                    has_qt_hint = _is_quantized_tensor_like(local)
-                                    self._has_quantized_dtensor_shards = has_qt_hint
-
-                                if has_qt_hint is True:
-                                    continue
-                                _safe_free_storage(local.data)
-                                continue
-
-                            if _is_quantized_tensor_like(tensor):
-                                continue
-
-                            _safe_free_storage(tensor.data)
-                        except Exception:
-                            continue
-            except Exception:
-                pass
 
         self.model = None
         try:

@@ -1,6 +1,7 @@
 import os
 import sys
 import gc
+import types
 import functools
 from datetime import timedelta
 
@@ -36,6 +37,223 @@ from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 from ray.exceptions import RayActorError
 
 
+class _RayControlNetRef:
+    """Lightweight placeholder for a ControlNet in conditioning.
+
+    Created by RayControlNetApply in the main process.  Carries only the
+    hint image and apply settings — no model weights.  Workers replace
+    this with a real ControlNet loaded from their local cache.
+    """
+
+    def __init__(self, strength, timestep_percent_range, cond_hint_original,
+                 extra_concat_orig=None, previous_controlnet=None, needs_vae=False):
+        self.strength = strength
+        self.timestep_percent_range = timestep_percent_range
+        self.cond_hint_original = cond_hint_original
+        self.extra_concat_orig = list(extra_concat_orig or [])
+        self.previous_controlnet = previous_controlnet
+        self.needs_vae = needs_vae
+
+        # ControlBase interface stubs needed by ComfyUI internals
+        self.cond_hint = None
+        self.global_average_pooling = False
+        self.compression_ratio = 1
+        self.upscale_algorithm = "nearest-exact"
+        self.extra_args = {}
+        self.extra_conds = []
+        self.strength_type = None
+        self.concat_mask = False
+        self.extra_hooks = None
+        self.preprocess_image = lambda a: a
+        self.model_sampling_current = None
+        self.latent_format = None
+        self.vae = None
+
+    def set_cond_hint(self, *args, **kwargs):
+        pass
+
+    def set_previous_controlnet(self, prev):
+        self.previous_controlnet = prev
+
+    def copy(self):
+        c = _RayControlNetRef(
+            self.strength,
+            self.timestep_percent_range,
+            self.cond_hint_original,
+            self.extra_concat_orig,
+            self.previous_controlnet,
+            self.needs_vae,
+        )
+        return c
+
+    def pre_run(self, model, percent_to_timestep_function):
+        pass
+
+    def get_models(self):
+        return []
+
+    def get_extra_hooks(self):
+        hooks = []
+        if self.previous_controlnet is not None:
+            hooks += self.previous_controlnet.get_extra_hooks()
+        return hooks
+
+    def cleanup(self):
+        pass
+
+    def inference_memory_requirements(self, dtype):
+        return 0
+
+
+def _restore_controlnet_refs(cond_list, cached_controlnet, worker_vae=None):
+    """Replace _RayControlNetRef placeholders with real ControlNet objects."""
+    if cond_list is None or cached_controlnet is None:
+        return
+
+    _, cnet_template = cached_controlnet
+
+    for item in cond_list:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            d = item[1]
+        elif isinstance(item, dict):
+            d = item
+        else:
+            continue
+        if not isinstance(d, dict):
+            continue
+
+        control = d.get("control")
+        if not isinstance(control, _RayControlNetRef):
+            continue
+
+        cnet = cnet_template.copy()
+        cnet.cond_hint_original = control.cond_hint_original
+        cnet.strength = control.strength
+        cnet.timestep_percent_range = control.timestep_percent_range
+        if control.extra_concat_orig:
+            cnet.extra_concat_orig = list(control.extra_concat_orig)
+        if control.needs_vae and worker_vae is not None:
+            cnet.vae = worker_vae
+        if control.previous_controlnet is not None:
+            prev = control.previous_controlnet
+            if isinstance(prev, _RayControlNetRef):
+                prev_cnet = cnet_template.copy()
+                prev_cnet.cond_hint_original = prev.cond_hint_original
+                prev_cnet.strength = prev.strength
+                prev_cnet.timestep_percent_range = prev.timestep_percent_range
+                if prev.extra_concat_orig:
+                    prev_cnet.extra_concat_orig = list(prev.extra_concat_orig)
+                if prev.needs_vae and worker_vae is not None:
+                    prev_cnet.vae = worker_vae
+                cnet.set_previous_controlnet(prev_cnet)
+            else:
+                cnet.set_previous_controlnet(prev)
+
+        d["control"] = cnet
+
+
+def _remap_conditioning_devices(positive, negative):
+    """Remap CUDA device references in conditioning to cuda:0.
+
+    Conditioning is created in the main ComfyUI process where CUDA device
+    indices map to physical GPUs.  Inside a ray worker, CUDA_VISIBLE_DEVICES
+    is set to a single physical GPU, so only cuda:0 is valid.  Any model
+    device (VAE, ControlNet, etc.) that references cuda:N (N>0) will fail.
+    """
+    target = torch.device("cuda:0")
+    for cond_list in (positive, negative):
+        if cond_list is None:
+            continue
+        for item in cond_list:
+            # Conditioning items are [tensor, dict] — the dict is at index 1.
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                cond = item[1]
+            elif isinstance(item, dict):
+                cond = item
+            else:
+                continue
+            if not isinstance(cond, dict):
+                continue
+            control = cond.get("control")
+            if control is not None:
+                _remap_control_devices(control, target)
+
+
+def _remap_control_devices(control, target):
+    vae = getattr(control, "vae", None)
+    if vae is not None:
+        _remap_cuda_device(vae, "device", target)
+        _remap_cuda_device(vae, "output_device", target)
+        patcher = getattr(vae, "patcher", None)
+        if patcher is not None:
+            _remap_patcher_device(patcher, target)
+    model_wrapped = getattr(control, "control_model_wrapped", None)
+    if model_wrapped is not None:
+        _remap_patcher_device(model_wrapped, target)
+    _remap_cuda_device(control, "load_device", target)
+    prev = getattr(control, "previous_controlnet", None)
+    if prev is not None:
+        _remap_control_devices(prev, target)
+
+
+def _move_control_to_device(control, device):
+    """Move ControlNet model weights to the worker's GPU.
+
+    Ray deserializes the ControlNet model on CPU.  Without this, only rank 0
+    loads the model via load_models_gpu(), leaving other ranks unable to run
+    the ControlNet forward.  This ensures every rank has the model on its GPU.
+    """
+    model_wrapped = getattr(control, "control_model_wrapped", None)
+    if model_wrapped is not None:
+        model = getattr(model_wrapped, "model", None)
+        if model is not None:
+            try:
+                model.to(device)
+            except Exception:
+                pass
+    # Also move the hint tensor if it's already materialized
+    cond_hint = getattr(control, "cond_hint", None)
+    if isinstance(cond_hint, torch.Tensor) and cond_hint.device.type == "cpu":
+        try:
+            control.cond_hint = cond_hint.to(device)
+        except Exception:
+            pass
+    prev = getattr(control, "previous_controlnet", None)
+    if prev is not None:
+        _move_control_to_device(prev, device)
+
+
+def _prepare_control_models(positive, negative):
+    """Remap devices AND move ControlNet model weights to the worker's GPU."""
+    target = torch.device("cuda:0")
+    for cond_list in (positive, negative):
+        if cond_list is None:
+            continue
+        for item in cond_list:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                cond = item[1]
+            elif isinstance(item, dict):
+                cond = item
+            else:
+                continue
+            if not isinstance(cond, dict):
+                continue
+            control = cond.get("control")
+            if control is not None:
+                _move_control_to_device(control, target)
+
+
+def _remap_patcher_device(patcher, target):
+    _remap_cuda_device(patcher, "load_device", target)
+    _remap_cuda_device(patcher, "offload_device", target)
+
+
+def _remap_cuda_device(obj, attr, target):
+    val = getattr(obj, attr, None)
+    if isinstance(val, torch.device) and val.type == "cuda":
+        setattr(obj, attr, target)
+
+
 # Developer reminder, Checking model parameter outside ray actor is very expensive (e.g Comfy main thread)
 # the model need to be serialized, send to object store and can cause OOM !, so setter and getter is the pattern !
 
@@ -64,6 +282,7 @@ class RayWorker:
         self.vae_model = None
         self.model_type = None
         self.state_dict = None
+        self.cached_controlnet = None  # (path, controlnet_object) cache
         self.lora_list = None
         self.parallel_dict = parallel_dict
         self.overwrite_cast_dtype = None
@@ -138,6 +357,23 @@ class RayWorker:
             self.model.config_fsdp(self.local_rank, self.device_mesh)
         else:
             raise ValueError("Model being set is not meta, can cause OOM in large model")
+
+    def _free_cached_aux_models(self):
+        """Free cached ControlNet and VAE GPU memory."""
+        if self.cached_controlnet is not None:
+            _, old_cnet = self.cached_controlnet
+            old_model = getattr(old_cnet, "control_model", None)
+            if old_model is not None:
+                del old_model
+            self.cached_controlnet = None
+
+        if self.vae_model is not None:
+            del self.vae_model
+            self.vae_model = None
+            self._cached_vae_path = None
+
+        torch.cuda.empty_cache()
+        gc.collect()
 
     def _normalize_model_options(self, model_options):
         if not model_options:
@@ -345,6 +581,7 @@ class RayWorker:
                     self.model.free_fsdp_vram()
                 except Exception as e:
                     print(f"[Rank {self.local_rank}] free_fsdp_vram failed: {e}")
+                self._free_cached_aux_models()
 
 
             # Monkey patch
@@ -430,6 +667,7 @@ class RayWorker:
 
             self._reset_active_model()
             self._invalidate_non_fsdp_cache()
+            self._free_cached_aux_models()
             if self.parallel_dict.get("pipefusion_enabled"):
                 from raylight.comfy_dist.sd import pipefusion_load_diffusion_model
 
@@ -471,6 +709,7 @@ class RayWorker:
     def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype, use_mmap=None):
         self._reset_active_model()
         self._invalidate_non_fsdp_cache()
+        self._free_cached_aux_models()
         if use_mmap is None:
             use_mmap = self.parallel_dict.get("use_mmap", True)
         if self.parallel_dict["is_fsdp"] is True:
@@ -539,12 +778,23 @@ class RayWorker:
             del lora_model
 
     def kill(self):
+        self._free_cached_aux_models()
         self._invalidate_non_fsdp_cache()
         self.model = None
         dist.destroy_process_group()
         ray.actor.exit_actor()
 
     def ray_vae_loader(self, vae_path):
+        if self.vae_model is not None and getattr(self, "_cached_vae_path", None) == vae_path:
+            return
+
+        # Free old VAE before loading new one
+        if self.vae_model is not None:
+            del self.vae_model
+            self.vae_model = None
+            self._cached_vae_path = None
+            torch.cuda.empty_cache()
+
         import comfy.sd as comfy_sd
         import comfy.utils as comfy_utils
 
@@ -568,6 +818,7 @@ class RayWorker:
         if self.local_rank == 0:
             print(f"VAE loaded in {self.global_world_size} GPUs")
         self.vae_model = vae_model
+        self._cached_vae_path = vae_path
 
     @patch_ray_tqdm
     def ray_vae_decode(self, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8):
@@ -615,6 +866,10 @@ class RayWorker:
         import comfy.sample as comfy_sample
         import comfy.utils as comfy_utils
 
+        # Restore ControlNet refs from local cache (loaded by load_controlnet)
+        _restore_controlnet_refs(positive, self.cached_controlnet, self.vae_model)
+        _restore_controlnet_refs(negative, self.cached_controlnet, self.vae_model)
+
         latent = latent_image
         latent_image = latent["samples"]
         latent = latent.copy()
@@ -629,6 +884,9 @@ class RayWorker:
         noise_mask = None
         if "noise_mask" in latent:
             noise_mask = latent["noise_mask"]
+
+        _remap_conditioning_devices(positive, negative)
+        _prepare_control_models(positive, negative)
 
         if self.parallel_dict["is_fsdp"] is True:
             self.model.patch_fsdp()
@@ -667,6 +925,62 @@ class RayWorker:
         gc.collect()
         return out
 
+    def load_controlnet(self, controlnet_path):
+        """Load a ControlNet model from disk into the worker.
+
+        Caches the result so subsequent calls with the same path are free.
+        Frees old ControlNet VRAM when the path changes.
+        Returns True on success.
+        """
+        if self.cached_controlnet is not None and self.cached_controlnet[0] == controlnet_path:
+            return True
+
+        # Free old ControlNet VRAM if model changed
+        if self.cached_controlnet is not None:
+            _, old_cnet = self.cached_controlnet
+            old_model = getattr(old_cnet, "control_model", None)
+            if old_model is not None:
+                del old_model
+            self.cached_controlnet = None
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        import comfy.controlnet as comfy_cnet
+
+        cnet = comfy_cnet.load_controlnet(controlnet_path)
+        if cnet is None:
+            print(f"[Rank {self.local_rank}] Failed to load ControlNet: {controlnet_path}")
+            return False
+
+        self.cached_controlnet = (controlnet_path, cnet)
+        if self.local_rank == 0:
+            print(f"[Rank {self.local_rank}] ControlNet loaded and cached from {controlnet_path}")
+        return True
+
+    def free_cached_controlnet(self):
+        """Explicitly free the cached ControlNet (e.g. when switching workflows)."""
+        if self.cached_controlnet is not None:
+            _, old_cnet = self.cached_controlnet
+            old_model = getattr(old_cnet, "control_model", None)
+            if old_model is not None:
+                del old_model
+            self.cached_controlnet = None
+            torch.cuda.empty_cache()
+            gc.collect()
+            if self.local_rank == 0:
+                print(f"[Rank {self.local_rank}] ControlNet cache freed")
+
+    def free_cached_vae(self):
+        """Explicitly free the cached VAE (e.g. when switching workflows)."""
+        if self.vae_model is not None:
+            del self.vae_model
+            self.vae_model = None
+            self._cached_vae_path = None
+            torch.cuda.empty_cache()
+            gc.collect()
+            if self.local_rank == 0:
+                print(f"[Rank {self.local_rank}] VAE cache freed")
+
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
     @patch_enable_comfy_kitchen_fsdp
@@ -690,6 +1004,10 @@ class RayWorker:
         import comfy.sample as comfy_sample
         import comfy.utils as comfy_utils
 
+        # Restore ControlNet refs from local cache (loaded by load_controlnet)
+        _restore_controlnet_refs(positive, self.cached_controlnet, self.vae_model)
+        _restore_controlnet_refs(negative, self.cached_controlnet, self.vae_model)
+
         latent_image = latent["samples"]
         latent_image = comfy_sample.fix_empty_latent_channels(self.model, latent_image)
 
@@ -710,6 +1028,9 @@ class RayWorker:
         noise_mask = None
         if "noise_mask" in latent:
             noise_mask = latent["noise_mask"]
+
+        _remap_conditioning_devices(positive, negative)
+        _prepare_control_models(positive, negative)
 
         disable_pbar = comfy_utils.PROGRESS_BAR_ENABLED
         if self.local_rank == 0:
