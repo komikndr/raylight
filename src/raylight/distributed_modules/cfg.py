@@ -123,6 +123,15 @@ if hasattr(model_base, "CosmosPredict2"):
         return cfg_parallel_forward_wrapper
 
 
+if hasattr(model_base, "Anima"):
+
+    @CFGParallelInjectRegistry.register(model_base.Anima)
+    def _inject_anima():
+        from ..diffusion_models.anima.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
 if hasattr(model_base, "HiDream"):
 
     @CFGParallelInjectRegistry.register(model_base.HiDream)
@@ -164,6 +173,15 @@ if hasattr(model_base, "Kandinsky5"):
     @CFGParallelInjectRegistry.register(model_base.Kandinsky5)
     def _inject_kandinsky5():
         from ..diffusion_models.kandinsky5.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "ErnieImage"):
+
+    @CFGParallelInjectRegistry.register(model_base.ErnieImage)
+    def _inject_ernie_image():
+        from ..diffusion_models.ernie.xdit_cfg_parallel import cfg_parallel_forward_wrapper
 
         return cfg_parallel_forward_wrapper
 
