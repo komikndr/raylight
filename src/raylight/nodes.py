@@ -198,6 +198,30 @@ def _collect_grouped_results(results: list, expected_length: int, label: str):
     return [grouped_results[dp_rank] for dp_rank in range(expected_length)]
 
 
+def _validate_unified_parallel_setup(parallel_dict: dict[str, Any], group_infos: list[dict[str, Any]], label: str):
+    ulysses_degree = _effective_parallel_degree(parallel_dict.get("ulysses_degree"))
+    ring_degree = _effective_parallel_degree(parallel_dict.get("ring_degree"))
+    cfg_degree = _effective_parallel_degree(parallel_dict.get("cfg_degree"))
+    pp_degree = _effective_parallel_degree(parallel_dict.get("pp_degree"))
+    dp_degree = max(int(info.get("dp_degree", 1)) for info in group_infos) if group_infos else 1
+    effective_parallel_size = ulysses_degree * ring_degree * cfg_degree * pp_degree * dp_degree
+
+    if effective_parallel_size <= 1:
+        raise ValueError(
+            f"{label} requires an active unified parallel topology with effective degree > 1. "
+            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, pp={pp_degree}, dp={dp_degree}. "
+            "Use DPKSampler for pure DP or single-worker execution."
+        )
+
+    if not parallel_dict.get("is_xdit") and not parallel_dict.get("pipefusion_enabled"):
+        raise ValueError(
+            f"{label} requires xFuser unified topology to be active. "
+            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, pp={pp_degree}, dp={dp_degree}, "
+            f"is_xdit={parallel_dict.get('is_xdit')}, pipefusion_enabled={parallel_dict.get('pipefusion_enabled')}. "
+            "DP-only execution should use DPKSampler."
+        )
+
+
 def _reset_pipefusion_runtime_config(parallel_dict: dict[str, Any]):
     parallel_dict["pipefusion_enabled"] = False
     parallel_dict["num_pipeline_patch"] = 1
@@ -928,12 +952,6 @@ class UnifiedParallelSampler:
         return {
             "required": {
                 "add_noise": (["enable", "disable"],),
-                "noise_list": (
-                    "NOISE",
-                    {
-                        "tooltip": "List of noise seeds for each xFuser data-parallel group. Use one item to share the same seed across all groups."
-                    },
-                ),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
                 "cfg": (
                     "FLOAT",
@@ -950,6 +968,12 @@ class UnifiedParallelSampler:
                 "ray_actors": (
                     "RAY_ACTORS",
                     {"tooltip": "Ray Actor to submit the model into"},
+                ),
+                "noise_list": (
+                    "NOISE",
+                    {
+                        "tooltip": "List of noise seeds for each xFuser data-parallel group. Use one item to share the same seed across all groups."
+                    },
                 ),
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
@@ -1006,7 +1030,9 @@ class UnifiedParallelSampler:
             disable_noise = True
 
         gpu_actors = ray_actors["workers"]
+        parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
         group_infos = ray.get([actor.get_exec_group_info.remote() for actor in gpu_actors])
+        _validate_unified_parallel_setup(parallel_dict, group_infos, "Unified Parallel Sampler")
         dp_degree = int(group_infos[0]["dp_degree"])
         noise_list = _normalize_grouped_inputs(noise_list, dp_degree, "noise_list")
         positive = _normalize_grouped_inputs(positive, dp_degree, "positive")
