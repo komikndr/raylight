@@ -9,7 +9,8 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 <details><summary><strong>Click to expand changelog</strong></summary>
 
-- ERNIE and Anima support for FSDP, USP and CFG
+- Experimental : Unified Parallel sampler, now all parallel type can be use at the same time, USP x DP x CFG x FSDP
+- ERNIE and Anima support
 - GPU Selector: add `GPU_SELECT` input to `RayInitializerAdvanced` to restrict Ray workers to specific GPUs (for example `0,1,2`, or leave empty for all GPUs), credit to [avtc](https://github.com/avtc)
 - Multi-Prompt DP: add `DPConditioningList` node for per-GPU conditioning in Data Parallel mode, credit to avtc
 - `mmap` option for reduce RAM, with GGUF variant implementation by avtc
@@ -154,6 +155,14 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 
 ---
 
+**Unified Parallel**
+This is experimental mode where all type of parallel group can work at a sime time, USP, FSDP, DP, CFG.
+
+<img width="833" height="427" alt="ValidUSP" src="https://github.com/user-attachments/assets/9c5571ca-ae4c-4deb-97da-c3552ff43cea" />
+
+---
+
+
 ### Side Notes
 - **Rule of thumb**, if you have enough VRAM, just use USP, if not, enable the FSDP, and if that is still not enough,
   enable also the FSDP CPU Offload.
@@ -256,7 +265,7 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 **Anima**
 | Model              | USP | FSDP | CFG |
 |--------------------|-----|------|-----|
-| Anima Preview3     | ✅  | ✅   | ✅  |
+| Anima Preview3     | ✅  | ✅   | ❌  |
 
 
 **UNet**

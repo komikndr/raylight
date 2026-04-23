@@ -142,6 +142,7 @@ class SafetensorOps(comfy.ops.manual_cast):
             self.scale_grad_by_freq = scale_grad_by_freq
             self.sparse = sparse
             self.weight = None
+            self.bias = None
 
         def forward(self, input, out_dtype=None):
             output_dtype = out_dtype
