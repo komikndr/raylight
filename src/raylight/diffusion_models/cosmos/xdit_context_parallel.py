@@ -242,23 +242,19 @@ def usp_mini_train_dit_forward(
     sp_rank = get_sequence_parallel_rank()
 
     B, T, H, W, D = x_B_T_H_W_D.shape
-    # Flatten spatial-temporal dimensions for sequence-parallel chunking
-    x_B_T_H_W_D = rearrange(x_B_T_H_W_D, "B T H W D -> B (T H W) D")
-    x_B_S_D, t_orig_size = pad_to_world_size(x_B_T_H_W_D, dim=1)
+    x_B_T_H_W_D, h_orig_size = pad_to_world_size(x_B_T_H_W_D, dim=2)
 
-    rope_emb_L_1_1_D, _ = pad_to_world_size(rope_emb_L_1_1_D, dim=0)
+    rope_emb_L_1_1_D = rearrange(rope_emb_L_1_1_D, "(t h w) s c d -> t h w s c d", t=T, h=H, w=W)
+    rope_emb_L_1_1_D, _ = pad_to_world_size(rope_emb_L_1_1_D, dim=1)
     if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
-        extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = rearrange(
-            extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D, "B T H W D -> B (T H W) D"
-        )
-        extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D, _ = pad_to_world_size(
-            extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D, dim=1
-        )
+        extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D, _ = pad_to_world_size(extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D, dim=2)
 
-    x_B_S_D = torch.chunk(x_B_S_D, sp_world, dim=1)[sp_rank]
-    rope_emb_L_1_1_D = torch.chunk(rope_emb_L_1_1_D, sp_world, dim=0)[sp_rank]
+    x_B_T_H_W_D = torch.chunk(x_B_T_H_W_D, sp_world, dim=2)[sp_rank]
+    rope_emb_L_1_1_D = torch.chunk(rope_emb_L_1_1_D, sp_world, dim=1)[sp_rank]
     if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
-        extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = torch.chunk(extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D, sp_world, dim=1)[sp_rank]
+        extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = torch.chunk(extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D, sp_world, dim=2)[sp_rank]
+
+    rope_emb_L_1_1_D = rearrange(rope_emb_L_1_1_D, "t h w s c d -> (t h w) s c d")
     # ================ SEQUENCE PARALLEL ================== #
 
     block_kwargs = {
@@ -268,17 +264,15 @@ def usp_mini_train_dit_forward(
         "transformer_options": kwargs.get("transformer_options", {}),
     }
     for block in self.blocks:
-        x_B_S_D = block(
-            x_B_S_D,
+        x_B_T_H_W_D = block(
+            x_B_T_H_W_D,
             t_embedding_B_T_D,
             crossattn_emb,
             **block_kwargs,
         )
 
-    x_B_S_D = get_sp_group().all_gather(x_B_S_D, dim=1)
-    x_B_S_D = x_B_S_D[:, :t_orig_size, :]
-
-    x_B_T_H_W_D = rearrange(x_B_S_D, "B (T H W) D -> B T H W D", T=T, H=H, W=W)
+    x_B_T_H_W_D = get_sp_group().all_gather(x_B_T_H_W_D, dim=2)
+    x_B_T_H_W_D = x_B_T_H_W_D[:, :, :h_orig_size, :, :]
 
     x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D.to(crossattn_emb.dtype), t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
     x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)[:, :, :orig_shape[-3], :orig_shape[-2], :orig_shape[-1]]
