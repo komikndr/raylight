@@ -1,6 +1,7 @@
 import torch
 import comfy.model_management
 import comfy.ops
+from torch.nn.modules.utils import _pair
 
 from raylight.comfy_dist.lora import calculate_weight as ray_calculate_weight
 
@@ -91,6 +92,14 @@ class SafetensorOps(comfy.ops.manual_cast):
     class Conv2d(SafetensorLayer, comfy.ops.manual_cast.Conv2d):
         def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode="zeros", device=None, dtype=None):
             torch.nn.Module.__init__(self)
+            self.in_channels = in_channels
+            self.out_channels = out_channels
+            self.kernel_size = _pair(kernel_size)
+            self.stride = _pair(stride)
+            self.padding = _pair(padding)
+            self.dilation = _pair(dilation)
+            self.groups = groups
+            self.padding_mode = padding_mode
             self.weight = None
             self.bias = None
 
