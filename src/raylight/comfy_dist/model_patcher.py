@@ -152,6 +152,10 @@ def _get_parent_module_and_name(model: torch.nn.Module, param_name: str) -> tupl
     return model.get_submodule(parent_name), leaf_name
 
 
+def _unwrap_base_model(model):
+    return getattr(model, "model", model)
+
+
 def _promote_nonfloating_params_to_meta(model: torch.nn.Module, target_dtype: torch.dtype) -> int:
     replaced = 0
     for name, param in list(model.named_parameters()):
@@ -184,7 +188,8 @@ def patch_fsdp(self):
     use_quant_loader = has_qt_runtime or has_quant_sd
 
     if use_quant_loader:
-        placeholder_dtype = getattr(self.model.model, "manual_cast_dtype", None) or torch.bfloat16
+        base_model = _unwrap_base_model(self.model)
+        placeholder_dtype = getattr(base_model, "manual_cast_dtype", None) or torch.bfloat16
         replaced = _promote_nonfloating_params_to_meta(diffusion_model, placeholder_dtype)
         if replaced > 0:
             print(f"[Rank {self.rank}] Promoted {replaced} non-floating quant params to meta placeholders before FSDP wrapping")

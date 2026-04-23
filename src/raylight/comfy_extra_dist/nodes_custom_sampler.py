@@ -13,6 +13,33 @@ from .ray_patch_decorator import ray_patch_with_return
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise
 
 
+def _normalize_grouped_inputs(values: list, expected_length: int, label: str):
+    if len(values) == expected_length:
+        return values
+    if len(values) == 1:
+        return values * expected_length
+    if len(values) > expected_length:
+        return values[:expected_length]
+    raise ValueError(f"{label} must provide 1 item or at least {expected_length} items, got {len(values)}")
+
+
+def _collect_grouped_results(results: list, expected_length: int, label: str):
+    grouped_results = {}
+    for result in results:
+        if result is None:
+            continue
+        dp_rank = int(result["dp_rank"])
+        if dp_rank in grouped_results:
+            raise RuntimeError(f"{label} produced multiple outputs for dp_rank {dp_rank}")
+        grouped_results[dp_rank] = result["result"]
+
+    missing = [dp_rank for dp_rank in range(expected_length) if dp_rank not in grouped_results]
+    if missing:
+        raise RuntimeError(f"{label} missing outputs for dp_rank {missing}")
+
+    return [grouped_results[dp_rank] for dp_rank in range(expected_length)]
+
+
 class RayBasicScheduler:
     @classmethod
     def INPUT_TYPES(s):
@@ -279,6 +306,89 @@ class XFuserSamplerCustom:
         return (out, ray_actors)
 
 
+class UnifiedParallelSamplerCustom:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "add_noise": ("BOOLEAN", {"default": True}),
+                "noise_list": ("NOISE",),
+                "cfg": (
+                    "FLOAT",
+                    {
+                        "default": 8.0,
+                        "min": 0.0,
+                        "max": 100.0,
+                        "step": 0.1,
+                        "round": 0.01,
+                    },
+                ),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "sampler": ("SAMPLER",),
+                "sigmas": ("SIGMAS",),
+                "latent_image": ("LATENT",),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT", "RAY_ACTORS")
+    RETURN_NAMES = ("latent", "ray_actors")
+    OUTPUT_IS_LIST = (True, False)
+    INPUT_IS_LIST = True
+
+    FUNCTION = "ray_sample"
+
+    CATEGORY = "Raylight/extra/custom_sampling/samplers"
+
+    def ray_sample(
+        self,
+        ray_actors,
+        add_noise,
+        noise_list,
+        cfg,
+        positive,
+        negative,
+        sampler,
+        sigmas,
+        latent_image,
+    ):
+        ray_actors = ray_actors[0]
+        add_noise = add_noise[0]
+        cfg = cfg[0]
+        sampler = sampler[0]
+        sigmas = sigmas[0]
+
+        gc.collect()
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        gpu_actors = ray_actors["workers"]
+        group_infos = ray.get([actor.get_exec_group_info.remote() for actor in gpu_actors])
+        dp_degree = int(group_infos[0]["dp_degree"])
+        noise_list = _normalize_grouped_inputs(noise_list, dp_degree, "noise_list")
+        positive = _normalize_grouped_inputs(positive, dp_degree, "positive")
+        negative = _normalize_grouped_inputs(negative, dp_degree, "negative")
+        latent_image = _normalize_grouped_inputs(latent_image, dp_degree, "latent_image")
+
+        futures = [
+            actor.custom_sampler.remote(
+                add_noise,
+                noise_list[group_info["dp_rank"]],
+                cfg,
+                positive[group_info["dp_rank"]],
+                negative[group_info["dp_rank"]],
+                sampler,
+                sigmas,
+                latent_image[group_info["dp_rank"]],
+                grouped_output=True,
+            )
+            for actor, group_info in zip(gpu_actors, group_infos)
+        ]
+        results = ray.get(futures)
+        out = _collect_grouped_results(results, dp_degree, "Unified Parallel SamplerCustom")
+        return (out, ray_actors)
+
+
 class DPSamplerCustom:
     @classmethod
     def INPUT_TYPES(s):
@@ -421,6 +531,7 @@ class RayAddNoise:
 
 NODE_CLASS_MAPPINGS = {
     "XFuserSamplerCustom": XFuserSamplerCustom,
+    "UnifiedParallelSamplerCustom": UnifiedParallelSamplerCustom,
     "DPSamplerCustom": DPSamplerCustom,
     "RayBasicScheduler": RayBasicScheduler,
     "RayBetaSamplingScheduler": RayBetaSamplingScheduler,
@@ -431,5 +542,6 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "XFuserSamplerCustom": "XFuser SamplerCustom",
+    "UnifiedParallelSamplerCustom": "Unified Parallel SamplerCustom (Advance)",
     "DPSamplerCustom": "Data Parallel SamplerCustom",
 }

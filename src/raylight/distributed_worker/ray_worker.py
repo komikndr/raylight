@@ -43,6 +43,8 @@ from ray.exceptions import RayActorError
 # If ray actor function being called from outside, ray.get([task in actor task]) will become sync between rank
 # If called from ray actor within. dist.barrier() become the sync.
 
+# PIPEFUSION STUFF IS ONLY TESTING, IT IS BREAKING DOWN ALLLL THE TIME
+
 
 # Comfy cli args, does not get pass through into ray actor
 def patch_enable_comfy_kitchen_fsdp(fn):
@@ -98,9 +100,10 @@ class RayWorker:
             # device_id=self.device
         )
 
-        # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
             self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
+
+        # Just experimenting, user can't trigger this
         elif not self.parallel_dict.get("pipefusion_enabled"):
             print(f"Running Ray in normal seperate sampler with: {self.global_world_size} number of workers")
 
@@ -124,14 +127,16 @@ class RayWorker:
             )
 
     def get_meta_model(self):
-        first_param_device = next(self.model.model.parameters()).device
+        base_model = getattr(self.model, "model", self.model)
+        first_param_device = next(base_model.parameters()).device
         if first_param_device == torch.device("meta"):
             return self.model
         else:
             raise ValueError("Model recieved is not meta, can cause OOM in large model")
 
     def set_meta_model(self, model):
-        first_param_device = next(model.model.parameters()).device
+        base_model = getattr(model, "model", model)
+        first_param_device = next(base_model.parameters()).device
         if first_param_device == torch.device("meta"):
             self.state_dict = None
             self.model = model
@@ -213,7 +218,8 @@ class RayWorker:
         if self.lora_list is not None:
             self.load_lora()
 
-        self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+        base_model = getattr(self.model, "model", self.model)
+        self.overwrite_cast_dtype = getattr(base_model, "manual_cast_dtype", None)
         self.active_request_key = active_key
         self.is_model_loaded = True
 
@@ -231,6 +237,35 @@ class RayWorker:
 
     def get_parallel_dict(self):
         return self.parallel_dict
+
+    def get_exec_group_info(self):
+        if self.xfuser_parallel is None:
+            return {
+                "global_rank": self.local_rank,
+                "dp_rank": 0,
+                "dp_degree": 1,
+                "is_group_leader": self.local_rank == 0,
+            }
+
+        is_group_leader = (
+            self.xfuser_parallel.sequence_rank == 0 and self.xfuser_parallel.pipeline_rank == 0 and self.xfuser_parallel.cfg_rank == 0
+        )
+        return {
+            "global_rank": self.xfuser_parallel.global_rank,
+            "dp_rank": self.xfuser_parallel.data_parallel_rank,
+            "dp_degree": self.xfuser_parallel.data_parallel_world_size,
+            "is_group_leader": is_group_leader,
+        }
+
+    def _grouped_sampling_result(self, result):
+        group_info = self.get_exec_group_info()
+        if not group_info["is_group_leader"]:
+            return None
+
+        return {
+            "dp_rank": group_info["dp_rank"],
+            "result": result,
+        }
 
     def set_parallel_dict(self, parallel_dict):
         self.parallel_dict = parallel_dict
@@ -271,7 +306,7 @@ class RayWorker:
                 "PipeFusion topology is now initialized through xFuser, but the Wan execution path does not yet combine PP with USP"
             )
 
-        base_model = self.model.model
+        base_model = getattr(self.model, "model", self.model)
         if not hasattr(base_model, "diffusion_model") or not hasattr(base_model.diffusion_model, "blocks"):
             raise ValueError(f"PipeFusion requires a Wan diffusion model with blocks, got {type(base_model).__name__}")
 
@@ -335,7 +370,8 @@ class RayWorker:
 
             # Fast path: same base model + same LoRA — reuse FSDP-wrapped model
             if self.model is not None and self.active_request_key == active_key:
-                self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+                base_model = getattr(self.model, "model", self.model)
+                self.overwrite_cast_dtype = getattr(base_model, "manual_cast_dtype", None)
                 self.is_model_loaded = True
                 return
 
@@ -345,7 +381,6 @@ class RayWorker:
                     self.model.free_fsdp_vram()
                 except Exception as e:
                     print(f"[Rank {self.local_rank}] free_fsdp_vram failed: {e}")
-
 
             # Monkey patch
             import comfy.model_patcher as model_patcher
@@ -384,7 +419,8 @@ class RayWorker:
             if self.lora_list is not None:
                 self.load_lora()
 
-            self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+            base_model = getattr(self.model, "model", self.model)
+            self.overwrite_cast_dtype = getattr(base_model, "manual_cast_dtype", None)
             self.is_model_loaded = True
             self.active_request_key = active_key
             return
@@ -400,7 +436,8 @@ class RayWorker:
             )
 
             if self.model is not None and self.active_request_key == active_key:
-                self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+                base_model = getattr(self.model, "model", self.model)
+                self.overwrite_cast_dtype = getattr(base_model, "manual_cast_dtype", None)
                 self.is_model_loaded = True
                 return
 
@@ -412,7 +449,8 @@ class RayWorker:
                 # from ~15Gb to ~23Gb on each GPU.
                 _cached_has_gpu_weights = False
                 try:
-                    _first_p = next(self.cached_base_model.model.parameters(), None)
+                    cached_base_model = getattr(self.cached_base_model, "model", self.cached_base_model)
+                    _first_p = next(cached_base_model.parameters(), None)
                     if _first_p is not None and _first_p.device.type == "cuda":
                         _cached_has_gpu_weights = True
                 except Exception:
@@ -560,7 +598,7 @@ class RayWorker:
         vae_model.throw_exception_if_invalid()
 
         import types
-        
+
         vae_model.decode_tiled_1d = types.MethodType(decode_tiled_1d, vae_model)
         vae_model.decode_tiled_ = types.MethodType(decode_tiled_, vae_model)
         vae_model.decode_tiled_3d = types.MethodType(decode_tiled_3d, vae_model)
@@ -610,6 +648,7 @@ class RayWorker:
         sampler,
         sigmas,
         latent_image,
+        grouped_output=False,
     ):
         import comfy.model_management as comfy_model_management
         import comfy.sample as comfy_sample
@@ -665,6 +704,8 @@ class RayWorker:
             pass
         comfy_model_management.soft_empty_cache()
         gc.collect()
+        if grouped_output:
+            return self._grouped_sampling_result(out)
         return out
 
     @patch_temp_fix_ck_ops
@@ -685,6 +726,7 @@ class RayWorker:
         start_step=None,
         last_step=None,
         force_full_denoise=False,
+        grouped_output=False,
     ):
         import comfy.model_management as comfy_model_management
         import comfy.sample as comfy_sample
@@ -744,6 +786,8 @@ class RayWorker:
             pass
         comfy_model_management.soft_empty_cache()
         gc.collect()
+        if grouped_output:
+            return self._grouped_sampling_result(out)
         return (out,)
 
 
