@@ -9,10 +9,10 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 <details><summary><strong>Click to expand changelog</strong></summary>
 
+- ERNIE and Anima support for FSDP, USP and CFG
 - GPU Selector: add `GPU_SELECT` input to `RayInitializerAdvanced` to restrict Ray workers to specific GPUs (for example `0,1,2`, or leave empty for all GPUs), credit to [avtc](https://github.com/avtc)
 - Multi-Prompt DP: add `DPConditioningList` node for per-GPU conditioning in Data Parallel mode, credit to avtc
-- `mmap` option for reduce RAM, GGUF implementation by avtc
-- Samplers: pass `ray_actors` through sampler outputs for cleaner workflow chaining
+- `mmap` option for reduce RAM, with GGUF variant implementation by avtc
 - Docs: add developer docs for FSDP, USP, CFG, and expansion modules
 - Now TensorCoreFP8 and NVFP4 works in FSDP2, check on [CK-Distributed](https://github.com/komikndr/comfy-kitchen-distributed)
 - LTX-2 USP
@@ -244,6 +244,19 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 | Model              | USP | FSDP | CFG |
 |--------------------|-----|------|-----|
 | LTX-2 T/I/A/ 2 V/VA| ✅  | ❌   | ❌  |
+
+
+**ERNIE-Image**
+| Model              | USP | FSDP | CFG |
+|--------------------|-----|------|-----|
+| Ernie Image        | ✅  | ✅   | ✅  |
+| Ernie Image Turbo  | ✅  | ✅   | ✅  |
+
+
+**Anima**
+| Model              | USP | FSDP | CFG |
+|--------------------|-----|------|-----|
+| Anima Preview3     | ✅  | ✅   | ✅  |
 
 
 **UNet**
