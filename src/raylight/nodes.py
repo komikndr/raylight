@@ -1,6 +1,8 @@
 import raylight
 import os
 import gc
+import shutil
+import tempfile
 from typing import Any
 from pathlib import Path
 from copy import deepcopy
@@ -19,6 +21,29 @@ from .distributed_worker.ray_worker import (
     ensure_fresh_actors,
     ray_nccl_tester,
 )
+
+
+def _raylight_ray_tmpdir() -> Path:
+    return Path(os.environ.get("RAYLIGHT_RAY_TMPDIR", Path(tempfile.gettempdir()) / "raylight-ray")).resolve()
+
+
+def _configure_raylight_ray_tmpdir(runtime_env: dict[str, Any]):
+    ray_tmpdir = _raylight_ray_tmpdir()
+    ray_tmpdir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("RAY_TMPDIR", str(ray_tmpdir))
+    runtime_env.setdefault("env_vars", {}).setdefault("RAY_TMPDIR", str(ray_tmpdir))
+
+
+def _cleanup_ray_temp():
+    """Remove stale Ray files only from Raylight's owned temp directory."""
+    ray_tmpdir = _raylight_ray_tmpdir()
+    ray_dir = ray_tmpdir / "ray"
+    if not ray_dir.is_dir():
+        return
+    try:
+        shutil.rmtree(ray_dir, ignore_errors=True)
+    except Exception:
+        pass
 
 
 # Workaround https://github.com/comfyanonymous/ComfyUI/pull/11134
@@ -465,9 +490,14 @@ class RayInitializer:
             # Adapted from avtc's Ray GPU visibility restriction idea.
             runtime_env_base.setdefault("env_vars", {})["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_idx) for gpu_idx in selected_gpus)
 
+        if ray_cluster_address in _LOCAL_CLUSTER_ADDRESSES:
+            _configure_raylight_ray_tmpdir(runtime_env_base)
+
         try:
             # Shut down so if comfy user try another workflow it will not cause error
             ray.shutdown()
+            _cleanup_ray_temp()
+            RayControlNetLoader._current_controlnet_path = None
             original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
             restricted_cuda_visible_devices = runtime_env_base.get("env_vars", {}).get("CUDA_VISIBLE_DEVICES")
             if restricted_cuda_visible_devices is not None:
@@ -490,6 +520,7 @@ class RayInitializer:
                         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         except Exception as e:
             ray.shutdown()
+            _cleanup_ray_temp()
             if restricted_cuda_visible_devices is not None:
                 os.environ["CUDA_VISIBLE_DEVICES"] = restricted_cuda_visible_devices
             try:
@@ -1214,8 +1245,171 @@ class RayKill:
 
         if kill_mode == "Kill Entire Cluster":
             ray.shutdown()
+            _cleanup_ray_temp()
+            RayControlNetLoader._current_controlnet_path = None
 
         return ()
+
+
+class RayControlNetLoader:
+    """Load a ControlNet model into all Ray workers.
+
+    Works like the standard ControlNetLoader but loads the model on each
+    worker's GPU from disk, avoiding Ray serialization of multi-GB weights.
+    Returns a lightweight reference that RayControlNetApply uses.
+
+    Only one ControlNet model per workflow is supported. To apply the same
+    model with different images/strengths, use multiple RayControlNetApply
+    nodes connected to a single RayControlNetLoader.
+    """
+
+    _current_controlnet_path = None
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "control_net_name": (folder_paths.get_filename_list("controlnet"),),
+            }
+        }
+
+    RETURN_TYPES = ("RAY_CONTROL_NET",)
+    RETURN_NAMES = ("ray_control_net")
+    FUNCTION = "load_controlnet"
+    CATEGORY = "Raylight"
+
+    def load_controlnet(self, ray_actors, control_net_name):
+        controlnet_path = folder_paths.get_full_path_or_raise("controlnet", control_net_name)
+
+        if (RayControlNetLoader._current_controlnet_path is not None
+                and RayControlNetLoader._current_controlnet_path != controlnet_path):
+            raise RuntimeError(
+                f"Only one ControlNet model per workflow is supported. "
+                f"Already loaded '{RayControlNetLoader._current_controlnet_path}', "
+                f"attempted '{controlnet_path}'. Use multiple RayControlNetApply nodes "
+                f"to apply the same model with different images."
+            )
+        RayControlNetLoader._current_controlnet_path = controlnet_path
+
+        # Validate the ControlNet loads in the main process first
+        import comfy.controlnet as comfy_controlnet
+
+        controlnet = comfy_controlnet.load_controlnet(controlnet_path)
+        if controlnet is None:
+            raise RuntimeError(f"Invalid ControlNet file: {control_net_name}")
+        del controlnet
+        gc.collect()
+
+        # Send the path to all workers — each loads from disk independently
+        gpu_actors = ray_actors["workers"]
+        futures = [actor.load_controlnet.remote(controlnet_path) for actor in gpu_actors]
+        results = ray.get(futures)
+        if not all(results):
+            raise RuntimeError(f"Failed to load ControlNet on one or more workers: {control_net_name}")
+
+        return (controlnet_path,)
+
+
+class RayControlNetApply:
+    """Apply a Ray-loaded ControlNet to conditioning.
+
+    Works like ApplyControlNet but uses a lightweight reference instead of
+    embedding the full model in the conditioning data.  The workers restore
+    the real ControlNet from their local cache during sampling.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "ray_control_net": ("RAY_CONTROL_NET",),
+                "image": ("IMAGE",),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+            },
+            "optional": {
+                "ray_vae": ("RAY_VAE",),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("positive", "negative")
+    FUNCTION = "apply_controlnet"
+    CATEGORY = "Raylight"
+
+    def apply_controlnet(self, positive, negative, ray_control_net, image, strength,
+                         start_percent, end_percent, ray_vae=None, extra_concat=None):
+        from .distributed_worker.ray_worker_controlnet import _RayControlNetRef
+
+        if strength == 0:
+            return (positive, negative)
+
+        if extra_concat is None:
+            extra_concat = []
+
+        control_hint = image.movedim(-1, 1)
+        cnets = {}
+
+        out = []
+        for conditioning in [positive, negative]:
+            c = []
+            for t in conditioning:
+                d = t[1].copy()
+
+                prev_cnet = d.get("control", None)
+                if prev_cnet in cnets:
+                    c_net = cnets[prev_cnet]
+                else:
+                    c_net = _RayControlNetRef(
+                        strength=strength,
+                        timestep_percent_range=(start_percent, end_percent),
+                        cond_hint_original=control_hint,
+                        extra_concat_orig=extra_concat,
+                        needs_vae=(ray_vae is not None),
+                    )
+                    if prev_cnet is not None:
+                        c_net.set_previous_controlnet(prev_cnet)
+                    cnets[prev_cnet] = c_net
+
+                d["control"] = c_net
+                d["control_apply_to_uncond"] = False
+                n = [t[0], d]
+                c.append(n)
+            out.append(c)
+        return (out[0], out[1])
+
+
+class RayVAELoader:
+    """Load a VAE model into all Ray workers.
+
+    Loads the VAE on each worker's GPU from disk.  Used by RayControlNetApply
+    when the ControlNet requires a VAE (e.g. for encoding the control image).
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "vae_name": (folder_paths.get_filename_list("vae"),),
+            }
+        }
+
+    RETURN_TYPES = ("RAY_VAE",)
+    FUNCTION = "load_vae"
+    CATEGORY = "Raylight"
+
+    def load_vae(self, ray_actors, vae_name):
+        vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
+
+        gpu_actors = ray_actors["workers"]
+        ray.get([actor.ray_vae_loader.remote(vae_path) for actor in gpu_actors])
+
+        return (vae_path,)
 
 
 class Noise_RandomNoise:
@@ -1363,6 +1557,9 @@ NODE_CLASS_MAPPINGS = {
     "RayKill": RayKill,
     "RayUNETLoader": RayUNETLoader,
     "RayLoraLoader": RayLoraLoader,
+    "RayControlNetLoader": RayControlNetLoader,
+    "RayControlNetApply": RayControlNetApply,
+    "RayVAELoader": RayVAELoader,
     "RayInitializer": RayInitializer,
     "RayInitializerAdvanced": RayInitializerAdvanced,
     "DPNoiseList": DPNoiseList,
@@ -1377,6 +1574,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayKill": "Kill Ray",
     "RayUNETLoader": "Load Diffusion Model (Ray)",
     "RayLoraLoader": "Load Lora Model (Ray)",
+    "RayControlNetLoader": "Load ControlNet (Ray)",
+    "RayControlNetApply": "Apply ControlNet (Ray)",
+    "RayVAELoader": "Load VAE (Ray)",
     "RayInitializer": "Ray Init Actor",
     "RayInitializerAdvanced": "Ray Init Actor (Advanced)",
     "DPNoiseList": "Data Parallel Noise List",

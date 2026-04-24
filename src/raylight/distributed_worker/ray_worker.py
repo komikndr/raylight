@@ -31,6 +31,12 @@ from raylight.distributed_worker.parallel_group_manager import (
     initialize_xfuser_parallel,
     requires_xfuser_parallel,
 )
+from raylight.distributed_worker.ray_worker_controlnet import (
+    _prepare_control_models,
+    _remap_conditioning_devices,
+    _restore_controlnet_refs,
+)
+from raylight.distributed_worker.ray_worker_vae import load_vae_model
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 from ray.exceptions import RayActorError
@@ -66,6 +72,7 @@ class RayWorker:
         self.vae_model = None
         self.model_type = None
         self.state_dict = None
+        self.cached_controlnet = None  # (path, controlnet_object) cache
         self.lora_list = None
         self.parallel_dict = parallel_dict
         self.overwrite_cast_dtype = None
@@ -143,6 +150,23 @@ class RayWorker:
             self.model.config_fsdp(self.local_rank, self.device_mesh)
         else:
             raise ValueError("Model being set is not meta, can cause OOM in large model")
+
+    def _free_cached_aux_models(self):
+        """Free cached ControlNet and VAE GPU memory."""
+        if self.cached_controlnet is not None:
+            _, old_cnet = self.cached_controlnet
+            old_model = getattr(old_cnet, "control_model", None)
+            if old_model is not None:
+                del old_model
+            self.cached_controlnet = None
+
+        if self.vae_model is not None:
+            del self.vae_model
+            self.vae_model = None
+            self._cached_vae_path = None
+
+        torch.cuda.empty_cache()
+        gc.collect()
 
     def _normalize_model_options(self, model_options):
         if not model_options:
@@ -381,6 +405,7 @@ class RayWorker:
                     self.model.free_fsdp_vram()
                 except Exception as e:
                     print(f"[Rank {self.local_rank}] free_fsdp_vram failed: {e}")
+                self._free_cached_aux_models()
 
             # Monkey patch
             import comfy.model_patcher as model_patcher
@@ -468,6 +493,7 @@ class RayWorker:
 
             self._reset_active_model()
             self._invalidate_non_fsdp_cache()
+            self._free_cached_aux_models()
             if self.parallel_dict.get("pipefusion_enabled"):
                 from raylight.comfy_dist.sd import pipefusion_load_diffusion_model
 
@@ -509,6 +535,7 @@ class RayWorker:
     def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype, use_mmap=None):
         self._reset_active_model()
         self._invalidate_non_fsdp_cache()
+        self._free_cached_aux_models()
         if use_mmap is None:
             use_mmap = self.parallel_dict.get("use_mmap", True)
         if self.parallel_dict["is_fsdp"] is True:
@@ -577,35 +604,29 @@ class RayWorker:
             del lora_model
 
     def kill(self):
+        self._free_cached_aux_models()
         self._invalidate_non_fsdp_cache()
         self.model = None
         dist.destroy_process_group()
         ray.actor.exit_actor()
 
     def ray_vae_loader(self, vae_path):
-        import comfy.sd as comfy_sd
-        import comfy.utils as comfy_utils
+        if self.vae_model is not None and getattr(self, "_cached_vae_path", None) == vae_path:
+            return
 
-        from ..comfy_dist.sd import decode_tiled_1d, decode_tiled_, decode_tiled_3d
+        # Free old VAE before loading new one
+        if self.vae_model is not None:
+            del self.vae_model
+            self.vae_model = None
+            self._cached_vae_path = None
+            torch.cuda.empty_cache()
 
-        state_dict = {}
-        if "pixel_space" in vae_path:
-            state_dict["pixel_space_vae"] = torch.tensor(1.0)
-        else:
-            state_dict = comfy_utils.load_torch_file(vae_path)
-
-        vae_model = comfy_sd.VAE(sd=state_dict)
-        vae_model.throw_exception_if_invalid()
-
-        import types
-
-        vae_model.decode_tiled_1d = types.MethodType(decode_tiled_1d, vae_model)
-        vae_model.decode_tiled_ = types.MethodType(decode_tiled_, vae_model)
-        vae_model.decode_tiled_3d = types.MethodType(decode_tiled_3d, vae_model)
+        vae_model = load_vae_model(vae_path)
 
         if self.local_rank == 0:
             print(f"VAE loaded in {self.global_world_size} GPUs")
         self.vae_model = vae_model
+        self._cached_vae_path = vae_path
 
     @patch_ray_tqdm
     def ray_vae_decode(self, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8):
@@ -654,6 +675,10 @@ class RayWorker:
         import comfy.sample as comfy_sample
         import comfy.utils as comfy_utils
 
+        # Restore ControlNet refs from local cache (loaded by load_controlnet)
+        _restore_controlnet_refs(positive, self.cached_controlnet, self.vae_model)
+        _restore_controlnet_refs(negative, self.cached_controlnet, self.vae_model)
+
         latent = latent_image
         latent_image = latent["samples"]
         latent = latent.copy()
@@ -668,6 +693,9 @@ class RayWorker:
         noise_mask = None
         if "noise_mask" in latent:
             noise_mask = latent["noise_mask"]
+
+        _remap_conditioning_devices(positive, negative)
+        _prepare_control_models(positive, negative)
 
         if self.parallel_dict["is_fsdp"] is True:
             self.model.patch_fsdp()
@@ -708,6 +736,62 @@ class RayWorker:
             return self._grouped_sampling_result(out)
         return out
 
+    def load_controlnet(self, controlnet_path):
+        """Load a ControlNet model from disk into the worker.
+
+        Caches the result so subsequent calls with the same path are free.
+        Frees old ControlNet VRAM when the path changes.
+        Returns True on success.
+        """
+        if self.cached_controlnet is not None and self.cached_controlnet[0] == controlnet_path:
+            return True
+
+        # Free old ControlNet VRAM if model changed
+        if self.cached_controlnet is not None:
+            _, old_cnet = self.cached_controlnet
+            old_model = getattr(old_cnet, "control_model", None)
+            if old_model is not None:
+                del old_model
+            self.cached_controlnet = None
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        import comfy.controlnet as comfy_cnet
+
+        cnet = comfy_cnet.load_controlnet(controlnet_path)
+        if cnet is None:
+            print(f"[Rank {self.local_rank}] Failed to load ControlNet: {controlnet_path}")
+            return False
+
+        self.cached_controlnet = (controlnet_path, cnet)
+        if self.local_rank == 0:
+            print(f"[Rank {self.local_rank}] ControlNet loaded and cached from {controlnet_path}")
+        return True
+
+    def free_cached_controlnet(self):
+        """Explicitly free the cached ControlNet (e.g. when switching workflows)."""
+        if self.cached_controlnet is not None:
+            _, old_cnet = self.cached_controlnet
+            old_model = getattr(old_cnet, "control_model", None)
+            if old_model is not None:
+                del old_model
+            self.cached_controlnet = None
+            torch.cuda.empty_cache()
+            gc.collect()
+            if self.local_rank == 0:
+                print(f"[Rank {self.local_rank}] ControlNet cache freed")
+
+    def free_cached_vae(self):
+        """Explicitly free the cached VAE (e.g. when switching workflows)."""
+        if self.vae_model is not None:
+            del self.vae_model
+            self.vae_model = None
+            self._cached_vae_path = None
+            torch.cuda.empty_cache()
+            gc.collect()
+            if self.local_rank == 0:
+                print(f"[Rank {self.local_rank}] VAE cache freed")
+
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
     @patch_enable_comfy_kitchen_fsdp
@@ -732,6 +816,10 @@ class RayWorker:
         import comfy.sample as comfy_sample
         import comfy.utils as comfy_utils
 
+        # Restore ControlNet refs from local cache (loaded by load_controlnet)
+        _restore_controlnet_refs(positive, self.cached_controlnet, self.vae_model)
+        _restore_controlnet_refs(negative, self.cached_controlnet, self.vae_model)
+
         latent_image = latent["samples"]
         latent_image = comfy_sample.fix_empty_latent_channels(self.model, latent_image)
 
@@ -752,6 +840,9 @@ class RayWorker:
         noise_mask = None
         if "noise_mask" in latent:
             noise_mask = latent["noise_mask"]
+
+        _remap_conditioning_devices(positive, negative)
+        _prepare_control_models(positive, negative)
 
         disable_pbar = comfy_utils.PROGRESS_BAR_ENABLED
         if self.local_rank == 0:
