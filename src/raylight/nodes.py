@@ -356,14 +356,14 @@ class RayInitializer:
                 "skip_comm_test": (
                     "BOOLEAN",
                     {
-                        "default": True,
+                        "default": False,
                         "tooltip": "Skip the startup NCCL communication test. Faster startup, but distributed issues are caught later.",
                     },
                 ),
                 "use_mmap": (
                     "BOOLEAN",
                     {
-                        "default": True,
+                        "default": False,
                         "tooltip": "Use mmap-backed safetensor loading. This can reduce RAM spikes during model load, especially for large checkpoints.",
                     },
                 ),
@@ -609,14 +609,14 @@ class RayInitializerAdvanced(RayInitializer):
                 "skip_comm_test": (
                     "BOOLEAN",
                     {
-                        "default": True,
+                        "default": False,
                         "tooltip": "Skip the startup NCCL communication test. Faster startup, but distributed issues are caught later.",
                     },
                 ),
                 "use_mmap": (
                     "BOOLEAN",
                     {
-                        "default": True,
+                        "default": False,
                         "tooltip": "Use mmap-backed safetensor loading. This can reduce RAM spikes during model load, especially for large checkpoints.",
                     },
                 ),
