@@ -33,6 +33,7 @@ def install_fp8_patches() -> None:
         QuantizedTensor,
         _LAYOUT_DISPATCH_TABLE,
         dequantize_args,
+        get_layout_class,
         register_layout_op,
     )
     from comfy_kitchen.tensor.fp8 import TensorCoreFP8Layout
@@ -46,8 +47,17 @@ def install_fp8_patches() -> None:
 
         return deco
 
+    def _layout_cls(qtensor: QuantizedTensor):
+        return get_layout_class(qtensor._layout_cls)
+
+    def _get_plain_tensors(qtensor: QuantizedTensor):
+        return _layout_cls(qtensor).get_plain_tensors(qtensor)
+
+    def _quantize_like(tensor: torch.Tensor, qtensor: QuantizedTensor):
+        return _layout_cls(qtensor).quantize(tensor)
+
     def wrap_fp8_tensor(qtensor: QuantizedTensor, qdata: torch.Tensor) -> QuantizedTensor:
-        params = TensorCoreFP8Layout.Params(
+        params = _layout_cls(qtensor).Params(
             scale=qtensor._params.scale,
             orig_dtype=qtensor._params.orig_dtype,
             orig_shape=tuple(qdata.shape),
@@ -71,13 +81,13 @@ def install_fp8_patches() -> None:
         output_shape = None
 
         if isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor):
-            input_qdata, scale_a = TensorCoreFP8Layout.get_plain_tensors(input_tensor)
-            weight_qdata, scale_b = TensorCoreFP8Layout.get_plain_tensors(weight)
+            input_qdata, scale_a = _get_plain_tensors(input_tensor)
+            weight_qdata, scale_b = _get_plain_tensors(weight)
             out_dtype = kwargs.get("out_dtype", input_tensor._params.orig_dtype)
         elif isinstance(input_tensor, torch.Tensor) and isinstance(weight, QuantizedTensor):
-            input_qdata, input_params = TensorCoreFP8Layout.quantize(input_tensor)
+            input_qdata, input_params = _quantize_like(input_tensor, weight)
             scale_a = input_params.scale
-            weight_qdata, scale_b = TensorCoreFP8Layout.get_plain_tensors(weight)
+            weight_qdata, scale_b = _get_plain_tensors(weight)
             out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
         else:
             return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
@@ -101,13 +111,13 @@ def install_fp8_patches() -> None:
         a, b = args[0], args[1]
 
         if isinstance(a, QuantizedTensor) and isinstance(b, QuantizedTensor):
-            a_qdata, scale_a = TensorCoreFP8Layout.get_plain_tensors(a)
-            b_qdata, scale_b = TensorCoreFP8Layout.get_plain_tensors(b)
+            a_qdata, scale_a = _get_plain_tensors(a)
+            b_qdata, scale_b = _get_plain_tensors(b)
             out_dtype = kwargs.get("out_dtype", a._params.orig_dtype)
         elif isinstance(a, torch.Tensor) and isinstance(b, QuantizedTensor):
-            a_qdata, a_params = TensorCoreFP8Layout.quantize(a)
+            a_qdata, a_params = _quantize_like(a, b)
             scale_a = a_params.scale
-            b_qdata, scale_b = TensorCoreFP8Layout.get_plain_tensors(b)
+            b_qdata, scale_b = _get_plain_tensors(b)
             out_dtype = kwargs.get("out_dtype", a.dtype)
         else:
             return torch.mm(*dequantize_args(args))
@@ -124,13 +134,13 @@ def install_fp8_patches() -> None:
         bias, a, b = args[0], args[1], args[2]
 
         if isinstance(a, QuantizedTensor) and isinstance(b, QuantizedTensor):
-            a_qdata, scale_a = TensorCoreFP8Layout.get_plain_tensors(a)
-            b_qdata, scale_b = TensorCoreFP8Layout.get_plain_tensors(b)
+            a_qdata, scale_a = _get_plain_tensors(a)
+            b_qdata, scale_b = _get_plain_tensors(b)
             out_dtype = kwargs.get("out_dtype", a._params.orig_dtype)
         elif isinstance(a, torch.Tensor) and isinstance(b, QuantizedTensor):
-            a_qdata, a_params = TensorCoreFP8Layout.quantize(a)
+            a_qdata, a_params = _quantize_like(a, b)
             scale_a = a_params.scale
-            b_qdata, scale_b = TensorCoreFP8Layout.get_plain_tensors(b)
+            b_qdata, scale_b = _get_plain_tensors(b)
             out_dtype = kwargs.get("out_dtype", a.dtype)
         else:
             return torch.addmm(*dequantize_args(args))
@@ -183,14 +193,14 @@ def install_fp8_patches() -> None:
             if not isinstance(out, QuantizedTensor):
                 raise TypeError(f"Expected QuantizedTensor out, got {type(out)}")
             out._qdata = data
-            out._params = TensorCoreFP8Layout.Params(
+            out._params = _layout_cls(qtensor).Params(
                 scale=scale,
                 orig_dtype=param_dtype,
                 orig_shape=orig_shape,
             )
             return None
 
-        params = TensorCoreFP8Layout.Params(
+        params = _layout_cls(qtensor).Params(
             scale=scale,
             orig_dtype=param_dtype,
             orig_shape=orig_shape,
