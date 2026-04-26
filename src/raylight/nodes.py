@@ -1275,7 +1275,7 @@ class RayControlNetLoader:
         }
 
     RETURN_TYPES = ("RAY_CONTROL_NET",)
-    RETURN_NAMES = ("ray_control_net")
+    RETURN_NAMES = ("ray_control_net",)
     FUNCTION = "load_controlnet"
     CATEGORY = "Raylight"
 
@@ -1400,6 +1400,7 @@ class RayVAELoader:
         }
 
     RETURN_TYPES = ("RAY_VAE",)
+    RETURN_TYPES = ("ray_vae",)
     FUNCTION = "load_vae"
     CATEGORY = "Raylight"
 
