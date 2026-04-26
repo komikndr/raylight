@@ -132,7 +132,7 @@ This mode splits the sequence among GPUs, the full model will be loaded into eac
 Use the XFuser KSampler to increase the Ulysses degree according to the number of your GPUs,
 while keeping the Ring degree at 1 for small systems.
 
-imagaes : USP
+![USP](docs/images/USP.PNG)
 
 ---
 
@@ -148,22 +148,23 @@ as the name suggests, Fully Sharded (Weight) Data Parallel.
 
 Data parallel also can use different prompt per generation using Conditional List
 
-images: DP Normal
-images: DP + COND
+![DP](docs/images/DP.PNG)
+![DP_COND_FSDP](docs/images/DP_DPCOND_FSDP.PNG)
 
 ---
 
 **Sequence + FSDP**
 Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser KSampler.
 
-<img width="833" height="427" alt="ValidUSP" src="https://github.com/user-attachments/assets/9c5571ca-ae4c-4deb-97da-c3552ff43cea" />
+![USP_FSDP](docs/images/USP_FSDP.PNG)
 
 ---
 
 **Unified Parallel**
 This is experimental mode where all type of parallel group can work at a sime time, USP, FSDP, DP, CFG.
 
-<img width="833" height="427" alt="ValidUSP" src="https://github.com/user-attachments/assets/9c5571ca-ae4c-4deb-97da-c3552ff43cea" />
+![UNIFIED](docs/images/UNIFIED.PNG)
+![UNIFIED_DP_COND](docs/images/UNIFIED_DP_COND.PNG)
 
 ---
 
