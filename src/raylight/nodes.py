@@ -1400,7 +1400,7 @@ class RayVAELoader:
         }
 
     RETURN_TYPES = ("RAY_VAE",)
-    RETURN_TYPES = ("ray_vae",)
+    RETURN_NAMES = ("ray_vae",)
     FUNCTION = "load_vae"
     CATEGORY = "Raylight"
 
