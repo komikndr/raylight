@@ -32,9 +32,11 @@ def install_fp8_patches() -> None:
     from comfy_kitchen.tensor.base import (
         QuantizedTensor,
         _LAYOUT_DISPATCH_TABLE,
+        dequantize_args,
         register_layout_op,
     )
     from comfy_kitchen.tensor.fp8 import TensorCoreFP8Layout
+    from comfy_kitchen.scaled_mm_v2 import scaled_mm_v2
 
     def maybe_register(op):
         def deco(fn):
@@ -51,6 +53,94 @@ def install_fp8_patches() -> None:
             orig_shape=tuple(qdata.shape),
         )
         return QuantizedTensor(qdata, qtensor._layout_cls, params)
+
+    def _fp8_scaled_mm(input_qdata, weight_qdata, scale_a, scale_b, bias=None, out_dtype=None):
+        return scaled_mm_v2(
+            input_qdata.contiguous(),
+            weight_qdata,
+            scale_a=scale_a,
+            scale_b=scale_b,
+            bias=bias,
+            out_dtype=out_dtype,
+        )
+
+    @register_layout_op(torch.ops.aten.linear.default, TensorCoreFP8Layout)
+    def handle_linear(qt, args, kwargs):
+        input_tensor, weight = args[0], args[1]
+        bias = args[2] if len(args) > 2 else None
+        output_shape = None
+
+        if isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor):
+            input_qdata, scale_a = TensorCoreFP8Layout.get_plain_tensors(input_tensor)
+            weight_qdata, scale_b = TensorCoreFP8Layout.get_plain_tensors(weight)
+            out_dtype = kwargs.get("out_dtype", input_tensor._params.orig_dtype)
+        elif isinstance(input_tensor, torch.Tensor) and isinstance(weight, QuantizedTensor):
+            input_qdata, input_params = TensorCoreFP8Layout.quantize(input_tensor)
+            scale_a = input_params.scale
+            weight_qdata, scale_b = TensorCoreFP8Layout.get_plain_tensors(weight)
+            out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
+        else:
+            return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
+
+        if input_qdata.ndim > 2:
+            output_shape = (*input_qdata.shape[:-1], weight_qdata.shape[0])
+            input_qdata = input_qdata.reshape(-1, input_qdata.shape[-1])
+
+        try:
+            output = _fp8_scaled_mm(input_qdata, weight_qdata.t(), scale_a, scale_b, bias, out_dtype)
+            if output_shape is not None:
+                output = output.reshape(output_shape)
+            return output
+        except (RuntimeError, TypeError) as e:
+            if isinstance(e, torch.OutOfMemoryError):
+                raise
+            return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
+
+    @register_layout_op(torch.ops.aten.mm.default, TensorCoreFP8Layout)
+    def handle_mm(qt, args, kwargs):
+        a, b = args[0], args[1]
+
+        if isinstance(a, QuantizedTensor) and isinstance(b, QuantizedTensor):
+            a_qdata, scale_a = TensorCoreFP8Layout.get_plain_tensors(a)
+            b_qdata, scale_b = TensorCoreFP8Layout.get_plain_tensors(b)
+            out_dtype = kwargs.get("out_dtype", a._params.orig_dtype)
+        elif isinstance(a, torch.Tensor) and isinstance(b, QuantizedTensor):
+            a_qdata, a_params = TensorCoreFP8Layout.quantize(a)
+            scale_a = a_params.scale
+            b_qdata, scale_b = TensorCoreFP8Layout.get_plain_tensors(b)
+            out_dtype = kwargs.get("out_dtype", a.dtype)
+        else:
+            return torch.mm(*dequantize_args(args))
+
+        try:
+            return _fp8_scaled_mm(a_qdata, b_qdata, scale_a, scale_b, out_dtype=out_dtype)
+        except (RuntimeError, TypeError) as e:
+            if isinstance(e, torch.OutOfMemoryError):
+                raise
+            return torch.mm(*dequantize_args(args))
+
+    @register_layout_op(torch.ops.aten.addmm.default, TensorCoreFP8Layout)
+    def handle_addmm(qt, args, kwargs):
+        bias, a, b = args[0], args[1], args[2]
+
+        if isinstance(a, QuantizedTensor) and isinstance(b, QuantizedTensor):
+            a_qdata, scale_a = TensorCoreFP8Layout.get_plain_tensors(a)
+            b_qdata, scale_b = TensorCoreFP8Layout.get_plain_tensors(b)
+            out_dtype = kwargs.get("out_dtype", a._params.orig_dtype)
+        elif isinstance(a, torch.Tensor) and isinstance(b, QuantizedTensor):
+            a_qdata, a_params = TensorCoreFP8Layout.quantize(a)
+            scale_a = a_params.scale
+            b_qdata, scale_b = TensorCoreFP8Layout.get_plain_tensors(b)
+            out_dtype = kwargs.get("out_dtype", a.dtype)
+        else:
+            return torch.addmm(*dequantize_args(args))
+
+        try:
+            return _fp8_scaled_mm(a_qdata, b_qdata, scale_a, scale_b, bias, out_dtype)
+        except (RuntimeError, TypeError) as e:
+            if isinstance(e, torch.OutOfMemoryError):
+                raise
+            return torch.addmm(*dequantize_args(args))
 
     def pre_all_gather(qtensor: QuantizedTensor, mesh):
         qdata = qtensor._qdata
