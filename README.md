@@ -9,6 +9,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 <details><summary><strong>Click to expand changelog</strong></summary>
 
+- Experimental : ControlNet support, by avtc
 - Experimental : Unified Parallel sampler, now all parallel type can be use at the same time, USP x DP x CFG x FSDP
 - ERNIE and Anima support
 - GPU Selector: add `GPU_SELECT` input to `RayInitializerAdvanced` to restrict Ray workers to specific GPUs (for example `0,1,2`, or leave empty for all GPUs), credit to [avtc](https://github.com/avtc)
