@@ -18,6 +18,7 @@ from enum import Enum
 
 from einops import rearrange
 import torch
+import comfy.ldm.common_dit
 
 from xfuser.core.distributed import (
     get_sequence_parallel_rank,
@@ -195,6 +196,8 @@ def usp_mini_train_dit_forward(
     *args,
     **kwargs,
 ):
+    orig_shape = list(x.shape)
+    x = comfy.ldm.common_dit.pad_to_patch_size(x, (self.patch_temporal, self.patch_spatial, self.patch_spatial))
     x_B_C_T_H_W = x
     timesteps_B_T = timesteps
     crossattn_emb = context
@@ -227,12 +230,30 @@ def usp_mini_train_dit_forward(
             f"{x_B_T_H_W_D.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape}"
         )
 
+    # The residual stream for this model has large values. To make fp16 compute_dtype work, we keep the residual stream
+    # in fp32, but run attention and MLP modules in fp16.
+    # An alternate method that clamps fp16 values "works" in the sense that it makes coherent images, but there is noticeable
+    # quality degradation and visual artifacts.
+    if x_B_T_H_W_D.dtype == torch.float16:
+        x_B_T_H_W_D = x_B_T_H_W_D.float()
+
     # ================ SEQUENCE PARALLEL ================== #
-    x_B_T_H_W_D, is_padded = pad_if_odd(x_B_T_H_W_D, 2)
+    sp_world = get_sequence_parallel_world_size()
+    sp_rank = get_sequence_parallel_rank()
+
     B, T, H, W, D = x_B_T_H_W_D.shape
-    x_B_T_H_W_D = torch.chunk(x_B_T_H_W_D, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+    x_B_T_H_W_D, h_orig_size = pad_to_world_size(x_B_T_H_W_D, dim=2)
+
     rope_emb_L_1_1_D = rearrange(rope_emb_L_1_1_D, "(t h w) s c d -> t h w s c d", t=T, h=H, w=W)
-    rope_emb_L_1_1_D = torch.chunk(rope_emb_L_1_1_D, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    rope_emb_L_1_1_D, _ = pad_to_world_size(rope_emb_L_1_1_D, dim=1)
+    if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
+        extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D, _ = pad_to_world_size(extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D, dim=2)
+
+    x_B_T_H_W_D = torch.chunk(x_B_T_H_W_D, sp_world, dim=2)[sp_rank]
+    rope_emb_L_1_1_D = torch.chunk(rope_emb_L_1_1_D, sp_world, dim=1)[sp_rank]
+    if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
+        extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = torch.chunk(extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D, sp_world, dim=2)[sp_rank]
+
     rope_emb_L_1_1_D = rearrange(rope_emb_L_1_1_D, "t h w s c d -> (t h w) s c d")
     # ================ SEQUENCE PARALLEL ================== #
 
@@ -251,9 +272,8 @@ def usp_mini_train_dit_forward(
         )
 
     x_B_T_H_W_D = get_sp_group().all_gather(x_B_T_H_W_D, dim=2)
-    if is_padded is True:
-        x_B_T_H_W_D = x_B_T_H_W_D[:, :, :-1, :]
+    x_B_T_H_W_D = x_B_T_H_W_D[:, :, :h_orig_size, :, :]
 
-    x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
-    x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
+    x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D.to(crossattn_emb.dtype), t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
+    x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)[:, :, :orig_shape[-3], :orig_shape[-2], :orig_shape[-1]]
     return x_B_C_Tt_Hp_Wp

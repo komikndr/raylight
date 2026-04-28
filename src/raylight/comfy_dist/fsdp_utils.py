@@ -265,13 +265,29 @@ def _materialize_missing_ignored_params(
             full_sd[param_name] = None
 
 
+def _collect_subtree_params(module: torch.nn.Module) -> set[torch.nn.Parameter]:
+    return set(module.parameters())
+
+
 def fully_shard_bottom_up(
     model: torch.nn.Module,
     fsdp_kwargs: dict[str, Any],
     native_ignore_scale: bool,
+    ignored_modules: set[torch.nn.Module] | None = None,
 ) -> int:
+    excluded_params: set[torch.nn.Parameter] = set()
+    ignored_module_ids: set[int] = set()
+    if ignored_modules:
+        for mod in ignored_modules:
+            excluded_params |= _collect_subtree_params(mod)
+            ignored_module_ids.update(id(child) for child in mod.modules())
+
+    shard_order = collect_bottom_up_shard_order(model)
+    if ignored_modules:
+        shard_order = [(n, m) for n, m in shard_order if id(m) not in ignored_module_ids]
+
     num_layers_sharded = 0
-    for _name, module in collect_bottom_up_shard_order(model):
+    for _name, module in shard_order:
         kwargs = dict(fsdp_kwargs)
         ignored_params: set[torch.nn.Parameter] = set()
         if native_ignore_scale:
@@ -280,6 +296,9 @@ def fully_shard_bottom_up(
         ignored_params |= collect_input_scale_ignored_params(module)
         ignored_params |= collect_scalar_ignored_params(module)
         ignored_params |= collect_odd_dim0_ignored_params(module)
+
+        subtree_params = set(module.parameters())
+        ignored_params |= (excluded_params & subtree_params)
 
         if ignored_params:
             kwargs["ignored_params"] = ignored_params
@@ -290,6 +309,38 @@ def fully_shard_bottom_up(
     if num_layers_sharded == 0:
         raise ValueError("No layer modules were sharded. Please check if shard conditions are working as expected.")
     return num_layers_sharded
+
+
+def materialize_excluded_params(
+    model: torch.nn.Module,
+    excluded_modules: set[torch.nn.Module],
+    full_sd: dict[str, Any],
+    device: torch.device,
+    cpu_offload: bool = False,
+) -> int:
+    """Load parameters of modules excluded from FSDP wrapping from a full state dict.
+
+    After FSDP wrapping, excluded-module parameters remain on meta device.
+    This function materializes them onto *device* (or CPU when cpu_offload).
+    Returns the number of parameters materialized.
+    """
+    module_to_prefix: dict[int, str] = {}
+    for name, mod in model.named_modules():
+        module_to_prefix[id(mod)] = name
+
+    count = 0
+    for module in excluded_modules:
+        prefix = module_to_prefix.get(id(module), "")
+        for param_name, param in module.named_parameters(recurse=True):
+            full_name = f"{prefix}.{param_name}" if prefix else param_name
+            if not getattr(param, "is_meta", False):
+                continue
+            full_tensor = full_sd.get(full_name)
+            if full_tensor is None:
+                continue
+            _materialize_unsharded_param(model, full_name, param, full_tensor, device, cpu_offload)
+            count += 1
+    return count
 
 
 def _decode_comfy_quant(conf: Any) -> dict[str, Any] | None:

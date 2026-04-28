@@ -1,0 +1,914 @@
+{
+  "id": "91f6bbe2-ed41-4fd6-bac7-71d5b5864ecb",
+  "revision": 0,
+  "last_node_id": 178,
+  "last_link_id": 278,
+  "nodes": [
+    {
+      "id": 155,
+      "type": "RayLoraLoader",
+      "pos": [
+        614.5518447084462,
+        390.58540766805334
+      ],
+      "size": [
+        270,
+        82
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "prev_ray_lora",
+          "shape": 7,
+          "type": "RAY_LORA",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_lora",
+          "type": "RAY_LORA",
+          "links": [
+            237
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayLoraLoader"
+      },
+      "widgets_values": [
+        "qwen_lightning.safetensors",
+        1
+      ]
+    },
+    {
+      "id": 172,
+      "type": "CLIPLoader",
+      "pos": [
+        620.0637614231679,
+        525.457694721219
+      ],
+      "size": [
+        270,
+        106
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            256
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "qwen_vl.safetensors",
+        "qwen_image",
+        "default"
+      ]
+    },
+    {
+      "id": 154,
+      "type": "RayUNETLoader",
+      "pos": [
+        964.5877766923437,
+        -42.105906006310946
+      ],
+      "size": [
+        279.4732421875,
+        102
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors_init",
+          "type": "RAY_ACTORS_INIT",
+          "link": 236
+        },
+        {
+          "name": "lora",
+          "shape": 7,
+          "type": "RAY_LORA",
+          "link": 237
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "links": [
+            252,
+            257,
+            259
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayUNETLoader"
+      },
+      "widgets_values": [
+        "qwen_image_2512_fp8_e4m3fn.safetensors",
+        "default"
+      ]
+    },
+    {
+      "id": 160,
+      "type": "CLIPTextEncode",
+      "pos": [
+        977.1781648341179,
+        157.5622537278246
+      ],
+      "size": [
+        389.77895266270093,
+        89.61268875717101
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 256
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            241,
+            268
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        "cyberpunk city at afternoon"
+      ]
+    },
+    {
+      "id": 161,
+      "type": "ConditioningZeroOut",
+      "pos": [
+        981.3131597933473,
+        295.6876290718403
+      ],
+      "size": [
+        204.134765625,
+        26
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "conditioning",
+          "type": "CONDITIONING",
+          "link": 241
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            269
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ConditioningZeroOut"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 167,
+      "type": "XFuserKSamplerAdvanced",
+      "pos": [
+        2005.7872385507983,
+        -42.105906006310946
+      ],
+      "size": [
+        312.353515625,
+        334
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 252
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 273
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 274
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 251
+        }
+      ],
+      "outputs": [
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "links": [
+            253
+          ]
+        },
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "XFuserKSamplerAdvanced"
+      },
+      "widgets_values": [
+        "enable",
+        736132966791191,
+        "randomize",
+        8,
+        1,
+        "euler",
+        "simple",
+        0,
+        10000,
+        "disable"
+      ]
+    },
+    {
+      "id": 173,
+      "type": "RayControlNetLoader",
+      "pos": [
+        1340.515669631929,
+        -42.105906006310946
+      ],
+      "size": [
+        217.96557719193243,
+        58
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 257
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_control_net",
+          "type": "RAY_CONTROL_NET",
+          "links": [
+            270
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayControlNetLoader"
+      },
+      "widgets_values": [
+        "Qwen-Image-2512-Fun-Controlnet-Union-2602.safetensors"
+      ]
+    },
+    {
+      "id": 152,
+      "type": "RayInitializer",
+      "pos": [
+        615.1188133012996,
+        -42.105906006310946
+      ],
+      "size": [
+        296.462890625,
+        346
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "ray_actors_init",
+          "type": "RAY_ACTORS_INIT",
+          "links": [
+            236
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayInitializer"
+      },
+      "widgets_values": [
+        "local",
+        "default",
+        2,
+        2,
+        1,
+        1,
+        1,
+        false,
+        true,
+        false,
+        "TORCH_FLASH",
+        false,
+        false
+      ]
+    },
+    {
+      "id": 169,
+      "type": "VAEDecode",
+      "pos": [
+        2361.088614264038,
+        -42.105906006310946
+      ],
+      "size": [
+        140,
+        46
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 253
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 254
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            275
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 157,
+      "type": "ImageScaleToTotalPixels",
+      "pos": [
+        248.5986087427233,
+        653.5238388783692
+      ],
+      "size": [
+        270,
+        106
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 238
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            276
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ImageScaleToTotalPixels"
+      },
+      "widgets_values": [
+        "nearest-exact",
+        1,
+        1
+      ]
+    },
+    {
+      "id": 174,
+      "type": "RayVAELoader",
+      "pos": [
+        1344.0447185216622,
+        61.77524401326717
+      ],
+      "size": [
+        270,
+        58
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 259
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_vae",
+          "type": "ray_vae",
+          "links": [
+            272
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayVAELoader"
+      },
+      "widgets_values": [
+        "qwen_vae.safetensors"
+      ]
+    },
+    {
+      "id": 165,
+      "type": "PreviewImage",
+      "pos": [
+        989.2987329744371,
+        397.0570960861951
+      ],
+      "size": [
+        602.3184131607075,
+        370.0119673434484
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 277
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 170,
+      "type": "VAELoader",
+      "pos": [
+        2015.924159507529,
+        345.9505771228518
+      ],
+      "size": [
+        270,
+        58
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            254
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "qwen_vae.safetensors"
+      ]
+    },
+    {
+      "id": 156,
+      "type": "LoadImage",
+      "pos": [
+        -73.32680383633422,
+        -34.37650842145388
+      ],
+      "size": [
+        652.1903407882397,
+        548.8829385462784
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            238
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "RayComfyNight.png",
+        "image"
+      ]
+    },
+    {
+      "id": 176,
+      "type": "RayControlNetApply",
+      "pos": [
+        1678.5039621211645,
+        -42.105906006310946
+      ],
+      "size": [
+        270,
+        186
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 268
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 269
+        },
+        {
+          "name": "ray_control_net",
+          "type": "RAY_CONTROL_NET",
+          "link": 270
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 278
+        },
+        {
+          "name": "ray_vae",
+          "shape": 7,
+          "type": "RAY_VAE",
+          "link": 272
+        }
+      ],
+      "outputs": [
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            273
+          ]
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "links": [
+            274
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayControlNetApply"
+      },
+      "widgets_values": [
+        1,
+        0,
+        1
+      ]
+    },
+    {
+      "id": 178,
+      "type": "Canny",
+      "pos": [
+        624.2242984866305,
+        676.69085873207
+      ],
+      "size": [
+        299.7623262721479,
+        82
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 276
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            277,
+            278
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Canny"
+      },
+      "widgets_values": [
+        0.33,
+        0.35
+      ]
+    },
+    {
+      "id": 177,
+      "type": "SaveImage",
+      "pos": [
+        2516.8432789606477,
+        -38.10783804280425
+      ],
+      "size": [
+        559.3987343082831,
+        524.7698259295142
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 275
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "Raylight"
+      ]
+    },
+    {
+      "id": 168,
+      "type": "EmptyLatentImage",
+      "pos": [
+        1677.9895646842594,
+        192.27478885753564
+      ],
+      "size": [
+        270,
+        106
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            251
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "EmptyLatentImage"
+      },
+      "widgets_values": [
+        1536,
+        1024,
+        1
+      ]
+    }
+  ],
+  "links": [
+    [
+      236,
+      152,
+      0,
+      154,
+      0,
+      "RAY_ACTORS_INIT"
+    ],
+    [
+      237,
+      155,
+      0,
+      154,
+      1,
+      "RAY_LORA"
+    ],
+    [
+      238,
+      156,
+      0,
+      157,
+      0,
+      "IMAGE"
+    ],
+    [
+      241,
+      160,
+      0,
+      161,
+      0,
+      "CONDITIONING"
+    ],
+    [
+      251,
+      168,
+      0,
+      167,
+      3,
+      "LATENT"
+    ],
+    [
+      252,
+      154,
+      0,
+      167,
+      0,
+      "RAY_ACTORS"
+    ],
+    [
+      253,
+      167,
+      0,
+      169,
+      0,
+      "LATENT"
+    ],
+    [
+      254,
+      170,
+      0,
+      169,
+      1,
+      "VAE"
+    ],
+    [
+      256,
+      172,
+      0,
+      160,
+      0,
+      "CLIP"
+    ],
+    [
+      257,
+      154,
+      0,
+      173,
+      0,
+      "RAY_ACTORS"
+    ],
+    [
+      259,
+      154,
+      0,
+      174,
+      0,
+      "RAY_ACTORS"
+    ],
+    [
+      268,
+      160,
+      0,
+      176,
+      0,
+      "CONDITIONING"
+    ],
+    [
+      269,
+      161,
+      0,
+      176,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      270,
+      173,
+      0,
+      176,
+      2,
+      "RAY_CONTROL_NET"
+    ],
+    [
+      272,
+      174,
+      0,
+      176,
+      4,
+      "RAY_VAE"
+    ],
+    [
+      273,
+      176,
+      0,
+      167,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      274,
+      176,
+      1,
+      167,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      275,
+      169,
+      0,
+      177,
+      0,
+      "IMAGE"
+    ],
+    [
+      276,
+      157,
+      0,
+      178,
+      0,
+      "IMAGE"
+    ],
+    [
+      277,
+      178,
+      0,
+      165,
+      0,
+      "IMAGE"
+    ],
+    [
+      278,
+      178,
+      0,
+      176,
+      3,
+      "IMAGE"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "frontendVersion": "1.42.15",
+    "workflowRendererVersion": "LG",
+    "ue_links": [],
+    "links_added_by_ue": [],
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true,
+    "ds": {
+      "scale": 0.9783733183103155,
+      "offset": [
+        -1743.5180100310913,
+        261.9891617228907
+      ]
+    }
+  },
+  "version": 0.4
+}

@@ -1,6 +1,7 @@
 import torch
 import comfy.model_management
 import comfy.ops
+from torch.nn.modules.utils import _pair, _reverse_repeat_tuple
 
 from raylight.comfy_dist.lora import calculate_weight as ray_calculate_weight
 
@@ -75,6 +76,37 @@ class SafetensorLayer(torch.nn.Module):
         return weight, bias
 
 
+def _init_conv2d_metadata(layer, in_channels, out_channels, kernel_size, stride, padding, dilation, groups, padding_mode):
+    kernel_size = _pair(kernel_size)
+    stride = _pair(stride)
+    dilation = _pair(dilation)
+
+    if isinstance(padding, str):
+        padding_value = padding
+        reversed_padding = [0, 0] * len(kernel_size)
+        if padding == "same":
+            for d, k, i in zip(dilation, kernel_size, range(len(kernel_size) - 1, -1, -1)):
+                total_padding = d * (k - 1)
+                left_pad = total_padding // 2
+                reversed_padding[2 * i] = left_pad
+                reversed_padding[2 * i + 1] = total_padding - left_pad
+    else:
+        padding_value = _pair(padding)
+        reversed_padding = _reverse_repeat_tuple(padding_value, 2)
+
+    layer.in_channels = in_channels
+    layer.out_channels = out_channels
+    layer.kernel_size = kernel_size
+    layer.stride = stride
+    layer.padding = padding_value
+    layer.dilation = dilation
+    layer.transposed = False
+    layer.output_padding = (0,) * len(kernel_size)
+    layer.groups = groups
+    layer.padding_mode = padding_mode
+    layer._reversed_padding_repeated_twice = reversed_padding
+
+
 class SafetensorOps(comfy.ops.manual_cast):
     class Linear(SafetensorLayer, comfy.ops.manual_cast.Linear):
         def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
@@ -91,6 +123,7 @@ class SafetensorOps(comfy.ops.manual_cast):
     class Conv2d(SafetensorLayer, comfy.ops.manual_cast.Conv2d):
         def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode="zeros", device=None, dtype=None):
             torch.nn.Module.__init__(self)
+            _init_conv2d_metadata(self, in_channels, out_channels, kernel_size, stride, padding, dilation, groups, padding_mode)
             self.weight = None
             self.bias = None
 
@@ -109,6 +142,7 @@ class SafetensorOps(comfy.ops.manual_cast):
             self.scale_grad_by_freq = scale_grad_by_freq
             self.sparse = sparse
             self.weight = None
+            self.bias = None
 
         def forward(self, input, out_dtype=None):
             output_dtype = out_dtype

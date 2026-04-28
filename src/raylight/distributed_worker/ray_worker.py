@@ -31,6 +31,12 @@ from raylight.distributed_worker.parallel_group_manager import (
     initialize_xfuser_parallel,
     requires_xfuser_parallel,
 )
+from raylight.distributed_worker.ray_worker_controlnet import (
+    _prepare_control_models,
+    _remap_conditioning_devices,
+    _restore_controlnet_refs,
+)
+from raylight.distributed_worker.ray_worker_vae import load_vae_model
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 from ray.exceptions import RayActorError
@@ -42,6 +48,8 @@ from ray.exceptions import RayActorError
 
 # If ray actor function being called from outside, ray.get([task in actor task]) will become sync between rank
 # If called from ray actor within. dist.barrier() become the sync.
+
+# PIPEFUSION STUFF IS ONLY TESTING, IT IS BREAKING DOWN ALLLL THE TIME
 
 
 # Comfy cli args, does not get pass through into ray actor
@@ -64,6 +72,7 @@ class RayWorker:
         self.vae_model = None
         self.model_type = None
         self.state_dict = None
+        self.cached_controlnet = None  # (path, controlnet_object) cache
         self.lora_list = None
         self.parallel_dict = parallel_dict
         self.overwrite_cast_dtype = None
@@ -111,6 +120,8 @@ class RayWorker:
 
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
             self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(nccl_world_size,))
+
+        # Just experimenting, user can't trigger this
         elif not self.parallel_dict.get("pipefusion_enabled"):
             print(f"Running Ray in normal seperate sampler with: {self.global_world_size} number of workers")
 
@@ -134,14 +145,16 @@ class RayWorker:
             )
 
     def get_meta_model(self):
-        first_param_device = next(self.model.model.parameters()).device
+        base_model = getattr(self.model, "model", self.model)
+        first_param_device = next(base_model.parameters()).device
         if first_param_device == torch.device("meta"):
             return self.model
         else:
             raise ValueError("Model recieved is not meta, can cause OOM in large model")
 
     def set_meta_model(self, model):
-        first_param_device = next(model.model.parameters()).device
+        base_model = getattr(model, "model", model)
+        first_param_device = next(base_model.parameters()).device
         if first_param_device == torch.device("meta"):
             # Free old model VRAM before replacing — without this, switching
             # workflows leaves the previous FSDP model's DTensor shards on GPU
@@ -186,6 +199,23 @@ class RayWorker:
         self.active_request_key = None
         gc.collect()
         comfy_model_management.soft_empty_cache()
+
+    def _free_cached_aux_models(self):
+        """Free cached ControlNet and VAE GPU memory."""
+        if self.cached_controlnet is not None:
+            _, old_cnet = self.cached_controlnet
+            old_model = getattr(old_cnet, "control_model", None)
+            if old_model is not None:
+                del old_model
+            self.cached_controlnet = None
+
+        if self.vae_model is not None:
+            del self.vae_model
+            self.vae_model = None
+            self._cached_vae_path = None
+
+        torch.cuda.empty_cache()
+        gc.collect()
 
     def check_model_loaded(self, unet_path, model_options):
         """Check if the currently loaded model matches the given parameters.
@@ -270,7 +300,8 @@ class RayWorker:
         if self.lora_list is not None:
             self.load_lora()
 
-        self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+        base_model = getattr(self.model, "model", self.model)
+        self.overwrite_cast_dtype = getattr(base_model, "manual_cast_dtype", None)
         self.active_request_key = active_key
         self.is_model_loaded = True
 
@@ -288,6 +319,35 @@ class RayWorker:
 
     def get_parallel_dict(self):
         return self.parallel_dict
+
+    def get_exec_group_info(self):
+        if self.xfuser_parallel is None:
+            return {
+                "global_rank": self.local_rank,
+                "dp_rank": 0,
+                "dp_degree": 1,
+                "is_group_leader": self.local_rank == 0,
+            }
+
+        is_group_leader = (
+            self.xfuser_parallel.sequence_rank == 0 and self.xfuser_parallel.pipeline_rank == 0 and self.xfuser_parallel.cfg_rank == 0
+        )
+        return {
+            "global_rank": self.xfuser_parallel.global_rank,
+            "dp_rank": self.xfuser_parallel.data_parallel_rank,
+            "dp_degree": self.xfuser_parallel.data_parallel_world_size,
+            "is_group_leader": is_group_leader,
+        }
+
+    def _grouped_sampling_result(self, result):
+        group_info = self.get_exec_group_info()
+        if not group_info["is_group_leader"]:
+            return None
+
+        return {
+            "dp_rank": group_info["dp_rank"],
+            "result": result,
+        }
 
     def set_parallel_dict(self, parallel_dict):
         self.parallel_dict = parallel_dict
@@ -328,7 +388,7 @@ class RayWorker:
                 "PipeFusion topology is now initialized through xFuser, but the Wan execution path does not yet combine PP with USP"
             )
 
-        base_model = self.model.model
+        base_model = getattr(self.model, "model", self.model)
         if not hasattr(base_model, "diffusion_model") or not hasattr(base_model.diffusion_model, "blocks"):
             raise ValueError(f"PipeFusion requires a Wan diffusion model with blocks, got {type(base_model).__name__}")
 
@@ -392,7 +452,8 @@ class RayWorker:
 
             # Fast path: same base model + same LoRA — reuse FSDP-wrapped model
             if self.model is not None and self.active_request_key == active_key:
-                self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+                base_model = getattr(self.model, "model", self.model)
+                self.overwrite_cast_dtype = getattr(base_model, "manual_cast_dtype", None)
                 self.is_model_loaded = True
                 return
 
@@ -402,7 +463,7 @@ class RayWorker:
                     self.model.free_fsdp_vram()
                 except Exception as e:
                     print(f"[Rank {self.local_rank}] free_fsdp_vram failed: {e}")
-
+                self._free_cached_aux_models()
 
             # Monkey patch
             import comfy.model_patcher as model_patcher
@@ -441,7 +502,8 @@ class RayWorker:
             if self.lora_list is not None:
                 self.load_lora()
 
-            self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+            base_model = getattr(self.model, "model", self.model)
+            self.overwrite_cast_dtype = getattr(base_model, "manual_cast_dtype", None)
             self.is_model_loaded = True
             self.active_request_key = active_key
             return
@@ -457,7 +519,8 @@ class RayWorker:
             )
 
             if self.model is not None and self.active_request_key == active_key:
-                self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
+                base_model = getattr(self.model, "model", self.model)
+                self.overwrite_cast_dtype = getattr(base_model, "manual_cast_dtype", None)
                 self.is_model_loaded = True
                 return
 
@@ -469,7 +532,8 @@ class RayWorker:
                 # from ~15Gb to ~23Gb on each GPU.
                 _cached_has_gpu_weights = False
                 try:
-                    _first_p = next(self.cached_base_model.model.parameters(), None)
+                    cached_base_model = getattr(self.cached_base_model, "model", self.cached_base_model)
+                    _first_p = next(cached_base_model.parameters(), None)
                     if _first_p is not None and _first_p.device.type == "cuda":
                         _cached_has_gpu_weights = True
                 except Exception:
@@ -487,6 +551,7 @@ class RayWorker:
 
             self._reset_active_model()
             self._invalidate_non_fsdp_cache()
+            self._free_cached_aux_models()
             if self.parallel_dict.get("pipefusion_enabled"):
                 from raylight.comfy_dist.sd import pipefusion_load_diffusion_model
 
@@ -528,6 +593,7 @@ class RayWorker:
     def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype, use_mmap=None):
         self._reset_active_model()
         self._invalidate_non_fsdp_cache()
+        self._free_cached_aux_models()
         if use_mmap is None:
             use_mmap = self.parallel_dict.get("use_mmap", True)
         if self.parallel_dict["is_fsdp"] is True:
@@ -596,33 +662,29 @@ class RayWorker:
             del lora_model
 
     def kill(self):
+        self._free_cached_aux_models()
         self._invalidate_non_fsdp_cache()
         self.model = None
         dist.destroy_process_group()
         ray.actor.exit_actor()
 
     def ray_vae_loader(self, vae_path):
-        import comfy.sd as comfy_sd
-        import comfy.utils as comfy_utils
+        if self.vae_model is not None and getattr(self, "_cached_vae_path", None) == vae_path:
+            return
 
-        from ..comfy_dist.sd import decode_tiled_1d, decode_tiled_, decode_tiled_3d
+        # Free old VAE before loading new one
+        if self.vae_model is not None:
+            del self.vae_model
+            self.vae_model = None
+            self._cached_vae_path = None
+            torch.cuda.empty_cache()
 
-        state_dict = {}
-        if "pixel_space" in vae_path:
-            state_dict["pixel_space_vae"] = torch.tensor(1.0)
-        else:
-            state_dict = comfy_utils.load_torch_file(vae_path)
-
-        vae_model = comfy_sd.VAE(sd=state_dict)
-        vae_model.throw_exception_if_invalid()
-
-        vae_model.decode_tiled_1d = types.MethodType(decode_tiled_1d, vae_model)
-        vae_model.decode_tiled_ = types.MethodType(decode_tiled_, vae_model)
-        vae_model.decode_tiled_3d = types.MethodType(decode_tiled_3d, vae_model)
+        vae_model = load_vae_model(vae_path)
 
         if self.local_rank == 0:
             print(f"VAE loaded in {self.global_world_size} GPUs")
         self.vae_model = vae_model
+        self._cached_vae_path = vae_path
 
     @patch_ray_tqdm
     def ray_vae_decode(self, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8):
@@ -665,10 +727,15 @@ class RayWorker:
         sampler,
         sigmas,
         latent_image,
+        grouped_output=False,
     ):
         import comfy.model_management as comfy_model_management
         import comfy.sample as comfy_sample
         import comfy.utils as comfy_utils
+
+        # Restore ControlNet refs from local cache (loaded by load_controlnet)
+        _restore_controlnet_refs(positive, self.cached_controlnet, self.vae_model)
+        _restore_controlnet_refs(negative, self.cached_controlnet, self.vae_model)
 
         latent = latent_image
         latent_image = latent["samples"]
@@ -684,6 +751,9 @@ class RayWorker:
         noise_mask = None
         if "noise_mask" in latent:
             noise_mask = latent["noise_mask"]
+
+        _remap_conditioning_devices(positive, negative)
+        _prepare_control_models(positive, negative)
 
         if self.parallel_dict["is_fsdp"] is True:
             self.model.patch_fsdp()
@@ -720,7 +790,65 @@ class RayWorker:
             pass
         comfy_model_management.soft_empty_cache()
         gc.collect()
+        if grouped_output:
+            return self._grouped_sampling_result(out)
         return out
+
+    def load_controlnet(self, controlnet_path):
+        """Load a ControlNet model from disk into the worker.
+
+        Caches the result so subsequent calls with the same path are free.
+        Frees old ControlNet VRAM when the path changes.
+        Returns True on success.
+        """
+        if self.cached_controlnet is not None and self.cached_controlnet[0] == controlnet_path:
+            return True
+
+        # Free old ControlNet VRAM if model changed
+        if self.cached_controlnet is not None:
+            _, old_cnet = self.cached_controlnet
+            old_model = getattr(old_cnet, "control_model", None)
+            if old_model is not None:
+                del old_model
+            self.cached_controlnet = None
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        import comfy.controlnet as comfy_cnet
+
+        cnet = comfy_cnet.load_controlnet(controlnet_path)
+        if cnet is None:
+            print(f"[Rank {self.local_rank}] Failed to load ControlNet: {controlnet_path}")
+            return False
+
+        self.cached_controlnet = (controlnet_path, cnet)
+        if self.local_rank == 0:
+            print(f"[Rank {self.local_rank}] ControlNet loaded and cached from {controlnet_path}")
+        return True
+
+    def free_cached_controlnet(self):
+        """Explicitly free the cached ControlNet (e.g. when switching workflows)."""
+        if self.cached_controlnet is not None:
+            _, old_cnet = self.cached_controlnet
+            old_model = getattr(old_cnet, "control_model", None)
+            if old_model is not None:
+                del old_model
+            self.cached_controlnet = None
+            torch.cuda.empty_cache()
+            gc.collect()
+            if self.local_rank == 0:
+                print(f"[Rank {self.local_rank}] ControlNet cache freed")
+
+    def free_cached_vae(self):
+        """Explicitly free the cached VAE (e.g. when switching workflows)."""
+        if self.vae_model is not None:
+            del self.vae_model
+            self.vae_model = None
+            self._cached_vae_path = None
+            torch.cuda.empty_cache()
+            gc.collect()
+            if self.local_rank == 0:
+                print(f"[Rank {self.local_rank}] VAE cache freed")
 
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
@@ -740,10 +868,15 @@ class RayWorker:
         start_step=None,
         last_step=None,
         force_full_denoise=False,
+        grouped_output=False,
     ):
         import comfy.model_management as comfy_model_management
         import comfy.sample as comfy_sample
         import comfy.utils as comfy_utils
+
+        # Restore ControlNet refs from local cache (loaded by load_controlnet)
+        _restore_controlnet_refs(positive, self.cached_controlnet, self.vae_model)
+        _restore_controlnet_refs(negative, self.cached_controlnet, self.vae_model)
 
         latent_image = latent["samples"]
         latent_image = comfy_sample.fix_empty_latent_channels(self.model, latent_image)
@@ -765,6 +898,9 @@ class RayWorker:
         noise_mask = None
         if "noise_mask" in latent:
             noise_mask = latent["noise_mask"]
+
+        _remap_conditioning_devices(positive, negative)
+        _prepare_control_models(positive, negative)
 
         disable_pbar = comfy_utils.PROGRESS_BAR_ENABLED
         if self.local_rank == 0:
@@ -799,6 +935,8 @@ class RayWorker:
             pass
         comfy_model_management.soft_empty_cache()
         gc.collect()
+        if grouped_output:
+            return self._grouped_sampling_result(out)
         return (out,)
 
 
@@ -854,7 +992,7 @@ def ray_nccl_tester(world_size):
 
 
 def make_ray_actor_fn(world_size, parallel_dict):
-    num_replicas = parallel_dict.get("FSDP_model_replicas", 1)
+    num_replicas = parallel_dict.get("dp_degree", 1)
     shard_size = parallel_dict.get("shard_size", world_size)
 
     def _init_ray_actor(world_size=world_size, parallel_dict=parallel_dict):

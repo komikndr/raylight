@@ -323,6 +323,19 @@ if hasattr(model_base, "CosmosPredict2"):
         model._forward = types.MethodType(usp_mini_train_dit_forward, model)
 
 
+if hasattr(model_base, "Anima"):
+
+    @USPInjectRegistry.register(model_base.Anima)
+    def _inject_anima(model_patcher, base_model, *args):
+        from ..diffusion_models.cosmos.xdit_context_parallel import usp_xfuser_attention_op, usp_mini_train_dit_forward
+
+        model = base_model.diffusion_model
+        for block in model.blocks:
+            block.cross_attn.attn_op = usp_xfuser_attention_op
+            block.self_attn.attn_op = usp_xfuser_attention_op
+        model._forward = types.MethodType(usp_mini_train_dit_forward, model)
+
+
 if hasattr(model_base, "CosmosVideo"):
 
     @USPInjectRegistry.register(model_base.CosmosVideo)
@@ -407,3 +420,16 @@ if hasattr(model_base, "LTXV"):
             block.attn2.forward = types.MethodType(usp_cross_attn_forward, block.attn2)
 
         model._forward = types.MethodType(usp_dit_forward, model)
+
+
+if hasattr(model_base, "ErnieImage"):
+
+    @USPInjectRegistry.register(model_base.ErnieImage)
+    def _inject_ernie_image(model_patcher, base_model, *args):
+        from ..diffusion_models.ernie.xdit_context_parallel import usp_attention_forward, usp_dit_forward, usp_forward
+
+        model = base_model.diffusion_model
+        for block in model.layers:
+            block.self_attention.forward = types.MethodType(usp_attention_forward, block.self_attention)
+        model._forward = types.MethodType(usp_dit_forward, model)
+        model.forward = types.MethodType(usp_forward, model)

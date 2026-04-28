@@ -178,6 +178,9 @@ def usp_dit_forward(
             if i < len(control_i):
                 add = control_i[i]
                 if add is not None:
+                    # Pad + chunk control signal to match USP sequence split
+                    add, _ = pad_to_world_size(add, dim=1)
+                    add = torch.chunk(add, sp_world_size, dim=1)[sp_rank]
                     hidden_states[:, :add.shape[1]] += add
 
     if timestep_zero_index is not None:

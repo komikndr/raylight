@@ -13,6 +13,64 @@ from .ray_patch_decorator import ray_patch_with_return
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise
 
 
+def _normalize_grouped_inputs(values: list, expected_length: int, label: str):
+    if len(values) == expected_length:
+        return values
+    if len(values) == 1:
+        return values * expected_length
+    if len(values) > expected_length:
+        return values[:expected_length]
+    raise ValueError(f"{label} must provide 1 item or at least {expected_length} items, got {len(values)}")
+
+
+def _collect_grouped_results(results: list, expected_length: int, label: str):
+    grouped_results = {}
+    for result in results:
+        if result is None:
+            continue
+        dp_rank = int(result["dp_rank"])
+        if dp_rank in grouped_results:
+            raise RuntimeError(f"{label} produced multiple outputs for dp_rank {dp_rank}")
+        grouped_results[dp_rank] = result["result"]
+
+    missing = [dp_rank for dp_rank in range(expected_length) if dp_rank not in grouped_results]
+    if missing:
+        raise RuntimeError(f"{label} missing outputs for dp_rank {missing}")
+
+    return [grouped_results[dp_rank] for dp_rank in range(expected_length)]
+
+
+def _normalized_degree(value):
+    if value is None:
+        return 1
+    value = int(value)
+    return 1 if value <= 0 else value
+
+
+def _validate_unified_parallel_setup(parallel_dict: dict, group_infos: list[dict], label: str):
+    ulysses_degree = _normalized_degree(parallel_dict.get("ulysses_degree"))
+    ring_degree = _normalized_degree(parallel_dict.get("ring_degree"))
+    cfg_degree = _normalized_degree(parallel_dict.get("cfg_degree"))
+    pp_degree = _normalized_degree(parallel_dict.get("pp_degree"))
+    dp_degree = max(int(info.get("dp_degree", 1)) for info in group_infos) if group_infos else 1
+    effective_parallel_size = ulysses_degree * ring_degree * cfg_degree * pp_degree * dp_degree
+
+    if effective_parallel_size <= 1:
+        raise ValueError(
+            f"{label} requires an active unified parallel topology with effective degree > 1. "
+            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, pp={pp_degree}, dp={dp_degree}. "
+            "Use DPSamplerCustom for pure DP or single-worker execution."
+        )
+
+    if not parallel_dict.get("is_xdit") and not parallel_dict.get("pipefusion_enabled"):
+        raise ValueError(
+            f"{label} requires xFuser unified topology to be active. "
+            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, pp={pp_degree}, dp={dp_degree}, "
+            f"is_xdit={parallel_dict.get('is_xdit')}, pipefusion_enabled={parallel_dict.get('pipefusion_enabled')}. "
+            "DP-only execution should use DPSamplerCustom."
+        )
+
+
 class RayBasicScheduler:
     @classmethod
     def INPUT_TYPES(s):
@@ -279,6 +337,91 @@ class XFuserSamplerCustom:
         return (out, ray_actors)
 
 
+class UnifiedParallelSamplerCustom:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "add_noise": ("BOOLEAN", {"default": True}),
+                "noise_list": ("NOISE",),
+                "cfg": (
+                    "FLOAT",
+                    {
+                        "default": 8.0,
+                        "min": 0.0,
+                        "max": 100.0,
+                        "step": 0.1,
+                        "round": 0.01,
+                    },
+                ),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "sampler": ("SAMPLER",),
+                "sigmas": ("SIGMAS",),
+                "latent_image": ("LATENT",),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT", "RAY_ACTORS")
+    RETURN_NAMES = ("latent", "ray_actors")
+    OUTPUT_IS_LIST = (True, False)
+    INPUT_IS_LIST = True
+
+    FUNCTION = "ray_sample"
+
+    CATEGORY = "Raylight/extra/custom_sampling/samplers"
+
+    def ray_sample(
+        self,
+        ray_actors,
+        add_noise,
+        noise_list,
+        cfg,
+        positive,
+        negative,
+        sampler,
+        sigmas,
+        latent_image,
+    ):
+        ray_actors = ray_actors[0]
+        add_noise = add_noise[0]
+        cfg = cfg[0]
+        sampler = sampler[0]
+        sigmas = sigmas[0]
+
+        gc.collect()
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        gpu_actors = ray_actors["workers"]
+        parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+        group_infos = ray.get([actor.get_exec_group_info.remote() for actor in gpu_actors])
+        _validate_unified_parallel_setup(parallel_dict, group_infos, "Unified Parallel SamplerCustom")
+        dp_degree = int(group_infos[0]["dp_degree"])
+        noise_list = _normalize_grouped_inputs(noise_list, dp_degree, "noise_list")
+        positive = _normalize_grouped_inputs(positive, dp_degree, "positive")
+        negative = _normalize_grouped_inputs(negative, dp_degree, "negative")
+        latent_image = _normalize_grouped_inputs(latent_image, dp_degree, "latent_image")
+
+        futures = [
+            actor.custom_sampler.remote(
+                add_noise,
+                noise_list[group_info["dp_rank"]],
+                cfg,
+                positive[group_info["dp_rank"]],
+                negative[group_info["dp_rank"]],
+                sampler,
+                sigmas,
+                latent_image[group_info["dp_rank"]],
+                grouped_output=True,
+            )
+            for actor, group_info in zip(gpu_actors, group_infos)
+        ]
+        results = ray.get(futures)
+        out = _collect_grouped_results(results, dp_degree, "Unified Parallel SamplerCustom")
+        return (out, ray_actors)
+
+
 class DPSamplerCustom:
     @classmethod
     def INPUT_TYPES(s):
@@ -430,6 +573,7 @@ class RayAddNoise:
 
 NODE_CLASS_MAPPINGS = {
     "XFuserSamplerCustom": XFuserSamplerCustom,
+    "UnifiedParallelSamplerCustom": UnifiedParallelSamplerCustom,
     "DPSamplerCustom": DPSamplerCustom,
     "RayBasicScheduler": RayBasicScheduler,
     "RayBetaSamplingScheduler": RayBetaSamplingScheduler,
@@ -440,5 +584,6 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "XFuserSamplerCustom": "XFuser SamplerCustom",
+    "UnifiedParallelSamplerCustom": "Unified Parallel SamplerCustom (Advance)",
     "DPSamplerCustom": "Data Parallel SamplerCustom",
 }

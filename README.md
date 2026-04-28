@@ -9,11 +9,12 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 <details><summary><strong>Click to expand changelog</strong></summary>
 
+- Experimental : ControlNet support, by avtc
+- Experimental : Unified Parallel sampler, now all parallel type can be use at the same time, USP x DP x CFG x FSDP
+- ERNIE and Anima support
 - GPU Selector: add `GPU_SELECT` input to `RayInitializerAdvanced` to restrict Ray workers to specific GPUs (for example `0,1,2`, or leave empty for all GPUs), credit to [avtc](https://github.com/avtc)
 - Multi-Prompt DP: add `DPConditioningList` node for per-GPU conditioning in Data Parallel mode, credit to avtc
-- GGUF mmap restore: properly restore mmap-backed quant params on unpatch when `use_mmap=True`, inspired by avtc's approach
-- Serialization fix: fix Ray/cloudpickle losing model config from `BASE.__getattr__`, credit to avtc
-- Samplers: pass `ray_actors` through sampler outputs for cleaner workflow chaining
+- `mmap` option for reduce RAM, with GGUF variant implementation by avtc
 - Docs: add developer docs for FSDP, USP, CFG, and expansion modules
 - Now TensorCoreFP8 and NVFP4 works in FSDP2, check on [CK-Distributed](https://github.com/komikndr/comfy-kitchen-distributed)
 - LTX-2 USP
@@ -131,7 +132,7 @@ This mode splits the sequence among GPUs, the full model will be loaded into eac
 Use the XFuser KSampler to increase the Ulysses degree according to the number of your GPUs,
 while keeping the Ring degree at 1 for small systems.
 
-<img width="834" height="437" alt="ValidUSP1" src="https://github.com/user-attachments/assets/c5430825-4db5-4b7d-aa44-b40d0ea0f516" />
+![USP](docs/images/USP.PNG)
 
 ---
 
@@ -144,16 +145,29 @@ By disabling them, it will run in DP mode. Both FSDP and DP modes must have the 
 FSDP will shard the weights, but each GPU will still work independently,
 as the name suggests, Fully Sharded (Weight) Data Parallel.
 
-<img width="892" height="638" alt="ValidDataParallel" src="https://github.com/user-attachments/assets/c9688e6b-7b0e-4b15-8279-2c94da46f78c" />
+
+Data parallel also can use different prompt per generation using Conditional List
+
+![DP](docs/images/DP.PNG)
+![DP_COND_FSDP](docs/images/DP_DPCOND_FSDP.PNG)
 
 ---
 
 **Sequence + FSDP**
 Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser KSampler.
 
-<img width="833" height="427" alt="ValidUSP" src="https://github.com/user-attachments/assets/9c5571ca-ae4c-4deb-97da-c3552ff43cea" />
+![USP_FSDP](docs/images/USP_FSDP.PNG)
 
 ---
+
+**Unified Parallel**
+This is experimental mode where all type of parallel group can work at a sime time, USP, FSDP, DP, CFG.
+
+![UNIFIED](docs/images/UNIFIED.PNG)
+![UNIFIED_DP_COND](docs/images/UNIFIED_DP_COND.PNG)
+
+---
+
 
 ### Side Notes
 - **Rule of thumb**, if you have enough VRAM, just use USP, if not, enable the FSDP, and if that is still not enough,
@@ -170,10 +184,6 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 3. **Ampere**: Tested
 4. **Ada Lovelace**: Tested
 5. **Blackwell**: Tested
-
-**Notes:**
-- Install latest Yunchang libs to enable FLASH_EFFICIENT, copy cmd inside the `requirements_experimental.txt`,
-  don't forget to refresh your nodes and select FLASH_EFFICIENT on XFuser_attention in Ray Init Actor node.
 
 ### AMD
 
@@ -205,7 +215,7 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 | Flux Kontext      | ✅  | ✅   | ❌  |
 | Flux Krea         | ✅  | ✅   | ❌  |
 | Flux 2            | ✅  | ✅   | ❌  |
-| Flux ControlNet   | ❌  | ❌   | ❌  |
+| Flux ControlNet   | ✅  | ✅   | ❌  |
 
 
 **Chroma**
@@ -213,14 +223,14 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 |-------------------|-----|------|-----|
 | Chroma            | ✅  | ✅   | ✅  |
 | Chroma Radiance   | ✅  | ✅   | ✅  |
-| Chroma ControlNet | ❌  | ❌   | ✅  |
+| Chroma ControlNet | ✅† | ✅†  | ✅  |
 
 
 **Qwen**
 | Model             | USP | FSDP | CFG |
 |-------------------|-----|------|-----|
 | Qwen Image/Edit   | ✅  | ✅   | ✅  |
-| ControlNet        | ❌  | ❌   | ✅  |
+| ControlNet        | ✅  | ✅   | ✅  |
 
 
 **Z Image, Lumina 2**
@@ -235,7 +245,7 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 |-------------------|-----|------|-----|
 | Hunyuan Video     | ✅  | ✅   | ❌  |
 | Hunyuan 1.5       | ✅  | ✅   | ❌  |
-| ControlNet        | ❌  | ❌   | ❌  |
+| ControlNet        | ✅† | ✅†  | ❌  |
 
 
 **Kandinsky5**
@@ -251,6 +261,19 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 | LTX-2 T/I/A/ 2 V/VA| ✅  | ❌   | ❌  |
 
 
+**ERNIE-Image**
+| Model              | USP | FSDP | CFG |
+|--------------------|-----|------|-----|
+| Ernie Image        | ✅  | ✅   | ✅  |
+| Ernie Image Turbo  | ✅  | ✅   | ✅  |
+
+
+**Anima**
+| Model              | USP | FSDP | CFG |
+|--------------------|-----|------|-----|
+| Anima Preview3     | ✅  | ✅   | ❌  |
+
+
 **UNet**
 | Model  | USP | FSDP | CFG |
 |--------|-----|------|-----|
@@ -260,6 +283,7 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 **Legend:**
 - ✅ = Supported
 - ❌ = Not currently supported.
+- ✅† = Code-ready, awaiting ControlNet model weights.
 - T = Text
 - I = Image
 - A = Audio
@@ -269,6 +293,11 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 - Non standard Wan variant (Phantom, S2V, etc...) is not tested
 - CFG parallel for Flux, Hunyuan, is technically supported by Raylight,
   but since these models do not support conditional batches (CFG = 1), enabling it has no effect.
+- Chroma and Hunyuan Video ControlNet support is implemented in the USP/FSDP code paths
+  but no ControlNet model weights are currently available in ComfyUI to test with.
+- Only one ControlNet model per workflow is supported. To apply the same model with
+  different images or strengths, use multiple Apply ControlNet (Ray) nodes connected
+  to a single Load ControlNet (Ray) node.
 
 ## Attention
 

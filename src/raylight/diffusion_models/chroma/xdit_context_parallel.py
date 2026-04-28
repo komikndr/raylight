@@ -163,6 +163,9 @@ def usp_dit_forward(
                 if i < len(control_i):
                     add = control_i[i]
                     if add is not None:
+                        # Pad + chunk control signal to match USP sequence split
+                        add, _ = pad_to_world_size(add, dim=1)
+                        add = torch.chunk(add, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
                         img += add
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
@@ -203,7 +206,15 @@ def usp_dit_forward(
                 if i < len(control_o):
                     add = control_o[i]
                     if add is not None:
-                        img[:, txt.shape[1]:, ...] += add
+                        # Embed control signal in full concatenated [txt, img] space, then pad+chunk
+                        sp_ws = get_sequence_parallel_world_size()
+                        sp_r = get_sequence_parallel_rank()
+                        txt_len = txt.shape[1]
+                        full_add = torch.zeros(img.shape[0], img_orig_size, add.shape[-1],
+                                               device=add.device, dtype=add.dtype)
+                        full_add[:, txt_len:txt_len + add.shape[1]] = add
+                        full_add, _ = pad_to_world_size(full_add, dim=1)
+                        img += torch.chunk(full_add, sp_ws, dim=1)[sp_r]
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = get_sp_group().all_gather(img.contiguous(), dim=1)
