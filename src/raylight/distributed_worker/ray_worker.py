@@ -82,6 +82,7 @@ class RayWorker:
 
         self.local_rank = local_rank
         self.global_world_size = self.parallel_dict["global_world_size"]
+        self.group_id = self.parallel_dict.get("group_id", 0)
 
         self.device_id = device_id
         self.parallel_dict = parallel_dict
@@ -99,16 +100,26 @@ class RayWorker:
         os.environ["NCCL_DEBUG"] = "WARN"
         os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
 
+        # global_world_size is already set to shard_size (GPUs per replica) by spawn_actor
+        # when FSDP is enabled, or total GPU count when FSDP is disabled.
+        nccl_world_size = self.global_world_size
+        nccl_rank = local_rank
+
+        # Each group gets its own port for NCCL isolation
+        master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+        base_port = int(os.environ.get("MASTER_PORT", "29500"))
+        group_port = base_port + self.group_id
+
         dist.init_process_group(
             "nccl",
-            rank=local_rank,
-            world_size=self.global_world_size,
+            rank=nccl_rank,
+            world_size=nccl_world_size,
             timeout=timedelta(minutes=1),
-            # device_id=self.device
+            init_method=f"tcp://{master_addr}:{group_port}",
         )
 
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
-            self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
+            self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(nccl_world_size,))
 
         # Just experimenting, user can't trigger this
         elif not self.parallel_dict.get("pipefusion_enabled"):
@@ -145,11 +156,49 @@ class RayWorker:
         base_model = getattr(model, "model", model)
         first_param_device = next(base_model.parameters()).device
         if first_param_device == torch.device("meta"):
+            # Free old model VRAM before replacing — without this, switching
+            # workflows leaves the previous FSDP model's DTensor shards on GPU
+            # and the new model's patch_fsdp() OOMs during set_model_state_dict.
+            self._free_current_model()
             self.state_dict = None
             self.model = model
             self.model.config_fsdp(self.local_rank, self.device_mesh)
         else:
             raise ValueError("Model being set is not meta, can cause OOM in large model")
+
+    def _free_current_model(self):
+        """Eagerly free the current model's GPU storage.
+
+        Handles both FSDP models (DTensor shards) and non-FSDP models.
+        Must be called before dropping the model reference so VRAM is
+        released deterministically without relying on __del__ / gc.
+        """
+        import comfy.model_management as comfy_model_management
+
+        if self.model is None:
+            return
+
+        if hasattr(self.model, "free_fsdp_vram"):
+            try:
+                self.model.free_fsdp_vram()
+            except Exception as e:
+                print(f"[Rank {self.local_rank}] free_fsdp_vram failed in _free_current_model: {e}")
+        else:
+            try:
+                self.model.unpatch_model(device_to=None)
+            except Exception as e:
+                print(f"[Rank {self.local_rank}] model.unpatch_model() failed in _free_current_model: {e}")
+
+        try:
+            self.model.cleanup()
+        except Exception as e:
+            print(f"[Rank {self.local_rank}] model.cleanup() failed in _free_current_model: {e}")
+
+        self.model = None
+        self.overwrite_cast_dtype = None
+        self.active_request_key = None
+        gc.collect()
+        comfy_model_management.soft_empty_cache()
 
     def _free_cached_aux_models(self):
         """Free cached ControlNet and VAE GPU memory."""
@@ -167,6 +216,15 @@ class RayWorker:
 
         torch.cuda.empty_cache()
         gc.collect()
+
+    def check_model_loaded(self, unet_path, model_options):
+        """Check if the currently loaded model matches the given parameters.
+
+        Used for reuse detection: when MCP or a different workflow runs with the
+        same model + lora + options, we can skip the full reload.
+        """
+        active_key = self._active_model_key(unet_path, model_options)
+        return self.model is not None and self.active_request_key == active_key
 
     def _normalize_model_options(self, model_options):
         if not model_options:
@@ -934,19 +992,42 @@ def ray_nccl_tester(world_size):
 
 
 def make_ray_actor_fn(world_size, parallel_dict):
+    num_replicas = parallel_dict.get("dp_degree", 1)
+    shard_size = parallel_dict.get("shard_size", world_size)
+
     def _init_ray_actor(world_size=world_size, parallel_dict=parallel_dict):
         ray_actors = dict()
         gpu_actor = ray.remote(RayWorker)
         gpu_actors = []
 
-        for local_rank in range(world_size):
-            gpu_actors.append(
-                gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
-                    local_rank=local_rank,
-                    device_id=0,
-                    parallel_dict=parallel_dict,
+        if num_replicas <= 1:
+            # Single replica — all GPUs in one group
+            for local_rank in range(world_size):
+                gpu_actors.append(
+                    gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
+                        local_rank=local_rank,
+                        device_id=0,
+                        parallel_dict=parallel_dict,
+                    )
                 )
-            )
+        else:
+            # Multiple replicas — each replica gets its own NCCL group
+            for group_id in range(num_replicas):
+                group_parallel_dict = dict(parallel_dict)
+                group_parallel_dict["group_id"] = group_id
+
+                for local_rank in range(shard_size):
+                    gpu_actors.append(
+                        gpu_actor.options(
+                            num_gpus=1,
+                            name=f"RayWorker:{group_id}_{local_rank}"
+                        ).remote(
+                            local_rank=local_rank,
+                            device_id=0,
+                            parallel_dict=group_parallel_dict,
+                        )
+                    )
+
         ray_actors["workers"] = gpu_actors
 
         for actor in ray_actors["workers"]:

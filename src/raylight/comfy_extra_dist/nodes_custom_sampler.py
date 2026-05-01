@@ -478,12 +478,21 @@ class DPSamplerCustom:
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
         gpu_actors = ray_actors["workers"]
+        parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+        num_gpus = len(gpu_actors)
 
+        # Auto-replicate: if fewer items than GPUs, fill remaining
         if len(positive) == 1:
-            positive = positive * len(gpu_actors)
+            positive = positive * num_gpus
         if len(negative) == 1:
-            negative = negative * len(gpu_actors)
+            negative = negative * num_gpus
+        if len(noise_list) != num_gpus:
+            if len(noise_list) >= num_gpus:
+                noise_list = noise_list[:num_gpus]
+            else:
+                noise_list = [noise_list[0]] * num_gpus
 
+        # Each GPU gets its own noise/conditioning — decoupled from FSDP sharding
         futures = [
             actor.custom_sampler.remote(
                 add_noise,
