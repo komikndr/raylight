@@ -472,18 +472,28 @@ class DPSamplerCustom:
         cfg = cfg[0]
         sampler = sampler[0]
         sigmas = sigmas[0]
-        latent_image = latent_image[0]
 
         gc.collect()
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
         gpu_actors = ray_actors["workers"]
 
+        num_gpus = len(gpu_actors)
+        # Replicate last item to fill remaining slots, or truncate if too many
+        if len(latent_image) < num_gpus:
+            latent_image = latent_image + [latent_image[-1]] * (num_gpus - len(latent_image))
+        elif len(latent_image) > num_gpus:
+            latent_image = latent_image[:num_gpus]
         if len(positive) == 1:
             positive = positive * len(gpu_actors)
         if len(negative) == 1:
-            negative = negative * len(gpu_actors)
+            negative = negative * num_gpus
+        if len(noise_list) < num_gpus:
+            noise_list = noise_list + [noise_list[-1]] * (num_gpus - len(noise_list))
+        elif len(noise_list) > num_gpus:
+            noise_list = noise_list[:num_gpus]
 
+        # Each GPU gets its own noise/conditioning/latent — decoupled from FSDP sharding
         futures = [
             actor.custom_sampler.remote(
                 add_noise,
@@ -493,7 +503,7 @@ class DPSamplerCustom:
                 negative[i],
                 sampler,
                 sigmas,
-                latent_image,
+                latent_image[i],
             )
             for i, actor in enumerate(gpu_actors)
         ]
