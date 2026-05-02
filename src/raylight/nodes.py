@@ -73,7 +73,7 @@ def _resolve_module_dir(module):
 
 
 def _resolve_repo_root():
-    current = Path(__file__).resolve()
+    current = Path(folder_paths.__file__).resolve()
     for parent in current.parents:
         if (parent / "main.py").exists() and (parent / "execution.py").exists():
             return parent
