@@ -477,9 +477,6 @@ class DPSamplerCustom:
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
         gpu_actors = ray_actors["workers"]
-        parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
-        num_gpus = len(gpu_actors)
-
         num_gpus = len(gpu_actors)
         # Replicate last item to fill remaining slots, or truncate if too many
         if len(latent_image) < num_gpus:

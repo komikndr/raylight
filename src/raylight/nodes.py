@@ -481,7 +481,6 @@ class RayInitializer:
             self.parallel_dict["is_fsdp"] = True
             final_dp = self.parallel_dict["dp_degree"]
             self.parallel_dict["shard_size"] = world_size // final_dp
-            self.parallel_dict["global_world_size"] = world_size // final_dp
 
         if ray_dashboard_address != "None":
             dashboard_host, dashboard_port = ray_dashboard_address.rsplit(":", 1)

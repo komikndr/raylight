@@ -82,6 +82,7 @@ class RayWorker:
 
         self.local_rank = local_rank
         self.global_world_size = self.parallel_dict["global_world_size"]
+        self.shard_size = self.parallel_dict["shard_size"]
         self.group_id = self.parallel_dict.get("group_id", 0)
 
         self.device_id = device_id
@@ -100,9 +101,7 @@ class RayWorker:
         os.environ["NCCL_DEBUG"] = "WARN"
         os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
 
-        # global_world_size is already set to shard_size (GPUs per replica) by spawn_actor
-        # when FSDP is enabled, or total GPU count when FSDP is disabled.
-        nccl_world_size = self.global_world_size
+        nccl_world_size = self.shard_size
         nccl_rank = local_rank
 
         # Each group gets its own port for NCCL isolation
@@ -128,7 +127,7 @@ class RayWorker:
         if requires_xfuser_parallel(self.parallel_dict):
             self.xfuser_parallel = initialize_xfuser_parallel(
                 local_rank=self.local_rank,
-                world_size=self.global_world_size,
+                world_size=self.shard_size,
                 parallel_dict=self.parallel_dict,
             )
             if self.parallel_dict["is_xdit"]:
