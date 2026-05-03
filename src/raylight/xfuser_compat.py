@@ -270,10 +270,15 @@ def _install_long_ctx_attention(xfuser_root: Path) -> None:
         hybrid_root / "attn_layer.py",
     )
 
+    try:
+        from yunchang.kernels import AttnType as _RealAttnType
+    except ImportError:
+        _RealAttnType = attn_layer.AttnType
+
     hybrid_pkg = sys.modules["xfuser.core.long_ctx_attention.hybrid"]
     hybrid_pkg.xFuserLongContextAttention = attn_layer.xFuserLongContextAttention
     hybrid_pkg.xFuserSanaLinearLongContextAttention = attn_layer.xFuserSanaLinearLongContextAttention
-    hybrid_pkg.AttnType = attn_layer.AttnType
+    hybrid_pkg.AttnType = _RealAttnType
     hybrid_pkg.__all__ = [
         "xFuserLongContextAttention",
         "xFuserSanaLinearLongContextAttention",
@@ -283,13 +288,30 @@ def _install_long_ctx_attention(xfuser_root: Path) -> None:
     long_ctx_pkg = sys.modules["xfuser.core.long_ctx_attention"]
     long_ctx_pkg.xFuserLongContextAttention = attn_layer.xFuserLongContextAttention
     long_ctx_pkg.xFuserSanaLinearLongContextAttention = attn_layer.xFuserSanaLinearLongContextAttention
-    long_ctx_pkg.AttnType = attn_layer.AttnType
+    long_ctx_pkg.AttnType = _RealAttnType
     long_ctx_pkg.__all__ = hybrid_pkg.__all__
 
-    ring_mod = _load_module(
-        "xfuser.core.long_ctx_attention.ring.ring_flash_attn",
-        ring_root / "ring_flash_attn.py",
-    )
+    _torch_cuda = None
+    _orig_cuda_available = None
+    try:
+        import torch.cuda as _torch_cuda
+        _orig_cuda_available = _torch_cuda.is_available
+        _torch_cuda.is_available = lambda: True
+
+        import yunchang.kernels as _yunchang_kernels
+        if getattr(_yunchang_kernels, "AttnType", None) is None:
+            _yunchang_kernels.AttnType = _RealAttnType
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        ring_mod = _load_module(
+            "xfuser.core.long_ctx_attention.ring.ring_flash_attn",
+            ring_root / "ring_flash_attn.py",
+        )
+    finally:
+        if _torch_cuda is not None and _orig_cuda_available is not None:
+            _torch_cuda.is_available = _orig_cuda_available
     ring_pkg = sys.modules["xfuser.core.long_ctx_attention.ring"]
     ring_pkg.xdit_ring_flash_attn_func = ring_mod.xdit_ring_flash_attn_func
     ring_pkg.xdit_sana_ring_flash_attn_func = ring_mod.xdit_sana_ring_flash_attn_func

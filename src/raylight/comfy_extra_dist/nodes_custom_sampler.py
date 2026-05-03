@@ -472,7 +472,6 @@ class DPSamplerCustom:
         cfg = cfg[0]
         sampler = sampler[0]
         sigmas = sigmas[0]
-        latent_image = latent_image[0]
 
         gc.collect()
         comfy.model_management.unload_all_models()
@@ -481,18 +480,22 @@ class DPSamplerCustom:
         parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
         num_gpus = len(gpu_actors)
 
-        # Auto-replicate: if fewer items than GPUs, fill remaining
+        num_gpus = len(gpu_actors)
+        # Replicate last item to fill remaining slots, or truncate if too many
+        if len(latent_image) < num_gpus:
+            latent_image = latent_image + [latent_image[-1]] * (num_gpus - len(latent_image))
+        elif len(latent_image) > num_gpus:
+            latent_image = latent_image[:num_gpus]
         if len(positive) == 1:
             positive = positive * num_gpus
         if len(negative) == 1:
             negative = negative * num_gpus
-        if len(noise_list) != num_gpus:
-            if len(noise_list) >= num_gpus:
-                noise_list = noise_list[:num_gpus]
-            else:
-                noise_list = [noise_list[0]] * num_gpus
+        if len(noise_list) < num_gpus:
+            noise_list = noise_list + [noise_list[-1]] * (num_gpus - len(noise_list))
+        elif len(noise_list) > num_gpus:
+            noise_list = noise_list[:num_gpus]
 
-        # Each GPU gets its own noise/conditioning — decoupled from FSDP sharding
+        # Each GPU gets its own noise/conditioning/latent — decoupled from FSDP sharding
         futures = [
             actor.custom_sampler.remote(
                 add_noise,
@@ -502,7 +505,7 @@ class DPSamplerCustom:
                 negative[i],
                 sampler,
                 sigmas,
-                latent_image,
+                latent_image[i],
             )
             for i, actor in enumerate(gpu_actors)
         ]
