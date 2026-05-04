@@ -477,7 +477,6 @@ class DPSamplerCustom:
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
         gpu_actors = ray_actors["workers"]
-
         num_gpus = len(gpu_actors)
         # Replicate last item to fill remaining slots, or truncate if too many
         if len(latent_image) < num_gpus:
@@ -485,7 +484,7 @@ class DPSamplerCustom:
         elif len(latent_image) > num_gpus:
             latent_image = latent_image[:num_gpus]
         if len(positive) == 1:
-            positive = positive * len(gpu_actors)
+            positive = positive * num_gpus
         if len(negative) == 1:
             negative = negative * num_gpus
         if len(noise_list) < num_gpus:
