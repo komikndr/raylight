@@ -175,6 +175,36 @@ if hasattr(model_base, "WAN21_FlowRVS"):
         model.forward_orig = types.MethodType(usp_dit_forward, model)
 
 
+if hasattr(model_base, "WAN21_CausalAR"):
+
+    @USPInjectRegistry.register(model_base.WAN21_CausalAR)
+    def _inject_wan21_causal_ar(model_patcher, base_model, *args):
+        from comfy.ldm.wan.model import WanI2VCrossAttention, WanT2VCrossAttention
+        from ..diffusion_models.wan.xdit_context_parallel import (
+            usp_causal_ar_block_forward,
+            usp_causal_ar_forward,
+            usp_causal_ar_forward_block,
+            usp_causal_ar_self_attn_forward,
+            usp_dit_forward,
+            usp_i2v_cross_attn_forward,
+            usp_t2v_cross_attn_forward,
+        )
+
+        model = base_model.diffusion_model
+        for block in model.blocks:
+            block.forward = types.MethodType(usp_causal_ar_block_forward, block)
+            block.self_attn.forward = types.MethodType(usp_causal_ar_self_attn_forward, block.self_attn)
+            if not hasattr(block, "cross_attn"):
+                continue
+            if isinstance(block.cross_attn, WanT2VCrossAttention):
+                block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
+            elif isinstance(block.cross_attn, WanI2VCrossAttention):
+                block.cross_attn.forward = types.MethodType(usp_i2v_cross_attn_forward, block.cross_attn)
+        model.forward_orig = types.MethodType(usp_dit_forward, model)
+        model.forward = types.MethodType(usp_causal_ar_forward, model)
+        model.forward_block = types.MethodType(usp_causal_ar_forward_block, model)
+
+
 if hasattr(model_base, "WAN21"):
 
     @USPInjectRegistry.register(model_base.WAN21)

@@ -22,6 +22,24 @@ def _pad_and_split_for_sp(tensor, dim=1):
     return tensor, orig_size
 
 
+def _sp_chunk_len(size):
+    return (size + get_sequence_parallel_world_size() - 1) // get_sequence_parallel_world_size()
+
+
+def _sync_ar_kv_cache_for_sampler(cache):
+    if cache is None or "sp_full_end" not in cache:
+        return
+
+    full_end = cache["end"]
+    sp_full_end = cache["sp_full_end"]
+    if full_end >= sp_full_end:
+        return
+
+    full_delta = sp_full_end - full_end
+    cache["sp_local_end"] = max(0, cache["sp_local_end"] - _sp_chunk_len(full_delta))
+    cache["sp_full_end"] = full_end
+
+
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0
@@ -31,6 +49,219 @@ def sinusoidal_embedding_1d(dim, position):
     # calculation
     sinusoid = torch.outer(position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
+    return x
+
+
+def usp_causal_ar_forward(
+    self,
+    x,
+    timestep,
+    context,
+    clip_fea=None,
+    time_dim_concat=None,
+    transformer_options={},
+    **kwargs,
+):
+    ar_state = transformer_options.get("ar_state")
+    if ar_state is None:
+        from comfy.ldm.wan.model import WanModel
+
+        return WanModel.forward(
+            self,
+            x,
+            timestep,
+            context,
+            clip_fea=clip_fea,
+            time_dim_concat=time_dim_concat,
+            transformer_options=transformer_options,
+            **kwargs,
+        )
+
+    bs = x.shape[0]
+    block_frames = x.shape[2]
+    t_per_frame = timestep.unsqueeze(1).expand(bs, block_frames)
+
+    return self.forward_block(
+        x=x,
+        timestep=t_per_frame,
+        context=context,
+        start_frame=ar_state["start_frame"],
+        kv_caches=ar_state["kv_caches"],
+        crossattn_caches=ar_state["crossattn_caches"],
+        clip_fea=clip_fea,
+        transformer_options=transformer_options,
+    )
+
+
+def usp_causal_ar_forward_block(
+    self,
+    x,
+    timestep,
+    context,
+    start_frame,
+    kv_caches,
+    crossattn_caches,
+    clip_fea=None,
+    transformer_options={},
+):
+    x = comfy.ldm.common_dit.pad_to_patch_size(x, self.patch_size)
+    bs, c, t, h, w = x.shape
+
+    x = self.patch_embedding(x.float()).to(x.dtype)
+    grid_sizes = x.shape[2:]
+    transformer_options["grid_sizes"] = grid_sizes
+    x = x.flatten(2).transpose(1, 2)
+    orig_size = x.shape[1]
+    transformer_options["usp_ar_block_seq_len"] = orig_size
+
+    e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()).to(dtype=x.dtype))
+    e = e.reshape(timestep.shape[0], -1, e.shape[-1])
+    e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+
+    context = self.text_embedding(context)
+
+    context_img_len = None
+    if clip_fea is not None and self.img_emb is not None:
+        context_clip = self.img_emb(clip_fea)
+        context = torch.concat([context_clip, context], dim=1)
+        context_img_len = clip_fea.shape[-2]
+
+    freqs = self.rope_encode(t, h, w, t_start=start_frame, device=x.device, dtype=x.dtype)
+
+    x, _ = _pad_and_split_for_sp(x, dim=1)
+    freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
+
+    patches_replace = transformer_options.get("patches_replace", {})
+    blocks_replace = patches_replace.get("dit", {})
+    transformer_options["total_blocks"] = len(self.blocks)
+    transformer_options["block_type"] = "double"
+    for i, block in enumerate(self.blocks):
+        transformer_options["block_index"] = i
+        if ("double_block", i) in blocks_replace:
+
+            def block_wrap(args):
+                out = {}
+                out["img"] = block(
+                    args["img"],
+                    context=args["txt"],
+                    e=args["vec"],
+                    freqs=args["pe"],
+                    context_img_len=context_img_len,
+                    kv_cache=kv_caches[i],
+                    crossattn_cache=crossattn_caches[i],
+                    transformer_options=args["transformer_options"],
+                )
+                return out
+
+            out = blocks_replace[("double_block", i)](
+                {"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options},
+                {"original_block": block_wrap},
+            )
+            x = out["img"]
+        else:
+            x = block(
+                x,
+                e=e0,
+                freqs=freqs,
+                context=context,
+                context_img_len=context_img_len,
+                kv_cache=kv_caches[i],
+                crossattn_cache=crossattn_caches[i],
+                transformer_options=transformer_options,
+            )
+
+    x = get_sp_group().all_gather(x.contiguous(), dim=1)
+    x = x[:, :orig_size, :]
+
+    x = self.head(x, e)
+    x = self.unpatchify(x, grid_sizes)
+    return x[:, :, :t, :h, :w]
+
+
+def usp_causal_ar_self_attn_forward(self, x, freqs, kv_cache=None, transformer_options={}):
+    b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+
+    q = apply_rope1(self.norm_q(self.q(x)).view(b, s, n, d), freqs)
+    k = apply_rope1(self.norm_k(self.k(x)).view(b, s, n, d), freqs)
+    v = self.v(x).view(b, s, n, d)
+
+    if kv_cache is None:
+        x = xfuser_optimized_attention(
+            q.view(b, s, n * d),
+            k.view(b, s, n * d),
+            v.view(b, s, n * d),
+            heads=self.num_heads,
+        )
+        return self.o(x.flatten(2))
+
+    _sync_ar_kv_cache_for_sampler(kv_cache)
+
+    full_end = kv_cache["end"]
+    local_end = kv_cache.get("sp_local_end", _sp_chunk_len(full_end))
+    full_block_seq_len = transformer_options["usp_ar_block_seq_len"]
+    local_new_end = local_end + s
+    full_new_end = full_end + full_block_seq_len
+
+    kv_cache["k"][:, local_end:local_new_end] = k
+    kv_cache["v"][:, local_end:local_new_end] = v
+    kv_cache["sp_local_end"] = local_new_end
+    kv_cache["sp_full_end"] = full_new_end
+    kv_cache["end"] = full_new_end
+
+    x = xfuser_optimized_attention(
+        q.view(b, s, n * d),
+        kv_cache["k"][:, :local_new_end].view(b, local_new_end, n * d),
+        kv_cache["v"][:, :local_new_end].view(b, local_new_end, n * d),
+        heads=self.num_heads,
+    )
+    return self.o(x.flatten(2))
+
+
+def usp_causal_ar_block_forward(
+    self,
+    x,
+    e,
+    freqs,
+    context,
+    context_img_len=257,
+    kv_cache=None,
+    crossattn_cache=None,
+    transformer_options={},
+):
+    from comfy.ldm.wan.model import repeat_e
+
+    if e.ndim < 4:
+        e = (comfy.model_management.cast_to(self.modulation, dtype=x.dtype, device=x.device) + e).chunk(6, dim=1)
+    else:
+        e = (comfy.model_management.cast_to(self.modulation, dtype=x.dtype, device=x.device).unsqueeze(0) + e).unbind(2)
+
+    y = self.self_attn(
+        torch.addcmul(repeat_e(e[0], x), self.norm1(x), 1 + repeat_e(e[1], x)),
+        freqs,
+        kv_cache=kv_cache,
+        transformer_options=transformer_options,
+    )
+    x = torch.addcmul(x, y, repeat_e(e[2], x))
+    del y
+
+    if crossattn_cache is not None and crossattn_cache.get("is_init"):
+        q = self.cross_attn.norm_q(self.cross_attn.q(self.norm3(x)))
+        x_ca = xfuser_optimized_attention(q, crossattn_cache["k"], crossattn_cache["v"], heads=self.num_heads)
+        x = x + self.cross_attn.o(x_ca.flatten(2))
+    else:
+        x = x + self.cross_attn(
+            self.norm3(x),
+            context,
+            context_img_len=context_img_len,
+            transformer_options=transformer_options,
+        )
+        if crossattn_cache is not None:
+            crossattn_cache["k"] = self.cross_attn.norm_k(self.cross_attn.k(context))
+            crossattn_cache["v"] = self.cross_attn.v(context)
+            crossattn_cache["is_init"] = True
+
+    y = self.ffn(torch.addcmul(repeat_e(e[3], x), self.norm2(x), 1 + repeat_e(e[4], x)))
+    x = torch.addcmul(x, y, repeat_e(e[5], x))
     return x
 
 
