@@ -205,20 +205,28 @@ if hasattr(model_base, "WAN21_CausalAR"):
         model.forward_block = types.MethodType(usp_causal_ar_forward_block, model)
 
 
-if hasattr(model_base, "WAN21"):
+if hasattr(model_base, "WAN22_WanDancer"):
 
-    @USPInjectRegistry.register(model_base.WAN21)
-    def _inject_wan21(model_patcher, base_model, *args):
+    @USPInjectRegistry.register(model_base.WAN22_WanDancer)
+    def _inject_wan22_wandancer(model_patcher, base_model, *args):
         from ..diffusion_models.wan.xdit_context_parallel import (
+            usp_wandancer_dit_forward,
+            usp_music_self_attn_forward,
             usp_self_attn_forward,
-            usp_dit_forward,
             usp_i2v_cross_attn_forward,
             usp_t2v_cross_attn_forward,
         )
 
         model = base_model.diffusion_model
-        _patch_wan_attention_blocks(model, usp_self_attn_forward, usp_t2v_cross_attn_forward, usp_i2v_cross_attn_forward)
-        model.forward_orig = types.MethodType(usp_dit_forward, model)
+        _patch_wan_attention_blocks(
+            model,
+            usp_self_attn_forward,
+            usp_t2v_cross_attn_forward,
+            usp_i2v_cross_attn_forward,
+        )
+        for layer in model.music_encoder:
+            layer.self_attn.forward = types.MethodType(usp_music_self_attn_forward, layer.self_attn)
+        model.forward_orig = types.MethodType(usp_wandancer_dit_forward, model)
 
 
 if hasattr(model_base, "WAN21_SCAIL"):
@@ -241,6 +249,21 @@ if hasattr(model_base, "WAN21_SCAIL"):
         )
         model.forward_orig = types.MethodType(usp_scail_dit_forward, model)
 
+
+if hasattr(model_base, "WAN21"):
+
+    @USPInjectRegistry.register(model_base.WAN21)
+    def _inject_wan21(model_patcher, base_model, *args):
+        from ..diffusion_models.wan.xdit_context_parallel import (
+            usp_self_attn_forward,
+            usp_dit_forward,
+            usp_i2v_cross_attn_forward,
+            usp_t2v_cross_attn_forward,
+        )
+
+        model = base_model.diffusion_model
+        _patch_wan_attention_blocks(model, usp_self_attn_forward, usp_t2v_cross_attn_forward, usp_i2v_cross_attn_forward)
+        model.forward_orig = types.MethodType(usp_dit_forward, model)
 
 if hasattr(model_base, "WanMultiTalk"):
 

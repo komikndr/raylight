@@ -281,13 +281,6 @@ def usp_dit_forward(
     grid_sizes = x.shape[2:]
     transformer_options["grid_sizes"] = grid_sizes
     x = x.flatten(2).transpose(1, 2)
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
-    sp_world = get_sequence_parallel_world_size()
-    sp_rank = get_sequence_parallel_rank()
-
-    x, orig_size = _pad_and_split_for_sp(x, dim=1)
-    freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     # time embeddings
     e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype=x[0].dtype))
@@ -295,11 +288,21 @@ def usp_dit_forward(
     e0 = self.time_projection(e).unflatten(2, (6, self.dim))
 
     full_ref = None
+    full_ref_seq_len = 0
     if self.ref_conv is not None:
         full_ref = kwargs.get("reference_latent", None)
         if full_ref is not None:
             full_ref = self.ref_conv(full_ref).flatten(2).transpose(1, 2)
+            full_ref_seq_len = full_ref.shape[1]
             x = torch.concat((full_ref, x), dim=1)
+
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    sp_world = get_sequence_parallel_world_size()
+    sp_rank = get_sequence_parallel_rank()
+
+    x, orig_size = _pad_and_split_for_sp(x, dim=1)
+    freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     # context
     context = self.text_embedding(context)
@@ -347,8 +350,8 @@ def usp_dit_forward(
     torch._dynamo.graph_break()
 
     x = self.head(x, e)
-    if full_ref is not None:
-        x = x[:, full_ref.shape[1] :]
+    if full_ref_seq_len > 0:
+        x = x[:, full_ref_seq_len:]
 
     # unpatchify
     x = self.unpatchify(x, grid_sizes)
@@ -743,6 +746,162 @@ def usp_s2v_dit_forward(
     return x
 
 
+def usp_music_self_attn_forward(self, x, freqs):
+    b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+
+    q = self.q_proj(x).view(b, s, n, d)
+    q = apply_rope1(q, freqs)
+
+    k = self.k_proj(x).view(b, s, n, d)
+    k = apply_rope1(k, freqs)
+
+    x = xfuser_optimized_attention(
+        q.view(b, s, n * d),
+        k.view(b, s, n * d),
+        self.v_proj(x).view(b, s, n * d),
+        heads=self.num_heads,
+    )
+
+    return self.out_proj(x)
+
+
+def usp_wandancer_dit_forward(
+    self,
+    x,
+    t,
+    context,
+    clip_fea=None,
+    clip_fea_ref=None,
+    freqs=None,
+    audio_embed=None,
+    fps=30,
+    audio_inject_scale=1.0,
+    transformer_options={},
+    *args,
+    **kwargs,
+):
+    if int(fps + 0.5) != 30:
+        x = self.patch_embedding_global(x.float()).to(x.dtype)
+    else:
+        x = self.patch_embedding(x.float()).to(x.dtype)
+
+    grid_sizes = x.shape[2:]
+    latent_frames = grid_sizes[0]
+    transformer_options["grid_sizes"] = grid_sizes
+    x = x.flatten(2).transpose(1, 2)
+    seq_len = x.size(1)
+
+    e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype=x[0].dtype))
+    e = e.reshape(t.shape[0], -1, e.shape[-1])
+    e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+
+    full_ref = None
+    full_ref_seq_len = 0
+    if self.ref_conv is not None:
+        full_ref = kwargs.get("reference_latent", None)
+        if full_ref is not None:
+            full_ref = self.ref_conv(full_ref).flatten(2).transpose(1, 2)
+            full_ref_seq_len = full_ref.shape[1]
+            x = torch.concat((full_ref, x), dim=1)
+
+    x, orig_size = _pad_and_split_for_sp(x, dim=1)
+    freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
+
+    context = self.text_embedding(context)
+
+    audio_emb = None
+    if audio_embed is not None:
+        music_feature = self.music_projection(audio_embed)
+
+        music_seq_len = music_feature.shape[1]
+        music_ids = torch.arange(music_seq_len, device=music_feature.device, dtype=music_feature.dtype).reshape(1, -1, 1)
+        music_freqs = self.music_rope_embedder(music_ids).movedim(1, 2)
+
+        music_feature, music_orig_size = _pad_and_split_for_sp(music_feature, dim=1)
+        music_freqs, _ = _pad_and_split_for_sp(music_freqs, dim=1)
+
+        for layer in self.music_encoder:
+            music_feature = layer(music_feature, music_freqs)
+
+        music_feature = get_sp_group().all_gather(music_feature.contiguous(), dim=1)
+        music_feature = music_feature[:, :music_orig_size, :]
+
+        audio_emb = torch.nn.functional.interpolate(
+            music_feature.unsqueeze(1),
+            size=(latent_frames * 8, self.dim),
+            mode="bilinear",
+        ).squeeze(1)
+
+    context_img_len = 0
+    if self.img_emb is not None and clip_fea is not None:
+        context_clip = self.img_emb(clip_fea)
+        context = torch.cat([context_clip, context], dim=1)
+        context_img_len += clip_fea.shape[-2]
+    if self.img_emb_refimage is not None and clip_fea_ref is not None:
+        context_clip_ref = self.img_emb_refimage(clip_fea_ref)
+        context = torch.cat([context_clip_ref, context], dim=1)
+        context_img_len += clip_fea_ref.shape[-2]
+
+    patches_replace = transformer_options.get("patches_replace", {})
+    blocks_replace = patches_replace.get("dit", {})
+    transformer_options["total_blocks"] = len(self.blocks)
+    transformer_options["block_type"] = "double"
+    for i, block in enumerate(self.blocks):
+        transformer_options["block_index"] = i
+        if ("double_block", i) in blocks_replace:
+
+            def block_wrap(args):
+                out = {}
+                out["img"] = block(
+                    args["img"],
+                    context=args["txt"],
+                    e=args["vec"],
+                    freqs=args["pe"],
+                    context_img_len=context_img_len,
+                    transformer_options=args["transformer_options"],
+                )
+                return out
+
+            out = blocks_replace[("double_block", i)](
+                {"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options},
+                {"original_block": block_wrap},
+            )
+            x = out["img"]
+        else:
+            x = block(
+                x,
+                e=e0,
+                freqs=freqs,
+                context=context,
+                context_img_len=context_img_len,
+                transformer_options=transformer_options,
+            )
+        if audio_emb is not None:
+            local_seq_len = min(seq_len, x.shape[1])
+            x = self.music_injector(
+                x,
+                i,
+                audio_emb,
+                audio_emb_global=None,
+                seq_len=local_seq_len,
+                scale=audio_inject_scale,
+            )
+
+    x = get_sp_group().all_gather(x.contiguous(), dim=1)
+    x = x[:, :orig_size, :]
+
+    if int(fps + 0.5) != 30:
+        x = self.head_global(x, e)
+    else:
+        x = self.head(x, e)
+
+    if full_ref_seq_len > 0:
+        x = x[:, full_ref_seq_len:]
+
+    x = self.unpatchify(x, grid_sizes)
+    return x
+
+
 def usp_self_attn_forward(self, x, freqs, transformer_options={}, **kwargs):
     r"""
     Args:
@@ -963,6 +1122,7 @@ def usp_multitalk_dit_forward(
     x = self.patch_embedding(x.float()).to(x.dtype)
     grid_sizes = x.shape[2:]
     transformer_options["grid_sizes"] = grid_sizes
+    x = x.flatten(2).transpose(1, 2)
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     sp_world = get_sequence_parallel_world_size()

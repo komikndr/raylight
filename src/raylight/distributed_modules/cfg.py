@@ -32,6 +32,15 @@ class CFGParallelInjectRegistry:
         raise ValueError(f"Model: {type(base_model).__name__} is not yet supported for CFG Parallelism")
 
 
+if hasattr(model_base, "WAN22_WanDancer"):
+
+    @CFGParallelInjectRegistry.register(model_base.WAN22_WanDancer)
+    def _inject_wan22_wandancer():
+        from ..diffusion_models.wan.xdit_cfg_parallel import cfg_parallel_forward_wrapper_wandancer
+
+        return cfg_parallel_forward_wrapper_wandancer
+
+
 if hasattr(model_base, "WAN21"):
 
     @CFGParallelInjectRegistry.register(model_base.WAN21)
