@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import logging
 import gc
+import types
 from typing import TYPE_CHECKING
 
 import torch
@@ -46,6 +47,8 @@ class LowVramPatch:
 
 
 def wipe_lowvram_weight(m):
+    _restore_fsdp_comfy_forward(m)
+
     if hasattr(m, "prev_comfy_cast_weights"):
         m.comfy_cast_weights = m.prev_comfy_cast_weights
         del m.prev_comfy_cast_weights
@@ -55,6 +58,62 @@ def wipe_lowvram_weight(m):
 
     if hasattr(m, "bias_function"):
         m.bias_function = []
+
+
+# I hate this, monkey see monkeypatch....
+def _restore_fsdp_comfy_forward(m):
+    if not hasattr(m, "_raylight_orig_forward_comfy_cast_weights"):
+        return
+    m.forward_comfy_cast_weights = m._raylight_orig_forward_comfy_cast_weights
+    del m._raylight_orig_forward_comfy_cast_weights
+
+
+def _fsdp_local_tensor(tensor):
+    if isinstance(tensor, DTensor) and not torch.is_grad_enabled():
+        return tensor.to_local()
+    return tensor
+
+
+def _raylight_fsdp_linear_forward_comfy_cast_weights(self, input, *args, **kwargs):
+    import comfy.ops as comfy_ops
+
+    unsupported_kwargs = set(kwargs) - {"compute_dtype", "want_requant"}
+    if len(args) > 2 or unsupported_kwargs:
+        return self._raylight_orig_forward_comfy_cast_weights(input, *args, **kwargs)
+
+    compute_dtype = kwargs.get("compute_dtype", None)
+    want_requant = kwargs.get("want_requant", False)
+    if args:
+        compute_dtype = args[0]
+    if len(args) > 1:
+        want_requant = args[1]
+
+    weight, bias, offload_stream = comfy_ops.cast_bias_weight(
+        self,
+        input,
+        offloadable=True,
+        compute_dtype=compute_dtype,
+        want_requant=want_requant,
+    )
+    try:
+        return torch.nn.functional.linear(
+            input,
+            _fsdp_local_tensor(weight),
+            _fsdp_local_tensor(bias),
+        )
+    finally:
+        comfy_ops.uncast_bias_weight(self, weight, bias, offload_stream)
+
+
+def _patch_fsdp_comfy_linear_forward(m):
+    if hasattr(m, "_raylight_orig_forward_comfy_cast_weights"):
+        return
+    if not hasattr(m, "forward_comfy_cast_weights"):
+        return
+    if not (hasattr(m, "weight") and hasattr(m, "in_features") and hasattr(m, "out_features")):
+        return
+    m._raylight_orig_forward_comfy_cast_weights = m.forward_comfy_cast_weights
+    m.forward_comfy_cast_weights = types.MethodType(_raylight_fsdp_linear_forward_comfy_cast_weights, m)
 
 
 def _safe_free_storage(tensor: torch.Tensor) -> None:
@@ -515,6 +574,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
                 if cast_weight and hasattr(m, "comfy_cast_weights"):
                     m.prev_comfy_cast_weights = m.comfy_cast_weights
                     m.comfy_cast_weights = True
+                    _patch_fsdp_comfy_linear_forward(m)
 
                 if weight_key in self.weight_wrapper_patches:
                     m.weight_function.extend(self.weight_wrapper_patches[weight_key])
@@ -561,6 +621,9 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         self.eject_model()
         if unpatch_weights:
             self.unpatch_hooks()
+            for m in self.model.modules():
+                _restore_fsdp_comfy_forward(m)
+
             if self.model.model_lowvram:
                 for m in self.model.modules():
                     move_weight_functions(m, device_to)
