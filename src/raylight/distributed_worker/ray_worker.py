@@ -101,7 +101,7 @@ class RayWorker:
         os.environ["NCCL_DEBUG"] = "WARN"
         os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
 
-        if self.parallel_dict.get("is_fsdp") and self.parallel_dict.get("shard_size") is not None:
+        if self.parallel_dict.get("use_group_process_group") and self.parallel_dict.get("shard_size") is not None:
             nccl_world_size = self.parallel_dict["shard_size"]
         else:
             nccl_world_size = self.parallel_dict["global_world_size"]
@@ -130,7 +130,7 @@ class RayWorker:
         if requires_xfuser_parallel(self.parallel_dict):
             self.xfuser_parallel = initialize_xfuser_parallel(
                 local_rank=self.local_rank,
-                world_size=self.shard_size,
+                world_size=nccl_world_size,
                 parallel_dict=self.parallel_dict,
             )
             if self.parallel_dict["is_xdit"]:
@@ -218,6 +218,16 @@ class RayWorker:
 
         torch.cuda.empty_cache()
         gc.collect()
+
+    def clean_vram(self):
+        """Free Raylight-managed model memory held by this worker."""
+        import comfy.model_management as comfy_model_management
+
+        self._free_current_model()
+        self._free_cached_aux_models()
+        gc.collect()
+        comfy_model_management.soft_empty_cache()
+        return True
 
     def check_model_loaded(self, unet_path, model_options):
         """Check if the currently loaded model matches the given parameters.
@@ -324,10 +334,17 @@ class RayWorker:
 
     def get_exec_group_info(self):
         if self.xfuser_parallel is None:
+            if self.parallel_dict.get("use_group_process_group"):
+                dp_rank = self.group_id
+                dp_degree = self.parallel_dict.get("dp_degree", 1)
+            else:
+                dp_rank = self.local_rank
+                dp_degree = self.global_world_size
+
             return {
                 "global_rank": self.local_rank,
-                "dp_rank": 0,
-                "dp_degree": 1,
+                "dp_rank": dp_rank,
+                "dp_degree": dp_degree,
                 "is_group_leader": self.local_rank == 0,
             }
 
@@ -996,14 +1013,15 @@ def ray_nccl_tester(world_size):
 def make_ray_actor_fn(world_size, parallel_dict):
     num_replicas = parallel_dict.get("dp_degree", 1)
     shard_size = parallel_dict.get("shard_size", world_size)
+    use_group_process_group = bool(parallel_dict.get("use_group_process_group"))
 
     def _init_ray_actor(world_size=world_size, parallel_dict=parallel_dict):
         ray_actors = dict()
         gpu_actor = ray.remote(RayWorker)
         gpu_actors = []
 
-        if num_replicas <= 1:
-            # Single replica — all GPUs in one group
+        if num_replicas <= 1 or not use_group_process_group:
+            # XDiT DP stays in one global group; xFuser derives DP ranks internally.
             for local_rank in range(world_size):
                 gpu_actors.append(
                     gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
@@ -1013,10 +1031,11 @@ def make_ray_actor_fn(world_size, parallel_dict):
                     )
                 )
         else:
-            # Multiple replicas — each replica gets its own NCCL group
+            # FSDP multi-replica DP uses one NCCL group per replica.
             for group_id in range(num_replicas):
                 group_parallel_dict = dict(parallel_dict)
                 group_parallel_dict["group_id"] = group_id
+                group_parallel_dict["use_group_process_group"] = True
 
                 for local_rank in range(shard_size):
                     gpu_actors.append(

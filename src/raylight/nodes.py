@@ -23,6 +23,14 @@ from .distributed_worker.ray_worker import (
 )
 
 
+class AnyType(str):
+    def __ne__(self, __value):
+        return False
+
+
+any_type = AnyType("*")
+
+
 def _raylight_ray_tmpdir() -> Path:
     return Path(os.environ.get("RAYLIGHT_RAY_TMPDIR", Path(tempfile.gettempdir()) / "raylight-ray")).resolve()
 
@@ -445,6 +453,7 @@ class RayInitializer:
         self.parallel_dict["sync_ulysses"] = False
         self.parallel_dict["global_world_size"] = world_size
         self.parallel_dict["shard_size"] = shard_size
+        self.parallel_dict["use_group_process_group"] = False
         self.parallel_dict["use_mmap"] = use_mmap
         self.parallel_dict["pp_degree"] = 1
         self.parallel_dict["dp_degree"] = dp_degree if dp_degree >= 1 else 1
@@ -481,6 +490,7 @@ class RayInitializer:
             self.parallel_dict["is_fsdp"] = True
             final_dp = self.parallel_dict["dp_degree"]
             self.parallel_dict["shard_size"] = world_size // final_dp
+            self.parallel_dict["use_group_process_group"] = final_dp > 1
 
         if ray_dashboard_address != "None":
             dashboard_host, dashboard_port = ray_dashboard_address.rsplit(":", 1)
@@ -1328,6 +1338,50 @@ class RayKill:
         return ()
 
 
+class RayCleanVRAMUsed:
+    @classmethod
+    def INPUT_TYPES(cls):
+        vram_hint = (
+            "Comfy VRAM frees memory owned by the Comfy process. "
+            "RayWorker VRAM frees Raylight-managed models on Ray workers."
+        )
+        return {
+            "required": {
+                "anything": (any_type, {}),
+                "target": (
+                    ["Comfy VRAM", "RayWorker VRAM"],
+                    {"default": "Comfy VRAM", "tooltip": vram_hint},
+                ),
+            },
+            "optional": {
+                "ray_actors": (
+                    "RAY_ACTORS",
+                    {"tooltip": "Required when target is RayWorker VRAM."},
+                ),
+            },
+        }
+
+    RETURN_TYPES = (any_type,)
+    RETURN_NAMES = ("output",)
+    FUNCTION = "clean_vram"
+    OUTPUT_NODE = True
+    CATEGORY = "Raylight"
+
+    def clean_vram(self, anything, target, ray_actors=None):
+        if target == "RayWorker VRAM":
+            if ray_actors is None:
+                raise ValueError("RayWorker VRAM cleanup requires ray_actors input.")
+
+            gpu_actors = ray_actors["workers"]
+            ray.get([actor.clean_vram.remote() for actor in gpu_actors])
+            return (anything,)
+
+        gc.collect()
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        return (anything,)
+
+
 class RayControlNetLoader:
     """Load a ControlNet model into all Ray workers.
 
@@ -1662,6 +1716,7 @@ NODE_CLASS_MAPPINGS = {
     "RayControlNetLoader": RayControlNetLoader,
     "RayControlNetApply": RayControlNetApply,
     "RayVAELoader": RayVAELoader,
+    "RayCleanVRAMUsed": RayCleanVRAMUsed,
     "RayInitializer": RayInitializer,
     "RayInitializerAdvanced": RayInitializerAdvanced,
     "DPNoiseList": DPNoiseList,
@@ -1680,6 +1735,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayControlNetLoader": "Load ControlNet (Ray)",
     "RayControlNetApply": "Apply ControlNet (Ray)",
     "RayVAELoader": "Load VAE (Ray)",
+    "RayCleanVRAMUsed": "Clean VRAM Used (Raylight)",
     "RayInitializer": "Ray Init Actor",
     "RayInitializerAdvanced": "Ray Init Actor (Advanced)",
     "DPNoiseList": "Data Parallel Noise List",
