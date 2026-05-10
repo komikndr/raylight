@@ -1338,6 +1338,8 @@ class RayKill:
         return ()
 
 
+# Credit to : https://github.com/yolain/ComfyUI-Easy-Use
+# I copied this for packaging sake.
 class RayCleanVRAMUsed:
     @classmethod
     def INPUT_TYPES(cls):

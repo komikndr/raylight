@@ -9,6 +9,8 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 <details><summary><strong>Click to expand changelog</strong></summary>
 
+- DP Latent Noise List, FSDP, and DP improvement, added by avtc
+- Add WanT2V Causal
 - Experimental : ControlNet support, by avtc
 - Experimental : Unified Parallel sampler, now all parallel type can be use at the same time, USP x DP x CFG x FSDP
 - ERNIE and Anima support
@@ -204,6 +206,7 @@ This is experimental mode where all type of parallel group can work at a sime ti
 | Wan2.2 14B I2V    | ✅  | ✅   | ✅  |
 | Wan2.2 14B I2V    | ✅  | ✅   | ✅  |
 | Wan2.1 1.3B T2V   | ✅  | ✅   | ✅  |
+| Wan2.1 1.3B AR    | ✅  | ❌   | ✅  |
 | Wan2.2 5B TI2V    | ✅  | ✅   | ✅  |
 | Wan2.1 Vace       | ✅  | ❌   | ✅  |
 
