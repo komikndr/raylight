@@ -219,16 +219,6 @@ class RayWorker:
         torch.cuda.empty_cache()
         gc.collect()
 
-    def clean_vram(self):
-        """Free Raylight-managed model memory held by this worker."""
-        import comfy.model_management as comfy_model_management
-
-        self._free_current_model()
-        self._free_cached_aux_models()
-        gc.collect()
-        comfy_model_management.soft_empty_cache()
-        return True
-
     def check_model_loaded(self, unet_path, model_options):
         """Check if the currently loaded model matches the given parameters.
 

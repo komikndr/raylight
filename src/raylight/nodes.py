@@ -1341,24 +1341,10 @@ class RayKill:
 class RayCleanVRAMUsed:
     @classmethod
     def INPUT_TYPES(cls):
-        vram_hint = (
-            "Comfy VRAM frees memory owned by the Comfy process. "
-            "RayWorker VRAM frees Raylight-managed models on Ray workers."
-        )
         return {
             "required": {
-                "anything": (any_type, {}),
-                "target": (
-                    ["Comfy VRAM", "RayWorker VRAM"],
-                    {"default": "Comfy VRAM", "tooltip": vram_hint},
-                ),
-            },
-            "optional": {
-                "ray_actors": (
-                    "RAY_ACTORS",
-                    {"tooltip": "Required when target is RayWorker VRAM."},
-                ),
-            },
+                "anything": (any_type, {"tooltip": "Frees VRAM owned by the ComfyUI process, then passes this value through."}),
+            }
         }
 
     RETURN_TYPES = (any_type,)
@@ -1367,15 +1353,7 @@ class RayCleanVRAMUsed:
     OUTPUT_NODE = True
     CATEGORY = "Raylight"
 
-    def clean_vram(self, anything, target, ray_actors=None):
-        if target == "RayWorker VRAM":
-            if ray_actors is None:
-                raise ValueError("RayWorker VRAM cleanup requires ray_actors input.")
-
-            gpu_actors = ray_actors["workers"]
-            ray.get([actor.clean_vram.remote() for actor in gpu_actors])
-            return (anything,)
-
+    def clean_vram(self, anything):
         gc.collect()
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
