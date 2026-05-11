@@ -1670,6 +1670,8 @@ class RayVAEDecodeDistributed:
 
     CATEGORY = "Raylight"
 
+    # -- Komikndr
+    # By default VAE on comfy already "Parallelized" through tiling, so just distributed the tiling to other rank
     def ray_decode(self, ray_actors, vae_name, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8):
         gpu_actors = ray_actors["workers"]
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
@@ -1678,12 +1680,35 @@ class RayVAEDecodeDistributed:
             ray.get(actor.ray_vae_loader.remote(vae_path))
 
         futures = [
-            actor.ray_vae_decode.remote(samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8)
+            actor.ray_vae_decode_partial.remote(
+                samples,
+                tile_size,
+                overlap=overlap,
+                temporal_size=temporal_size,
+                temporal_overlap=temporal_overlap,
+                job_rank=i,
+                job_world_size=len(gpu_actors),
+            )
             for i, actor in enumerate(gpu_actors)
         ]
 
-        image = ray.get(futures)
-        return (image[0],)
+        worker_partials = ray.get(futures)
+        decoded_passes = []
+        for pass_index in range(len(worker_partials[0])):
+            out = None
+            out_div = None
+            for partials in worker_partials:
+                partial_out, partial_div = partials[pass_index]
+                out = partial_out if out is None else out + partial_out
+                out_div = partial_div if out_div is None else out_div + partial_div
+            decoded_passes.append(out / out_div.clamp_min(1e-6))
+
+        decoded = decoded_passes[0]
+        if len(decoded_passes) > 1:
+            decoded = sum(decoded_passes) / len(decoded_passes)
+
+        image = ray.get(gpu_actors[0].ray_vae_decode_finalize.remote(decoded.cpu()))
+        return (image,)
 
 
 NODE_CLASS_MAPPINGS = {

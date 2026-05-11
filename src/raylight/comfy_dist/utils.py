@@ -146,3 +146,135 @@ def tiled_scale(
         output_device=output_device,
         pbar=pbar
     )
+
+
+@torch.inference_mode()
+def tiled_scale_multidim_partial(
+    samples,
+    function,
+    tile=(64, 64),
+    overlap=8,
+    upscale_amount=4,
+    out_channels=3,
+    output_device="cpu",
+    downscale=False,
+    index_formulas=None,
+    pbar=None,
+    job_rank=0,
+    job_world_size=1,
+):
+    dims = len(tile)
+
+    if not (isinstance(upscale_amount, (tuple, list))):
+        upscale_amount = [upscale_amount] * dims
+
+    if not (isinstance(overlap, (tuple, list))):
+        overlap = [overlap] * dims
+
+    if index_formulas is None:
+        index_formulas = upscale_amount
+
+    if not (isinstance(index_formulas, (tuple, list))):
+        index_formulas = [index_formulas] * dims
+
+    def get_upscale(dim, val):
+        up = upscale_amount[dim]
+        if callable(up):
+            return up(val)
+        else:
+            return up * val
+
+    def get_downscale(dim, val):
+        up = upscale_amount[dim]
+        if callable(up):
+            return up(val)
+        else:
+            return val / up
+
+    def get_upscale_pos(dim, val):
+        up = index_formulas[dim]
+        if callable(up):
+            return up(val)
+        else:
+            return up * val
+
+    def get_downscale_pos(dim, val):
+        up = index_formulas[dim]
+        if callable(up):
+            return up(val)
+        else:
+            return val / up
+
+    if downscale:
+        get_scale = get_downscale
+        get_pos = get_downscale_pos
+    else:
+        get_scale = get_upscale
+        get_pos = get_upscale_pos
+
+    def mult_list_upscale(a):
+        out = []
+        for i in range(len(a)):
+            out.append(round(get_scale(i, a[i])))
+        return out
+
+    output_shape = [samples.shape[0], out_channels] + mult_list_upscale(samples.shape[2:])
+    output = torch.zeros(output_shape, device=output_device)
+    output_div = torch.zeros(output_shape, device=output_device)
+
+    job_index = 0
+    for b in range(samples.shape[0]):
+        s = samples[b:b + 1]
+
+        if all(s.shape[d + 2] <= tile[d] for d in range(dims)):
+            if job_index % job_world_size == job_rank:
+                ps = function(s).to(output_device)
+                output[b:b + 1].copy_(ps)
+                output_div[b:b + 1].fill_(1.0)
+            job_index += 1
+            if pbar is not None:
+                pbar.update(1)
+            continue
+
+        positions = [range(0, s.shape[d + 2] - overlap[d], tile[d] - overlap[d]) if s.shape[d + 2] > tile[d] else [0] for d in range(dims)]
+
+        for it in itertools.product(*positions):
+            if job_index % job_world_size != job_rank:
+                job_index += 1
+                continue
+
+            s_in = s
+            upscaled = []
+
+            for d in range(dims):
+                pos = max(0, min(s.shape[d + 2] - overlap[d], it[d]))
+                l = min(tile[d], s.shape[d + 2] - pos)
+                s_in = s_in.narrow(d + 2, pos, l)
+                upscaled.append(round(get_pos(d, pos)))
+
+            ps = function(s_in).to(output_device)
+            mask = torch.ones_like(ps)
+
+            for d in range(2, dims + 2):
+                feather = round(get_scale(d - 2, overlap[d - 2]))
+                if feather >= mask.shape[d]:
+                    continue
+                for t in range(feather):
+                    a = (t + 1) / feather
+                    mask.narrow(d, t, 1).mul_(a)
+                    mask.narrow(d, mask.shape[d] - 1 - t, 1).mul_(a)
+
+            o = output[b:b + 1]
+            o_d = output_div[b:b + 1]
+            for d in range(dims):
+                o = o.narrow(d + 2, upscaled[d], mask.shape[d + 2])
+                o_d = o_d.narrow(d + 2, upscaled[d], mask.shape[d + 2])
+
+            o.add_(ps * mask)
+            o_d.add_(mask)
+
+            job_index += 1
+            if pbar is not None:
+                pbar.update(1)
+
+    return output.cpu(), output_div.cpu()

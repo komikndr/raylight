@@ -36,7 +36,12 @@ from raylight.distributed_worker.ray_worker_controlnet import (
     _remap_conditioning_devices,
     _restore_controlnet_refs,
 )
-from raylight.distributed_worker.ray_worker_vae import load_vae_model
+from raylight.distributed_worker.ray_worker_vae import (
+    load_vae_model,
+    ray_vae_decode_finalize_impl,
+    ray_vae_decode_impl,
+    ray_vae_decode_partial_impl,
+)
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 from ray.exceptions import RayActorError
@@ -697,31 +702,14 @@ class RayWorker:
 
     @patch_ray_tqdm
     def ray_vae_decode(self, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8):
-        if tile_size < overlap * 4:
-            overlap = tile_size // 4
-        if temporal_size < temporal_overlap * 2:
-            temporal_overlap = temporal_overlap // 2
-        temporal_compression = self.vae_model.temporal_compression_decode()
-        if temporal_compression is not None:
-            temporal_size = max(2, temporal_size // temporal_compression)
-            temporal_overlap = max(1, min(temporal_size // 2, temporal_overlap // temporal_compression))
-        else:
-            temporal_size = None
-            temporal_overlap = None
+        return ray_vae_decode_impl(self, samples, tile_size, overlap, temporal_size, temporal_overlap)
 
-        compression = self.vae_model.spacial_compression_decode()
+    @patch_ray_tqdm
+    def ray_vae_decode_partial(self, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8, job_rank=0, job_world_size=1):
+        return ray_vae_decode_partial_impl(self, samples, tile_size, overlap, temporal_size, temporal_overlap, job_rank, job_world_size)
 
-        images = self.vae_model.decode_tiled(
-            samples["samples"],
-            tile_x=tile_size // compression,
-            tile_y=tile_size // compression,
-            overlap=overlap // compression,
-            tile_t=temporal_size,
-            overlap_t=temporal_overlap,
-        )
-        if len(images.shape) == 5:
-            images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
-        return images
+    def ray_vae_decode_finalize(self, decoded):
+        return ray_vae_decode_finalize_impl(self, decoded)
 
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
