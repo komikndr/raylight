@@ -150,6 +150,15 @@ if hasattr(model_base, "HiDream"):
         return cfg_parallel_forward_wrapper
 
 
+if hasattr(model_base, "HiDreamO1"):
+
+    @CFGParallelInjectRegistry.register(model_base.HiDreamO1)
+    def _inject_hidream_o1():
+        from ..diffusion_models.hidream_o1.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
 if hasattr(model_base, "LTXV"):
 
     @CFGParallelInjectRegistry.register(model_base.LTXV)

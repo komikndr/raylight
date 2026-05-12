@@ -416,6 +416,16 @@ if hasattr(model_base, "Lumina2"):
         model._forward = types.MethodType(usp_dit_forward, model)
 
 
+if hasattr(model_base, "HiDreamO1"):
+
+    @USPInjectRegistry.register(model_base.HiDreamO1)
+    def _inject_hidream_o1(model_patcher, base_model, *args):
+        from ..diffusion_models.hidream_o1.xdit_context_parallel import usp_dit_forward
+
+        model = base_model.diffusion_model
+        model._forward = types.MethodType(usp_dit_forward, model)
+
+
 if hasattr(model_base, "Kandinsky5"):
 
     @USPInjectRegistry.register(model_base.Kandinsky5)
