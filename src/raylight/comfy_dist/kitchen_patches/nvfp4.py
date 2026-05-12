@@ -9,6 +9,7 @@ _PATCHED = False
 _MISSING = object()
 _ORIG_LAYOUT_PRE = _MISSING
 _ORIG_LAYOUT_POST = _MISSING
+_PATCHED_LAYOUT = None
 _ORIG_QT_PRE = _MISSING
 _ORIG_QT_POST = _MISSING
 
@@ -24,14 +25,21 @@ def _get_op(path: str) -> Any:
 
 def install_nvfp4_patches() -> None:
     global _PATCHED
-    global _ORIG_LAYOUT_PRE, _ORIG_LAYOUT_POST, _ORIG_QT_PRE, _ORIG_QT_POST
+    global _ORIG_LAYOUT_PRE, _ORIG_LAYOUT_POST, _PATCHED_LAYOUT, _ORIG_QT_PRE, _ORIG_QT_POST
     if _PATCHED:
         return
 
     import comfy_kitchen as ck
     from comfy_kitchen.float_utils import from_blocked, to_blocked
     from comfy_kitchen.tensor.base import QuantizedTensor, register_layout_op
-    from comfy_kitchen.tensor.nvfp4 import TensorCoreNVFP4Layout
+    from comfy_kitchen.tensor.nvfp4 import TensorCoreNVFP4Layout as KitchenTensorCoreNVFP4Layout
+
+    try:
+        from comfy.quant_ops import get_layout_class as comfy_get_layout_class
+        TensorCoreNVFP4Layout = comfy_get_layout_class("TensorCoreNVFP4Layout") or KitchenTensorCoreNVFP4Layout
+    except Exception:  # pragma: no cover
+        TensorCoreNVFP4Layout = KitchenTensorCoreNVFP4Layout
+    _PATCHED_LAYOUT = TensorCoreNVFP4Layout
 
     def maybe_register(op):
         def deco(fn):
@@ -572,10 +580,12 @@ def install_nvfp4_patches() -> None:
 
 def restore_nvfp4_patches() -> None:
     global _PATCHED
-    global _ORIG_LAYOUT_PRE, _ORIG_LAYOUT_POST, _ORIG_QT_PRE, _ORIG_QT_POST
+    global _ORIG_LAYOUT_PRE, _ORIG_LAYOUT_POST, _PATCHED_LAYOUT, _ORIG_QT_PRE, _ORIG_QT_POST
 
     from comfy_kitchen.tensor.base import QuantizedTensor
-    from comfy_kitchen.tensor.nvfp4 import TensorCoreNVFP4Layout
+    from comfy_kitchen.tensor.nvfp4 import TensorCoreNVFP4Layout as KitchenTensorCoreNVFP4Layout
+
+    TensorCoreNVFP4Layout = _PATCHED_LAYOUT or KitchenTensorCoreNVFP4Layout
 
     if _ORIG_LAYOUT_PRE is _MISSING:
         if hasattr(TensorCoreNVFP4Layout, "pre_all_gather"):
@@ -603,6 +613,7 @@ def restore_nvfp4_patches() -> None:
 
     _ORIG_LAYOUT_PRE = _MISSING
     _ORIG_LAYOUT_POST = _MISSING
+    _PATCHED_LAYOUT = None
     _ORIG_QT_PRE = _MISSING
     _ORIG_QT_POST = _MISSING
     _PATCHED = False

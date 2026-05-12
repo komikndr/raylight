@@ -8,8 +8,8 @@ import torch
 
 _PATCHED = False
 _MISSING = object()
-_ORIG_LAYOUT_PRE = _MISSING
-_ORIG_LAYOUT_POST = _MISSING
+_ORIG_LAYOUT_METHODS = {}
+_PATCHED_LAYOUTS = ()
 _ORIG_QT_PRE = _MISSING
 _ORIG_QT_POST = _MISSING
 
@@ -25,24 +25,50 @@ def _get_op(path: str) -> Any:
 
 def install_fp8_patches() -> None:
     global _PATCHED
-    global _ORIG_LAYOUT_PRE, _ORIG_LAYOUT_POST, _ORIG_QT_PRE, _ORIG_QT_POST
+    global _ORIG_LAYOUT_METHODS, _PATCHED_LAYOUTS, _ORIG_QT_PRE, _ORIG_QT_POST
     if _PATCHED:
         return
 
     from comfy_kitchen.tensor.base import (
         QuantizedTensor,
-        _LAYOUT_DISPATCH_TABLE,
         dequantize_args,
         get_layout_class,
         register_layout_op,
     )
-    from comfy_kitchen.tensor.fp8 import TensorCoreFP8Layout
+    from comfy_kitchen.tensor.fp8 import TensorCoreFP8Layout as KitchenTensorCoreFP8Layout
     from comfy_kitchen.scaled_mm_v2 import scaled_mm_v2
+
+    try:
+        from comfy.quant_ops import QUANT_ALGOS as COMFY_QUANT_ALGOS
+        from comfy.quant_ops import get_layout_class as comfy_get_layout_class
+    except Exception:  # pragma: no cover
+        COMFY_QUANT_ALGOS = {}
+        comfy_get_layout_class = get_layout_class
+
+    def append_layout(layouts, layout_cls):
+        if layout_cls is None:
+            return
+        if any(layout_cls is existing for existing in layouts):
+            return
+        layouts.append(layout_cls)
+
+    def comfy_layout_for(quant_format: str, fallback_name: str):
+        layout_name = COMFY_QUANT_ALGOS.get(quant_format, {}).get("comfy_tensor_layout", fallback_name)
+        return comfy_get_layout_class(layout_name)
+
+    fp8_layout_classes = []
+    append_layout(fp8_layout_classes, KitchenTensorCoreFP8Layout)
+    append_layout(fp8_layout_classes, get_layout_class("TensorCoreFP8Layout"))
+    append_layout(fp8_layout_classes, comfy_layout_for("float8_e4m3fn", "TensorCoreFP8Layout"))
+    append_layout(fp8_layout_classes, comfy_layout_for("float8_e5m2", "TensorCoreFP8Layout"))
+    fp8_layout_classes = tuple(fp8_layout_classes)
+    _PATCHED_LAYOUTS = fp8_layout_classes
 
     def maybe_register(op):
         def deco(fn):
             if op is not None:
-                register_layout_op(op, TensorCoreFP8Layout)(fn)
+                for layout_cls in fp8_layout_classes:
+                    register_layout_op(op, layout_cls)(fn)
             return fn
 
         return deco
@@ -74,7 +100,7 @@ def install_fp8_patches() -> None:
             out_dtype=out_dtype,
         )
 
-    @register_layout_op(torch.ops.aten.linear.default, TensorCoreFP8Layout)
+    @maybe_register(torch.ops.aten.linear.default)
     def handle_linear(qt, args, kwargs):
         input_tensor, weight = args[0], args[1]
         bias = args[2] if len(args) > 2 else None
@@ -106,7 +132,7 @@ def install_fp8_patches() -> None:
                 raise
             return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
 
-    @register_layout_op(torch.ops.aten.mm.default, TensorCoreFP8Layout)
+    @maybe_register(torch.ops.aten.mm.default)
     def handle_mm(qt, args, kwargs):
         a, b = args[0], args[1]
 
@@ -129,7 +155,7 @@ def install_fp8_patches() -> None:
                 raise
             return torch.mm(*dequantize_args(args))
 
-    @register_layout_op(torch.ops.aten.addmm.default, TensorCoreFP8Layout)
+    @maybe_register(torch.ops.aten.addmm.default)
     def handle_addmm(qt, args, kwargs):
         bias, a, b = args[0], args[1], args[2]
 
@@ -207,12 +233,14 @@ def install_fp8_patches() -> None:
         )
         return QuantizedTensor(data, qtensor._layout_cls, params), (data,)
 
-    if _ORIG_LAYOUT_PRE is _MISSING:
-        _ORIG_LAYOUT_PRE = getattr(TensorCoreFP8Layout, "pre_all_gather", _MISSING)
-    if _ORIG_LAYOUT_POST is _MISSING:
-        _ORIG_LAYOUT_POST = getattr(TensorCoreFP8Layout, "post_all_gather", _MISSING)
-    setattr(TensorCoreFP8Layout, "pre_all_gather", pre_all_gather)
-    setattr(TensorCoreFP8Layout, "post_all_gather", post_all_gather)
+    for layout_cls in fp8_layout_classes:
+        if layout_cls not in _ORIG_LAYOUT_METHODS:
+            _ORIG_LAYOUT_METHODS[layout_cls] = (
+                getattr(layout_cls, "pre_all_gather", _MISSING),
+                getattr(layout_cls, "post_all_gather", _MISSING),
+            )
+        setattr(layout_cls, "pre_all_gather", pre_all_gather)
+        setattr(layout_cls, "post_all_gather", post_all_gather)
 
     def fsdp_pre_all_gather(self, mesh):
         return self.layout_cls.pre_all_gather(self, mesh)
@@ -522,7 +550,7 @@ def install_fp8_patches() -> None:
         if op is None:
             continue
 
-        @register_layout_op(op, TensorCoreFP8Layout)
+        @maybe_register(op)
         def shape_handler(qt, args, kwargs, _op=op):
             input_tensor = args[0]
             if not isinstance(input_tensor, QuantizedTensor):
@@ -535,22 +563,23 @@ def install_fp8_patches() -> None:
 
 def restore_fp8_patches() -> None:
     global _PATCHED
-    global _ORIG_LAYOUT_PRE, _ORIG_LAYOUT_POST, _ORIG_QT_PRE, _ORIG_QT_POST
+    global _ORIG_LAYOUT_METHODS, _PATCHED_LAYOUTS, _ORIG_QT_PRE, _ORIG_QT_POST
 
     from comfy_kitchen.tensor.base import QuantizedTensor
-    from comfy_kitchen.tensor.fp8 import TensorCoreFP8Layout
 
-    if _ORIG_LAYOUT_PRE is _MISSING:
-        if hasattr(TensorCoreFP8Layout, "pre_all_gather"):
-            delattr(TensorCoreFP8Layout, "pre_all_gather")
-    else:
-        setattr(TensorCoreFP8Layout, "pre_all_gather", _ORIG_LAYOUT_PRE)
+    for layout_cls in _PATCHED_LAYOUTS:
+        orig_pre, orig_post = _ORIG_LAYOUT_METHODS.get(layout_cls, (_MISSING, _MISSING))
+        if orig_pre is _MISSING:
+            if hasattr(layout_cls, "pre_all_gather"):
+                delattr(layout_cls, "pre_all_gather")
+        else:
+            setattr(layout_cls, "pre_all_gather", orig_pre)
 
-    if _ORIG_LAYOUT_POST is _MISSING:
-        if hasattr(TensorCoreFP8Layout, "post_all_gather"):
-            delattr(TensorCoreFP8Layout, "post_all_gather")
-    else:
-        setattr(TensorCoreFP8Layout, "post_all_gather", _ORIG_LAYOUT_POST)
+        if orig_post is _MISSING:
+            if hasattr(layout_cls, "post_all_gather"):
+                delattr(layout_cls, "post_all_gather")
+        else:
+            setattr(layout_cls, "post_all_gather", orig_post)
 
     if _ORIG_QT_PRE is _MISSING:
         if hasattr(QuantizedTensor, "fsdp_pre_all_gather"):
@@ -564,8 +593,8 @@ def restore_fp8_patches() -> None:
     else:
         setattr(QuantizedTensor, "fsdp_post_all_gather", _ORIG_QT_POST)
 
-    _ORIG_LAYOUT_PRE = _MISSING
-    _ORIG_LAYOUT_POST = _MISSING
+    _ORIG_LAYOUT_METHODS = {}
+    _PATCHED_LAYOUTS = ()
     _ORIG_QT_PRE = _MISSING
     _ORIG_QT_POST = _MISSING
     _PATCHED = False

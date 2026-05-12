@@ -9,13 +9,10 @@ from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
 
 try:
-    from comfy_kitchen.tensor import QuantizedTensor, get_layout_class
+    from comfy.quant_ops import QUANT_ALGOS, QuantizedTensor, get_layout_class
 except Exception:  # pragma: no cover
-    from comfy.quant_ops import QuantizedTensor, get_layout_class  # type: ignore
+    from comfy_kitchen.tensor import QuantizedTensor, get_layout_class  # type: ignore
 
-try:
-    from comfy.quant_ops import QUANT_ALGOS
-except Exception:  # pragma: no cover
     QUANT_ALGOS = {}
 
 
@@ -509,6 +506,11 @@ def _build_quantized_tensor(
     quant_format = conf.get("format", None)
     if quant_format is None or quant_format not in QUANT_ALGOS:
         raise ValueError(f"Unknown quantization format for {param_name}: {quant_format}")
+    if quant_format == "mxfp8":
+        raise NotImplementedError(
+            "Raylight FSDP does not support MXFP8 quantized weights yet. "
+            "Use FP8/NVFP4 weights or disable Raylight FSDP quant loading."
+        )
 
     qconfig = QUANT_ALGOS[quant_format]
     layout_name = qconfig["comfy_tensor_layout"]
