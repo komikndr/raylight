@@ -67,6 +67,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 For developers and advanced users, see the [docs](docs/) folder for detailed guides on USP, CFG, FSDP, and expansion modules.
 - Top most head is `dev`, pr merge into `dev` or any custom branch name e.g `komikndr:raylight/feat-something` <- `john_doe:raylight/feat-something`, DONT MERGE INTO MAIN
+- If commit message contain "Partial: " it meaant the code is finished, tested on single worker, but not yet being tested in parallel setup.
 
 ## What exactly is Raylight
 
