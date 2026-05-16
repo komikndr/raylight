@@ -64,16 +64,22 @@ def _safe_free_storage(tensor: torch.Tensor) -> None:
     try:
         if tensor.device.type == "meta":
             return
+        if _is_quantized_tensor_like(tensor):
+            return
+        if tensor.storage_offset() != 0:
+            return
     except Exception:
         return
 
     try:
         _free_storage(tensor)
-    except RuntimeError as e:
+    except (RuntimeError, AssertionError) as e:
         msg = str(e)
         if "invalid python storage" in msg:
             return
         if "out of bounds for storage" in msg:
+            return
+        if "Freeing a tensor's storage is unsafe" in msg:
             return
         raise
 
