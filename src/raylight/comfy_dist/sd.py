@@ -1,6 +1,7 @@
 import logging
 
 import torch
+import torch.nn.functional as F
 
 from raylight import comfy_dist
 from raylight.diffusion_models.wan.pipefusion import (
@@ -90,6 +91,152 @@ class OffsetBypassAdapter(comfy.weight_adapter.WeightAdapterBase):
         return total
 
 
+class DirectDiffBypassAdapter(comfy.weight_adapter.WeightAdapterBase):
+    name = "diff_bypass"
+
+    def __init__(self, weight_diff=None, bias_diff=None, key=None):
+        self.weights = (weight_diff, bias_diff)
+        self.key = key
+        self._warned = False
+
+    def _warn(self, message, *args):
+        if self._warned:
+            return
+        self._warned = True
+        logging.warning(message, *args)
+
+    def _bias_delta(self, base_out, bias):
+        if bias is None:
+            return torch.zeros_like(base_out)
+        bias = bias.to(device=base_out.device, dtype=base_out.dtype)
+        if base_out.ndim == 0:
+            return bias.reshape_as(base_out)
+        shape = [1] * base_out.ndim
+        if base_out.ndim == 1:
+            shape[0] = bias.shape[0]
+        else:
+            shape[1 if getattr(self, "is_conv", False) else -1] = bias.shape[0]
+        return bias.reshape(shape).expand_as(base_out)
+
+    def h(self, x: torch.Tensor, base_out: torch.Tensor) -> torch.Tensor:
+        weight_diff, bias_diff = self.weights
+        scale = getattr(self, "multiplier", 1.0)
+        if weight_diff is not None:
+            weight_diff = weight_diff.to(device=x.device, dtype=x.dtype)
+        if bias_diff is not None:
+            bias_diff = bias_diff.to(device=x.device, dtype=x.dtype)
+        if weight_diff is None:
+            return self._bias_delta(base_out, bias_diff) * scale
+
+        try:
+            if getattr(self, "is_conv", False):
+                conv_fn = (F.conv1d, F.conv2d, F.conv3d)[self.conv_dim - 1]
+                out = conv_fn(x, weight_diff, bias_diff, **getattr(self, "kw_dict", {}))
+            else:
+                out = F.linear(x, weight_diff, bias_diff)
+        except Exception as e:
+            self._warn("DIFF BYPASS FAILED key=%s error=%s", self.key, e)
+            return torch.zeros_like(base_out)
+
+        if out.shape != base_out.shape:
+            self._warn("DIFF BYPASS SHAPE MISMATCH key=%s delta=%s base=%s", self.key, tuple(out.shape), tuple(base_out.shape))
+            return torch.zeros_like(base_out)
+        return out * scale
+
+
+class ParamDiffBypassAdapter(comfy.weight_adapter.WeightAdapterBase):
+    name = "param_diff_bypass"
+
+    def __init__(self, weight_diff=None, bias_diff=None, key=None):
+        self.weights = (weight_diff, bias_diff)
+        self.key = key
+        self._warned = False
+
+    def _warn(self, message, *args):
+        if self._warned:
+            return
+        self._warned = True
+        logging.warning(message, *args)
+
+    def _patch_param(self, module, param_name, diff, scale):
+        param = getattr(module, param_name, None)
+        if param is None or diff is None:
+            return None
+        if tuple(param.shape) != tuple(diff.shape):
+            self._warn(
+                "PARAM DIFF BYPASS SHAPE MISMATCH key=%s.%s delta=%s base=%s",
+                self.key,
+                param_name,
+                tuple(diff.shape),
+                tuple(param.shape),
+            )
+            return None
+        orig_data = param.data
+        try:
+            param.data = orig_data + (diff.to(device=orig_data.device, dtype=orig_data.dtype) * scale)
+        except Exception as e:
+            self._warn("PARAM DIFF BYPASS FAILED key=%s.%s error=%s", self.key, param_name, e)
+            return None
+        return orig_data
+
+    def bypass_forward(self, org_forward, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        module = getattr(org_forward, "__self__", None)
+        if module is None:
+            self._warn("PARAM DIFF BYPASS FAILED key=%s missing bound module", self.key)
+            return org_forward(x, *args, **kwargs)
+
+        weight_diff, bias_diff = self.weights
+        scale = getattr(self, "multiplier", 1.0)
+        orig_weight = None
+        orig_bias = None
+        try:
+            orig_weight = self._patch_param(module, "weight", weight_diff, scale)
+            orig_bias = self._patch_param(module, "bias", bias_diff, scale)
+            return org_forward(x, *args, **kwargs)
+        finally:
+            if orig_weight is not None:
+                module.weight.data = orig_weight
+            if orig_bias is not None:
+                module.bias.data = orig_bias
+
+
+def _get_module_by_key(model, key):
+    module = model
+    try:
+        for part in key.split("."):
+            if part.isdigit():
+                module = module[int(part)]
+            else:
+                module = getattr(module, part)
+        return module
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return None
+
+
+def _diff_target_from_key(key):
+    if key.endswith(".weight"):
+        return key[:-7], "weight"
+    if key.endswith(".bias"):
+        return key[:-5], "bias"
+    return None, None
+
+
+def _is_linear_or_conv_module(module):
+    if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)):
+        return True
+    class_name = type(module).__name__.lower()
+    return "linear" in class_name or "conv" in class_name
+
+
+def _diff_tensor_from_patch(patch_data):
+    if not isinstance(patch_data, tuple) or len(patch_data) != 2:
+        return None
+    patch_type, patch_payload = patch_data
+    if patch_type != "diff" or not isinstance(patch_payload, tuple) or len(patch_payload) < 1:
+        return None
+    return patch_payload[0]
+
+
 def load_lora_for_models(model, lora, strength_model):
     key_map = {}
     if model is not None:
@@ -128,6 +275,7 @@ def load_lora_for_models_quantized(model, lora, strength_model):
     new_modelpatcher = model.clone()
 
     grouped_adapters = {}
+    diff_groups = {}
     unsupported_keys = []
     for loaded_key, patch_data in loaded.items():
         key = loaded_key
@@ -151,15 +299,60 @@ def load_lora_for_models_quantized(model, lora, strength_model):
                 {
                     "adapter": patch_data,
                     "offset": offset,
+                    "strength": strength_model,
+                    "key": key,
+                    "handled_keys": {key},
                 }
             )
+            continue
+
+        diff = _diff_tensor_from_patch(patch_data)
+        if diff is not None:
+            if function is not None or offset is not None:
+                unsupported_keys.append(loaded_key)
+                continue
+
+            module_key, param_name = _diff_target_from_key(key)
+            module = _get_module_by_key(new_modelpatcher.model, module_key) if module_key is not None else None
+            if module is None or not hasattr(module, "weight"):
+                unsupported_keys.append(loaded_key)
+                continue
+
+            group = diff_groups.setdefault(module_key, {"weight": None, "bias": None, "handled_keys": set()})
+            group[param_name] = diff
+            group["handled_keys"].add(key)
+
+    for module_key, group in diff_groups.items():
+        module = _get_module_by_key(new_modelpatcher.model, module_key)
+        if module is None:
+            unsupported_keys.extend(group["handled_keys"])
+            continue
+
+        if _is_linear_or_conv_module(module):
+            adapter = DirectDiffBypassAdapter(group.get("weight"), group.get("bias"), key=module_key)
+        else:
+            if module_key in grouped_adapters:
+                unsupported_keys.extend(group["handled_keys"])
+                continue
+            adapter = ParamDiffBypassAdapter(group.get("weight"), group.get("bias"), key=module_key)
+
+        grouped_adapters.setdefault(module_key, []).append(
+            {
+                "adapter": adapter,
+                "offset": None,
+                "strength": strength_model,
+                "key": module_key,
+                "handled_keys": set(group["handled_keys"]),
+            }
+        )
 
     manager = comfy.weight_adapter.BypassInjectionManager()
     loaded_keys = set()
     for key, entries in grouped_adapters.items():
-        loaded_keys.add(key)
+        for item in entries:
+            loaded_keys.update(item.get("handled_keys", {item["key"]}))
         if len(entries) == 1 and entries[0]["offset"] is None:
-            manager.add_adapter(key, entries[0]["adapter"], strength=strength_model)
+            manager.add_adapter(key, entries[0]["adapter"], strength=entries[0]["strength"])
             continue
 
         wrapper_entries = []
@@ -168,8 +361,8 @@ def load_lora_for_models_quantized(model, lora, strength_model):
                 {
                     "adapter": item["adapter"],
                     "offset": item["offset"],
-                    "strength": strength_model,
-                    "key": key,
+                    "strength": item["strength"],
+                    "key": item["key"],
                 }
             )
         manager.add_adapter(key, OffsetBypassAdapter(wrapper_entries), strength=1.0)
@@ -177,11 +370,14 @@ def load_lora_for_models_quantized(model, lora, strength_model):
     injections = manager.create_injections(new_modelpatcher.model)
     new_modelpatcher.set_injections("quantized_lora_bypass", injections)
 
+    reported_keys = set()
     for key in unsupported_keys:
-        logging.warning("SKIP FUNCTIONAL LORA KEY IN QUANTIZED BYPASS MODE {}".format(key))
+        normalized_key = key[0] if isinstance(key, tuple) else key
+        reported_keys.add(normalized_key)
+        logging.warning("SKIP LORA KEY IN QUANTIZED BYPASS MODE {}".format(key))
     for key, patch_data in loaded.items():
         normalized_key = key[0] if isinstance(key, tuple) else key
-        if normalized_key not in loaded_keys:
+        if normalized_key not in loaded_keys and normalized_key not in reported_keys:
             patch_type = getattr(patch_data, "name", None)
             if patch_type is None and isinstance(patch_data, tuple) and len(patch_data) > 0:
                 patch_type = patch_data[0]
