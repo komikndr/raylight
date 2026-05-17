@@ -221,6 +221,12 @@ def _diff_target_from_key(key):
     return None, None
 
 
+def _module_key_from_weight_key(key):
+    if isinstance(key, str) and key.endswith(".weight"):
+        return key[:-7]
+    return key
+
+
 def _is_linear_or_conv_module(module):
     if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)):
         return True
@@ -235,6 +241,35 @@ def _diff_tensor_from_patch(patch_data):
     if patch_type != "diff" or not isinstance(patch_payload, tuple) or len(patch_payload) < 1:
         return None
     return patch_payload[0]
+
+
+def _adapter_dora_scale(adapter):
+    weights = getattr(adapter, "weights", None)
+    name = getattr(adapter, "name", None)
+    if not isinstance(weights, (tuple, list)):
+        return None
+    if name == "lora" and len(weights) > 4:
+        return weights[4]
+    if name == "loha" and len(weights) > 7:
+        return weights[7]
+    if name == "lokr" and len(weights) > 8:
+        return weights[8]
+    return None
+
+
+def _adapter_has_dora(adapter):
+    return _adapter_dora_scale(adapter) is not None
+
+
+def _adapter_has_reshape(adapter):
+    weights = getattr(adapter, "weights", None)
+    if getattr(adapter, "name", None) != "lora" or not isinstance(weights, (tuple, list)):
+        return False
+    return len(weights) > 5 and weights[5] is not None
+
+
+def _sample_keys(keys, limit=8):
+    return [str(key) for key in list(keys)[:limit]]
 
 
 def load_lora_for_models(model, lora, strength_model):
@@ -262,11 +297,13 @@ def load_lora_for_models(model, lora, strength_model):
 
 
 def load_lora_for_models_quantized(model, lora, strength_model):
+    raw_lora_key_count = len(lora)
     key_map = {}
     if model is not None:
         key_map = comfy.lora.model_lora_keys_unet(model.model, key_map)
 
     lora = comfy.lora_convert.convert_lora(lora)
+    converted_lora_key_count = len(lora)
     loaded = comfy_dist.lora.load_lora(lora, key_map)
 
     if model is None:
@@ -277,6 +314,13 @@ def load_lora_for_models_quantized(model, lora, strength_model):
     grouped_adapters = {}
     diff_groups = {}
     unsupported_keys = []
+    adapter_counts = {}
+    direct_diff_counts = {"weight": 0, "bias": 0, "param": 0, "unsupported": 0}
+    dora_keys = []
+    reshape_keys = []
+    offset_keys = []
+    function_keys = []
+    other_patch_counts = {}
     for loaded_key, patch_data in loaded.items():
         key = loaded_key
         offset = None
@@ -291,11 +335,22 @@ def load_lora_for_models_quantized(model, lora, strength_model):
         if not isinstance(key, str):
             continue
 
-        if getattr(patch_data, "name", None) in {"lora", "loha", "lokr"} and hasattr(patch_data, "h"):
+        patch_name = getattr(patch_data, "name", None)
+        if patch_name in {"lora", "loha", "lokr"} and hasattr(patch_data, "h"):
+            adapter_counts[patch_name] = adapter_counts.get(patch_name, 0) + 1
+            if _adapter_has_dora(patch_data):
+                dora_keys.append(key)
+            if _adapter_has_reshape(patch_data):
+                reshape_keys.append(key)
+            if offset is not None:
+                offset_keys.append(loaded_key)
+            if function is not None:
+                function_keys.append(loaded_key)
             if function is not None:
                 unsupported_keys.append(loaded_key)
                 continue
-            grouped_adapters.setdefault(key, []).append(
+            module_key = _module_key_from_weight_key(key)
+            grouped_adapters.setdefault(module_key, []).append(
                 {
                     "adapter": patch_data,
                     "offset": offset,
@@ -309,18 +364,34 @@ def load_lora_for_models_quantized(model, lora, strength_model):
         diff = _diff_tensor_from_patch(patch_data)
         if diff is not None:
             if function is not None or offset is not None:
+                direct_diff_counts["unsupported"] += 1
+                if function is not None:
+                    function_keys.append(loaded_key)
+                if offset is not None:
+                    offset_keys.append(loaded_key)
                 unsupported_keys.append(loaded_key)
                 continue
 
             module_key, param_name = _diff_target_from_key(key)
             module = _get_module_by_key(new_modelpatcher.model, module_key) if module_key is not None else None
             if module is None or not hasattr(module, "weight"):
+                direct_diff_counts["unsupported"] += 1
                 unsupported_keys.append(loaded_key)
                 continue
 
+            if param_name in direct_diff_counts:
+                direct_diff_counts[param_name] += 1
             group = diff_groups.setdefault(module_key, {"weight": None, "bias": None, "handled_keys": set()})
             group[param_name] = diff
             group["handled_keys"].add(key)
+            continue
+
+        patch_type = patch_name
+        if patch_type is None and isinstance(patch_data, tuple) and len(patch_data) > 0:
+            patch_type = patch_data[0]
+        other_patch_counts[str(patch_type or type(patch_data).__name__)] = other_patch_counts.get(
+            str(patch_type or type(patch_data).__name__), 0
+        ) + 1
 
     for module_key, group in diff_groups.items():
         module = _get_module_by_key(new_modelpatcher.model, module_key)
@@ -331,6 +402,7 @@ def load_lora_for_models_quantized(model, lora, strength_model):
         if _is_linear_or_conv_module(module):
             adapter = DirectDiffBypassAdapter(group.get("weight"), group.get("bias"), key=module_key)
         else:
+            direct_diff_counts["param"] += len(group["handled_keys"])
             if module_key in grouped_adapters:
                 unsupported_keys.extend(group["handled_keys"])
                 continue
@@ -368,6 +440,57 @@ def load_lora_for_models_quantized(model, lora, strength_model):
         manager.add_adapter(key, OffsetBypassAdapter(wrapper_entries), strength=1.0)
 
     injections = manager.create_injections(new_modelpatcher.model)
+    get_hook_count = getattr(manager, "get_hook_count", None)
+    if get_hook_count is not None:
+        hook_count = get_hook_count()
+    else:
+        hook_count = len(getattr(manager, "hooks", ()))
+
+    logging.warning(
+        "[Raylight LoRA][quant-bypass] keys raw=%d converted=%d key_map=%d loaded=%d strength=%s",
+        raw_lora_key_count,
+        converted_lora_key_count,
+        len(key_map),
+        len(loaded),
+        strength_model,
+    )
+    logging.warning(
+        "[Raylight LoRA][quant-bypass] adapters=%s direct_diff=%s other=%s grouped=%d unsupported=%d hooks=%d",
+        adapter_counts,
+        direct_diff_counts,
+        other_patch_counts,
+        len(grouped_adapters),
+        len(unsupported_keys),
+        hook_count,
+    )
+    if dora_keys:
+        logging.warning(
+            "[Raylight LoRA][quant-bypass] DoRA adapters routed through output-delta bypass: count=%d sample=%s. "
+            "This does not match Comfy TensorCore merged-weight LoRA semantics.",
+            len(dora_keys),
+            _sample_keys(dora_keys),
+        )
+    if reshape_keys:
+        logging.warning(
+            "[Raylight LoRA][quant-bypass] reshape adapters routed through output-delta bypass: count=%d sample=%s",
+            len(reshape_keys),
+            _sample_keys(reshape_keys),
+        )
+    if offset_keys:
+        logging.warning(
+            "[Raylight LoRA][quant-bypass] offset LoRA entries present: count=%d sample=%s",
+            len(offset_keys),
+            _sample_keys(offset_keys),
+        )
+    if function_keys:
+        logging.warning(
+            "[Raylight LoRA][quant-bypass] function LoRA entries are unsupported in quantized bypass: count=%d sample=%s",
+            len(function_keys),
+            _sample_keys(function_keys),
+        )
+    if len(loaded) > 0 and hook_count == 0:
+        logging.warning("[Raylight LoRA][quant-bypass] loaded patches are nonzero but created bypass hooks=0")
+
     new_modelpatcher.set_injections("quantized_lora_bypass", injections)
 
     reported_keys = set()
