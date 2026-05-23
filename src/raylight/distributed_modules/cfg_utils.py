@@ -23,6 +23,11 @@ _DEFAULT_SKIP_EXTRA_KWARGS = frozenset(
 def _find_batch_tensor(value):
     if isinstance(value, torch.Tensor):
         return value
+    if isinstance(value, dict):
+        for item in value.values():
+            tensor = _find_batch_tensor(item)
+            if tensor is not None:
+                return tensor
     if isinstance(value, (list, tuple)):
         for item in value:
             tensor = _find_batch_tensor(item)
@@ -51,6 +56,8 @@ def _chunk_value(value, cfg_world_size, cfg_rank):
         return None
     if isinstance(value, torch.Tensor):
         return _chunk_tensor(value, cfg_world_size, cfg_rank)
+    if isinstance(value, dict):
+        return {key: _chunk_value(item, cfg_world_size, cfg_rank) for key, item in value.items()}
     if isinstance(value, list):
         return [_chunk_value(item, cfg_world_size, cfg_rank) for item in value]
     if isinstance(value, tuple):

@@ -200,6 +200,123 @@ class ParamDiffBypassAdapter(comfy.weight_adapter.WeightAdapterBase):
                 module.bias.data = orig_bias
 
 
+class MergedWeightBypassAdapter(comfy.weight_adapter.WeightAdapterBase):
+    name = "merged_weight_bypass"
+    _logged_calls = 0
+    _max_logged_calls = 16
+
+    def __init__(self, key, weight_patches=None, bias_patches=None):
+        self.key = key
+        self.weight_key = f"{key}.weight"
+        self.bias_key = f"{key}.bias"
+        self.weight_patches = weight_patches or []
+        self.bias_patches = bias_patches or []
+        self.weights = []
+        self._warned = False
+        self._logged = False
+
+    def _warn(self, message, *args):
+        if self._warned:
+            return
+        self._warned = True
+        logging.warning(message, *args)
+
+    def _tensor_data(self, value):
+        if value is None:
+            return None
+        return getattr(value, "data", value)
+
+    def _materialize_tensor(self, value, device, dtype, label):
+        tensor = self._tensor_data(value)
+        if tensor is None:
+            return None, False
+
+        was_quantized = hasattr(tensor, "_qdata") and hasattr(tensor, "_layout_cls") and hasattr(tensor, "_params")
+        try:
+            if was_quantized:
+                tensor = tensor.dequantize()
+            return tensor.to(device=device, dtype=dtype, copy=True), was_quantized
+        except Exception as e:
+            self._warn("[Raylight LoRA][merged-forward] materialize failed key=%s.%s error=%s", self.key, label, e)
+            return None, was_quantized
+
+    def _patched_weight(self, module, x):
+        weight, was_quantized = self._materialize_tensor(getattr(module, "weight", None), x.device, x.dtype, "weight")
+        if weight is None:
+            return None, was_quantized
+        if self.weight_patches:
+            weight = comfy_dist.lora.calculate_weight(
+                self.weight_patches,
+                weight,
+                self.weight_key,
+                intermediate_dtype=weight.dtype,
+            )
+        return weight, was_quantized
+
+    def _patched_bias(self, module, x, out_features):
+        bias_param = getattr(module, "bias", None)
+        if bias_param is None:
+            if not self.bias_patches:
+                return None
+            bias = torch.zeros((out_features,), device=x.device, dtype=x.dtype)
+        else:
+            bias, _ = self._materialize_tensor(bias_param, x.device, x.dtype, "bias")
+            if bias is None:
+                return None
+
+        if self.bias_patches:
+            bias = comfy_dist.lora.calculate_weight(
+                self.bias_patches,
+                bias,
+                self.bias_key,
+                intermediate_dtype=bias.dtype,
+            )
+        return bias
+
+    def _log_first_call(self, module, x, weight, was_quantized):
+        if self._logged:
+            return
+        self._logged = True
+        if MergedWeightBypassAdapter._logged_calls >= MergedWeightBypassAdapter._max_logged_calls:
+            return
+        MergedWeightBypassAdapter._logged_calls += 1
+        logging.warning(
+            "[Raylight LoRA][merged-forward] first_call key=%s module=%s input=%s weight=%s "
+            "weight_patches=%d bias_patches=%d dtype=%s device=%s quantized=%s",
+            self.key,
+            type(module).__name__,
+            tuple(x.shape),
+            tuple(weight.shape),
+            len(self.weight_patches),
+            len(self.bias_patches),
+            weight.dtype,
+            weight.device,
+            was_quantized,
+        )
+
+    def bypass_forward(self, org_forward, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        module = getattr(org_forward, "__self__", None)
+        if module is None:
+            self._warn("[Raylight LoRA][merged-forward] missing bound module key=%s", self.key)
+            return org_forward(x, *args, **kwargs)
+
+        weight, was_quantized = self._patched_weight(module, x)
+        if weight is None:
+            return org_forward(x, *args, **kwargs)
+
+        bias = self._patched_bias(module, x, weight.shape[0])
+        self._log_first_call(module, x, weight, was_quantized)
+
+        try:
+            if getattr(self, "is_conv", False):
+                conv_fn = (F.conv1d, F.conv2d, F.conv3d)[self.conv_dim - 1]
+                return conv_fn(x, weight, bias, **getattr(self, "kw_dict", {}))
+            return F.linear(x, weight, bias)
+        except Exception as e:
+            self._warn("[Raylight LoRA][merged-forward] forward failed key=%s error=%s", self.key, e)
+            return org_forward(x, *args, **kwargs)
+
+
 def _get_module_by_key(model, key):
     module = model
     try:
@@ -321,6 +438,14 @@ def load_lora_for_models_quantized(model, lora, strength_model):
     offset_keys = []
     function_keys = []
     other_patch_counts = {}
+    merged_patch_groups = {}
+
+    def merged_group(module_key):
+        return merged_patch_groups.setdefault(
+            module_key,
+            {"weight_patches": [], "bias_patches": [], "handled_keys": set()},
+        )
+
     for loaded_key, patch_data in loaded.items():
         key = loaded_key
         offset = None
@@ -350,15 +475,21 @@ def load_lora_for_models_quantized(model, lora, strength_model):
                 unsupported_keys.append(loaded_key)
                 continue
             module_key = _module_key_from_weight_key(key)
-            grouped_adapters.setdefault(module_key, []).append(
-                {
-                    "adapter": patch_data,
-                    "offset": offset,
-                    "strength": strength_model,
-                    "key": key,
-                    "handled_keys": {key},
-                }
-            )
+            module = _get_module_by_key(new_modelpatcher.model, module_key)
+            if module is not None and _is_linear_or_conv_module(module):
+                group = merged_group(module_key)
+                group["weight_patches"].append((strength_model, patch_data, 1.0, offset, function))
+                group["handled_keys"].add(key)
+            else:
+                grouped_adapters.setdefault(module_key, []).append(
+                    {
+                        "adapter": patch_data,
+                        "offset": offset,
+                        "strength": strength_model,
+                        "key": key,
+                        "handled_keys": {key},
+                    }
+                )
             continue
 
         diff = _diff_tensor_from_patch(patch_data)
@@ -381,6 +512,12 @@ def load_lora_for_models_quantized(model, lora, strength_model):
 
             if param_name in direct_diff_counts:
                 direct_diff_counts[param_name] += 1
+            if _is_linear_or_conv_module(module):
+                group = merged_group(module_key)
+                group[f"{param_name}_patches"].append((strength_model, patch_data, 1.0, None, None))
+                group["handled_keys"].add(key)
+                continue
+
             group = diff_groups.setdefault(module_key, {"weight": None, "bias": None, "handled_keys": set()})
             group[param_name] = diff
             group["handled_keys"].add(key)
@@ -417,6 +554,28 @@ def load_lora_for_models_quantized(model, lora, strength_model):
                 "handled_keys": set(group["handled_keys"]),
             }
         )
+
+    merged_forward_count = 0
+    merged_weight_patch_count = 0
+    merged_bias_patch_count = 0
+    for module_key, group in merged_patch_groups.items():
+        weight_patches = group["weight_patches"]
+        bias_patches = group["bias_patches"]
+        if not weight_patches and not bias_patches:
+            continue
+        adapter = MergedWeightBypassAdapter(module_key, weight_patches, bias_patches)
+        grouped_adapters.setdefault(module_key, []).append(
+            {
+                "adapter": adapter,
+                "offset": None,
+                "strength": 1.0,
+                "key": module_key,
+                "handled_keys": set(group["handled_keys"]),
+            }
+        )
+        merged_forward_count += 1
+        merged_weight_patch_count += len(weight_patches)
+        merged_bias_patch_count += len(bias_patches)
 
     manager = comfy.weight_adapter.BypassInjectionManager()
     loaded_keys = set()
@@ -463,16 +622,21 @@ def load_lora_for_models_quantized(model, lora, strength_model):
         len(unsupported_keys),
         hook_count,
     )
+    logging.warning(
+        "[Raylight LoRA][merged-forward] groups=%d weight_patches=%d bias_patches=%d",
+        merged_forward_count,
+        merged_weight_patch_count,
+        merged_bias_patch_count,
+    )
     if dora_keys:
         logging.warning(
-            "[Raylight LoRA][quant-bypass] DoRA adapters routed through output-delta bypass: count=%d sample=%s. "
-            "This does not match Comfy TensorCore merged-weight LoRA semantics.",
+            "[Raylight LoRA][merged-forward] DoRA adapters present: count=%d sample=%s",
             len(dora_keys),
             _sample_keys(dora_keys),
         )
     if reshape_keys:
         logging.warning(
-            "[Raylight LoRA][quant-bypass] reshape adapters routed through output-delta bypass: count=%d sample=%s",
+            "[Raylight LoRA][merged-forward] reshape adapters present: count=%d sample=%s",
             len(reshape_keys),
             _sample_keys(reshape_keys),
         )

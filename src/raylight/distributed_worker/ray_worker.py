@@ -68,6 +68,98 @@ def patch_enable_comfy_kitchen_fsdp(fn):
     return wrapper
 
 
+def _get_guider_conditionings(guider_spec):
+    guider_type = guider_spec.get("type")
+    if guider_type == "basic":
+        return [guider_spec["positive"]]
+    if guider_type == "cfg":
+        return [guider_spec["positive"], guider_spec["negative"]]
+    if guider_type == "dual_cfg":
+        return [guider_spec["positive"], guider_spec["middle"], guider_spec["negative"]]
+    raise ValueError(f"Unsupported RAY_GUIDER type: {guider_type!r}")
+
+
+def _build_ray_guider(model, guider_spec):
+    import math
+
+    import comfy.samplers
+    import node_helpers
+
+    guider_type = guider_spec.get("type")
+
+    if guider_type == "basic":
+        class RayGuiderBasic(comfy.samplers.CFGGuider):
+            def set_conds(self, positive):
+                self.inner_set_conds({"positive": positive})
+
+        guider = RayGuiderBasic(model)
+        guider.set_conds(guider_spec["positive"])
+        return guider
+
+    if guider_type == "cfg":
+        guider = comfy.samplers.CFGGuider(model)
+        guider.set_conds(guider_spec["positive"], guider_spec["negative"])
+        guider.set_cfg(guider_spec["cfg"])
+        return guider
+
+    if guider_type != "dual_cfg":
+        raise ValueError(f"Unsupported RAY_GUIDER type: {guider_type!r}")
+
+    class RayGuiderDualCFG(comfy.samplers.CFGGuider):
+        def set_cfg(self, cfg1, cfg2, nested=False):
+            self.cfg1 = cfg1
+            self.cfg2 = cfg2
+            self.nested = nested
+
+        def set_conds(self, positive, middle, negative):
+            middle = node_helpers.conditioning_set_values(middle, {"prompt_type": "negative"})
+            self.inner_set_conds({"positive": positive, "middle": middle, "negative": negative})
+
+        def predict_noise(self, x, timestep, model_options={}, seed=None):
+            negative_cond = self.conds.get("negative", None)
+            middle_cond = self.conds.get("middle", None)
+            positive_cond = self.conds.get("positive", None)
+
+            if self.nested:
+                out = comfy.samplers.calc_cond_batch(self.inner_model, [negative_cond, middle_cond, positive_cond], x, timestep, model_options)
+                pred_text = comfy.samplers.cfg_function(
+                    self.inner_model,
+                    out[2],
+                    out[1],
+                    self.cfg1,
+                    x,
+                    timestep,
+                    model_options=model_options,
+                    cond=positive_cond,
+                    uncond=middle_cond,
+                )
+                return out[0] + self.cfg2 * (pred_text - out[0])
+
+            if not model_options.get("disable_cfg1_optimization", False):
+                if math.isclose(self.cfg2, 1.0):
+                    negative_cond = None
+                    if math.isclose(self.cfg1, 1.0):
+                        middle_cond = None
+
+            out = comfy.samplers.calc_cond_batch(self.inner_model, [negative_cond, middle_cond, positive_cond], x, timestep, model_options)
+            return comfy.samplers.cfg_function(
+                self.inner_model,
+                out[1],
+                out[0],
+                self.cfg2,
+                x,
+                timestep,
+                model_options=model_options,
+                cond=middle_cond,
+                uncond=negative_cond,
+            ) + (out[2] - out[1]) * self.cfg1
+
+    guider = RayGuiderDualCFG(model)
+    guider.set_conds(guider_spec["positive"], guider_spec["middle"], guider_spec["negative"])
+    guider.set_cfg(guider_spec["cfg1"], guider_spec["cfg2"], guider_spec.get("nested", False))
+    return guider
+
+
 class RayWorker:
     def __init__(self, local_rank, device_id, parallel_dict):
         from raylight.comfy_dist import patch_base_getattr
@@ -710,6 +802,103 @@ class RayWorker:
 
     def ray_vae_decode_finalize(self, decoded):
         return ray_vae_decode_finalize_impl(self, decoded)
+
+    @patch_temp_fix_ck_ops
+    @patch_ray_tqdm
+    @patch_enable_comfy_kitchen_fsdp
+    def custom_sampler_advanced(
+        self,
+        add_noise,
+        noise_seed,
+        guider_spec,
+        sampler,
+        sigmas,
+        latent_image,
+        grouped_output=False,
+    ):
+        import comfy.model_management as comfy_model_management
+        import comfy.nested_tensor as comfy_nested_tensor
+        import comfy.sample as comfy_sample
+        import comfy.utils as comfy_utils
+        import latent_preview
+
+        for cond_list in _get_guider_conditionings(guider_spec):
+            _restore_controlnet_refs(cond_list, self.cached_controlnet, self.vae_model)
+            _remap_conditioning_devices(cond_list, None)
+            _prepare_control_models(cond_list, None)
+
+        latent = latent_image
+        latent_image = latent["samples"]
+        latent = latent.copy()
+        latent_image = comfy_sample.fix_empty_latent_channels(
+            self.model,
+            latent_image,
+            latent.get("downscale_ratio_spacial", None),
+            latent.get("downscale_ratio_temporal", None),
+        )
+        latent["samples"] = latent_image
+
+        noise_source = Noise_RandomNoise(noise_seed) if add_noise else Noise_EmptyNoise()
+        noise = noise_source.generate_noise(latent)
+
+        noise_mask = None
+        if "noise_mask" in latent:
+            noise_mask = latent["noise_mask"]
+
+        if self.parallel_dict["is_fsdp"] is True:
+            self.model.patch_fsdp()
+            del self.state_dict
+            self.state_dict = None
+            torch.cuda.synchronize()
+            comfy_model_management.soft_empty_cache()
+            gc.collect()
+
+        guider = _build_ray_guider(self.model, guider_spec)
+        x0_output = {}
+        callback = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1, x0_output)
+
+        disable_pbar = comfy_utils.PROGRESS_BAR_ENABLED
+        if self.local_rank == 0:
+            disable_pbar = not comfy_utils.PROGRESS_BAR_ENABLED
+
+        with torch.no_grad():
+            samples = guider.sample(
+                noise,
+                latent_image,
+                sampler,
+                sigmas,
+                denoise_mask=noise_mask,
+                callback=callback,
+                disable_pbar=disable_pbar,
+                seed=noise_source.seed,
+            )
+            samples = samples.to(comfy_model_management.intermediate_device())
+
+            out = latent.copy()
+            out.pop("downscale_ratio_spacial", None)
+            out.pop("downscale_ratio_temporal", None)
+            out["samples"] = samples
+
+            if "x0" in x0_output:
+                x0_out = guider.model_patcher.model.process_latent_out(x0_output["x0"].cpu())
+                if samples.is_nested:
+                    latent_shapes = [x.shape for x in samples.unbind()]
+                    x0_out = comfy_nested_tensor.NestedTensor(comfy_utils.unpack_latents(x0_out, latent_shapes))
+                out_denoised = latent.copy()
+                out_denoised["samples"] = x0_out
+            else:
+                out_denoised = out
+
+        try:
+            self.model.cleanup()
+        except Exception:
+            pass
+        comfy_model_management.soft_empty_cache()
+        gc.collect()
+        result = (out, out_denoised)
+        if grouped_output:
+            return self._grouped_sampling_result(result)
+        return result
 
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm

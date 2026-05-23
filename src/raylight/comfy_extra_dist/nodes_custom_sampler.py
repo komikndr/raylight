@@ -13,6 +13,40 @@ from .ray_patch_decorator import ray_patch_with_return
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise
 
 
+def _make_ray_guider(ray_actors, guider_type, **kwargs):
+    guider = {"ray_actors": ray_actors, "type": guider_type}
+    guider.update(kwargs)
+    return guider
+
+
+def _extract_ray_actors_from_guider(guider):
+    if not isinstance(guider, dict) or "ray_actors" not in guider:
+        raise ValueError("Expected a RAY_GUIDER created by Raylight guider nodes")
+    return guider["ray_actors"]
+
+
+def _normalize_grouped_guiders(guiders: list, expected_length: int):
+    guiders = _normalize_grouped_inputs(guiders, expected_length, "guider")
+    ray_actors = None
+    for guider in guiders:
+        current_ray_actors = _extract_ray_actors_from_guider(guider)
+        if ray_actors is None:
+            ray_actors = current_ray_actors
+            continue
+        if current_ray_actors is not ray_actors and current_ray_actors != ray_actors:
+            raise ValueError("All RAY_GUIDER inputs must be created from the same ray actor set")
+    return guiders, ray_actors
+
+
+def _split_advanced_results(results: list):
+    outputs = []
+    denoised_outputs = []
+    for output, denoised_output in results:
+        outputs.append(output)
+        denoised_outputs.append(denoised_output)
+    return outputs, denoised_outputs
+
+
 def _normalize_grouped_inputs(values: list, expected_length: int, label: str):
     if len(values) == expected_length:
         return values
@@ -262,6 +296,156 @@ class RaySamplerSASolver(ComfyNodeABC):
         return (sampler,)
 
 
+class RayBasicGuider:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "conditioning": ("CONDITIONING",),
+            }
+        }
+
+    RETURN_TYPES = ("RAY_GUIDER",)
+    RETURN_NAMES = ("guider",)
+    FUNCTION = "get_guider"
+    CATEGORY = "Raylight/extra/custom_sampling/guiders"
+
+    def get_guider(self, ray_actors, conditioning):
+        return (_make_ray_guider(ray_actors, "basic", positive=conditioning),)
+
+
+class RayCFGGuider:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "cfg": (
+                    "FLOAT",
+                    {
+                        "default": 8.0,
+                        "min": 0.0,
+                        "max": 100.0,
+                        "step": 0.1,
+                        "round": 0.01,
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("RAY_GUIDER",)
+    RETURN_NAMES = ("guider",)
+    FUNCTION = "get_guider"
+    CATEGORY = "Raylight/extra/custom_sampling/guiders"
+
+    def get_guider(self, ray_actors, positive, negative, cfg):
+        return (_make_ray_guider(ray_actors, "cfg", positive=positive, negative=negative, cfg=cfg),)
+
+
+class RayDualCFGGuider:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "cond1": ("CONDITIONING",),
+                "cond2": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "cfg_conds": (
+                    "FLOAT",
+                    {
+                        "default": 8.0,
+                        "min": 0.0,
+                        "max": 100.0,
+                        "step": 0.1,
+                        "round": 0.01,
+                    },
+                ),
+                "cfg_cond2_negative": (
+                    "FLOAT",
+                    {
+                        "default": 8.0,
+                        "min": 0.0,
+                        "max": 100.0,
+                        "step": 0.1,
+                        "round": 0.01,
+                    },
+                ),
+                "style": (["regular", "nested"],),
+            }
+        }
+
+    RETURN_TYPES = ("RAY_GUIDER",)
+    RETURN_NAMES = ("guider",)
+    FUNCTION = "get_guider"
+    CATEGORY = "Raylight/extra/custom_sampling/guiders"
+
+    def get_guider(self, ray_actors, cond1, cond2, negative, cfg_conds, cfg_cond2_negative, style):
+        return (
+            _make_ray_guider(
+                ray_actors,
+                "dual_cfg",
+                positive=cond1,
+                middle=cond2,
+                negative=negative,
+                cfg1=cfg_conds,
+                cfg2=cfg_cond2_negative,
+                nested=(style == "nested"),
+            ),
+        )
+
+
+class XFuserSamplerCustomAdvanced:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "add_noise": ("BOOLEAN", {"default": True}),
+                "noise_seed": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 0xFFFFFFFFFFFFFFFF,
+                        "control_after_generate": True,
+                    },
+                ),
+                "guider": ("RAY_GUIDER",),
+                "sampler": ("SAMPLER",),
+                "sigmas": ("SIGMAS",),
+                "latent_image": ("LATENT",),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT", "LATENT", "RAY_ACTORS")
+    RETURN_NAMES = ("output", "denoised_output", "ray_actors")
+    FUNCTION = "ray_sample"
+    CATEGORY = "Raylight/extra/custom_sampling/samplers"
+
+    def ray_sample(self, add_noise, noise_seed, guider, sampler, sigmas, latent_image):
+        gc.collect()
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        ray_actors = _extract_ray_actors_from_guider(guider)
+        gpu_actors = ray_actors["workers"]
+        futures = [
+            actor.custom_sampler_advanced.remote(
+                add_noise,
+                noise_seed,
+                guider,
+                sampler,
+                sigmas,
+                latent_image,
+            )
+            for actor in gpu_actors
+        ]
+        output, denoised_output = ray.get(futures)[0]
+        return (output, denoised_output, ray_actors)
+
+
 class XFuserSamplerCustom:
     @classmethod
     def INPUT_TYPES(s):
@@ -335,6 +519,65 @@ class XFuserSamplerCustom:
         results = ray.get(futures)
         out = results[0]
         return (out, ray_actors)
+
+
+class UnifiedParallelSamplerCustomAdvanced:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "add_noise": ("BOOLEAN", {"default": True}),
+                "noise_list": ("NOISE",),
+                "guider": ("RAY_GUIDER",),
+                "sampler": ("SAMPLER",),
+                "sigmas": ("SIGMAS",),
+                "latent_image": ("LATENT",),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT", "LATENT", "RAY_ACTORS")
+    RETURN_NAMES = ("output", "denoised_output", "ray_actors")
+    OUTPUT_IS_LIST = (True, True, False)
+    INPUT_IS_LIST = True
+    FUNCTION = "ray_sample"
+    CATEGORY = "Raylight/extra/custom_sampling/samplers"
+
+    def ray_sample(self, add_noise, noise_list, guider, sampler, sigmas, latent_image):
+        add_noise = add_noise[0]
+        sampler = sampler[0]
+        sigmas = sigmas[0]
+
+        gc.collect()
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+
+        initial_ray_actors = _extract_ray_actors_from_guider(guider[0])
+        gpu_actors = initial_ray_actors["workers"]
+        parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+        group_infos = ray.get([actor.get_exec_group_info.remote() for actor in gpu_actors])
+        _validate_unified_parallel_setup(parallel_dict, group_infos, "Unified Parallel SamplerCustomAdvanced")
+        dp_degree = int(group_infos[0]["dp_degree"])
+
+        noise_list = _normalize_grouped_inputs(noise_list, dp_degree, "noise_list")
+        guider, ray_actors = _normalize_grouped_guiders(guider, dp_degree)
+        latent_image = _normalize_grouped_inputs(latent_image, dp_degree, "latent_image")
+
+        futures = [
+            actor.custom_sampler_advanced.remote(
+                add_noise,
+                noise_list[group_info["dp_rank"]],
+                guider[group_info["dp_rank"]],
+                sampler,
+                sigmas,
+                latent_image[group_info["dp_rank"]],
+                grouped_output=True,
+            )
+            for actor, group_info in zip(gpu_actors, group_infos)
+        ]
+        results = ray.get(futures)
+        results = _collect_grouped_results(results, dp_degree, "Unified Parallel SamplerCustomAdvanced")
+        outputs, denoised_outputs = _split_advanced_results(results)
+        return (outputs, denoised_outputs, ray_actors)
 
 
 class UnifiedParallelSamplerCustom:
@@ -420,6 +663,60 @@ class UnifiedParallelSamplerCustom:
         results = ray.get(futures)
         out = _collect_grouped_results(results, dp_degree, "Unified Parallel SamplerCustom")
         return (out, ray_actors)
+
+
+class DPSamplerCustomAdvanced:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "add_noise": ("BOOLEAN", {"default": True}),
+                "noise_list": ("NOISE",),
+                "guider": ("RAY_GUIDER",),
+                "sampler": ("SAMPLER",),
+                "sigmas": ("SIGMAS",),
+                "latent_image": ("LATENT",),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT", "LATENT", "RAY_ACTORS")
+    RETURN_NAMES = ("output", "denoised_output", "ray_actors")
+    OUTPUT_IS_LIST = (True, True, False)
+    INPUT_IS_LIST = True
+    FUNCTION = "ray_sample"
+    CATEGORY = "Raylight/extra/custom_sampling/samplers"
+
+    def ray_sample(self, add_noise, noise_list, guider, sampler, sigmas, latent_image):
+        add_noise = add_noise[0]
+        sampler = sampler[0]
+        sigmas = sigmas[0]
+
+        gc.collect()
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+
+        initial_ray_actors = _extract_ray_actors_from_guider(guider[0])
+        gpu_actors = initial_ray_actors["workers"]
+        num_gpus = len(gpu_actors)
+
+        guider, ray_actors = _normalize_grouped_guiders(guider, num_gpus)
+        latent_image = _normalize_grouped_inputs(latent_image, num_gpus, "latent_image")
+        noise_list = _normalize_grouped_inputs(noise_list, num_gpus, "noise_list")
+
+        futures = [
+            actor.custom_sampler_advanced.remote(
+                add_noise,
+                noise_list[i],
+                guider[i],
+                sampler,
+                sigmas,
+                latent_image[i],
+            )
+            for i, actor in enumerate(gpu_actors)
+        ]
+        results = ray.get(futures)
+        outputs, denoised_outputs = _split_advanced_results(results)
+        return (outputs, denoised_outputs, ray_actors)
 
 
 class DPSamplerCustom:
@@ -572,8 +869,14 @@ class RayAddNoise:
 
 
 NODE_CLASS_MAPPINGS = {
+    "RayBasicGuider": RayBasicGuider,
+    "RayCFGGuider": RayCFGGuider,
+    "RayDualCFGGuider": RayDualCFGGuider,
+    "XFuserSamplerCustomAdvanced": XFuserSamplerCustomAdvanced,
     "XFuserSamplerCustom": XFuserSamplerCustom,
+    "UnifiedParallelSamplerCustomAdvanced": UnifiedParallelSamplerCustomAdvanced,
     "UnifiedParallelSamplerCustom": UnifiedParallelSamplerCustom,
+    "DPSamplerCustomAdvanced": DPSamplerCustomAdvanced,
     "DPSamplerCustom": DPSamplerCustom,
     "RayBasicScheduler": RayBasicScheduler,
     "RayBetaSamplingScheduler": RayBetaSamplingScheduler,
@@ -583,7 +886,13 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "RayBasicGuider": "Basic Guider (Ray)",
+    "RayCFGGuider": "CFG Guider (Ray)",
+    "RayDualCFGGuider": "Dual CFG Guider (Ray)",
+    "XFuserSamplerCustomAdvanced": "XFuser SamplerCustom Advanced",
     "XFuserSamplerCustom": "XFuser SamplerCustom",
+    "UnifiedParallelSamplerCustomAdvanced": "Unified Parallel SamplerCustom Advanced",
     "UnifiedParallelSamplerCustom": "Unified Parallel SamplerCustom (Advance)",
+    "DPSamplerCustomAdvanced": "Data Parallel SamplerCustom Advanced",
     "DPSamplerCustom": "Data Parallel SamplerCustom",
 }
