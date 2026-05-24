@@ -76,6 +76,8 @@ def _get_guider_conditionings(guider_spec):
         return [guider_spec["positive"], guider_spec["negative"]]
     if guider_type == "dual_cfg":
         return [guider_spec["positive"], guider_spec["middle"], guider_spec["negative"]]
+    if "positive" in guider_spec and "negative" in guider_spec:
+        return [guider_spec["positive"], guider_spec["negative"]]
     raise ValueError(f"Unsupported RAY_GUIDER type: {guider_type!r}")
 
 
@@ -84,6 +86,8 @@ def _build_ray_guider(model, guider_spec):
 
     import comfy.samplers
     import node_helpers
+
+    from raylight.expansion.comfyui_ltxv.guiders import build_ltxv_ray_guider
 
     guider_type = guider_spec.get("type")
 
@@ -101,6 +105,10 @@ def _build_ray_guider(model, guider_spec):
         guider.set_conds(guider_spec["positive"], guider_spec["negative"])
         guider.set_cfg(guider_spec["cfg"])
         return guider
+
+    ltxv_guider = build_ltxv_ray_guider(model, guider_spec)
+    if ltxv_guider is not None:
+        return ltxv_guider
 
     if guider_type != "dual_cfg":
         raise ValueError(f"Unsupported RAY_GUIDER type: {guider_type!r}")
