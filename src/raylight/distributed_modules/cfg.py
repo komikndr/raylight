@@ -59,6 +59,33 @@ if hasattr(model_base, "QwenImage"):
         return cfg_parallel_forward_wrapper
 
 
+if hasattr(model_base, "Lens"):
+
+    @CFGParallelInjectRegistry.register(model_base.Lens)
+    def _inject_lens():
+        from ..diffusion_models.lens.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "PiD"):
+
+    @CFGParallelInjectRegistry.register(model_base.PiD)
+    def _inject_pid():
+        from ..diffusion_models.pixeldit.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
+if hasattr(model_base, "PixelDiTT2I"):
+
+    @CFGParallelInjectRegistry.register(model_base.PixelDiTT2I)
+    def _inject_pixeldit():
+        from ..diffusion_models.pixeldit.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
 if hasattr(model_base, "Chroma"):
 
     @CFGParallelInjectRegistry.register(model_base.ChromaRadiance)

@@ -54,6 +54,14 @@ def _patch_wan_attention_blocks(
                 block.cross_attn.forward = types.MethodType(usp_i2v_cross_attn_forward, block.cross_attn)
 
 
+def _patch_pixeldit_blocks(model, usp_joint_attention_forward, usp_rotary_attention_forward, usp_pit_block_forward):
+    for block in model.patch_blocks:
+        block.attn.forward = types.MethodType(usp_joint_attention_forward, block.attn)
+    for block in model.pixel_blocks:
+        block.attn.forward = types.MethodType(usp_rotary_attention_forward, block.attn)
+        block.forward = types.MethodType(usp_pit_block_forward, block)
+
+
 if hasattr(model_base, "WAN21_Vace"):
 
     @USPInjectRegistry.register(model_base.WAN21_Vace)
@@ -361,6 +369,50 @@ if hasattr(model_base, "QwenImage"):
         for block in model.transformer_blocks:
             block.attn.forward = types.MethodType(usp_attn_forward, block.attn)
         model._forward = types.MethodType(usp_dit_forward, model)
+
+
+if hasattr(model_base, "Lens"):
+
+    @USPInjectRegistry.register(model_base.Lens)
+    def _inject_lens(model_patcher, base_model, *args):
+        from ..diffusion_models.lens.xdit_context_parallel import usp_lens_forward, usp_lens_attention_forward
+
+        model = base_model.diffusion_model
+        for block in model.transformer_blocks:
+            block.attn.forward = types.MethodType(usp_lens_attention_forward, block.attn)
+        model._forward = types.MethodType(usp_lens_forward, model)
+
+
+if hasattr(model_base, "PiD"):
+
+    @USPInjectRegistry.register(model_base.PiD)
+    def _inject_pid(model_patcher, base_model, *args):
+        from ..diffusion_models.pixeldit.xdit_context_parallel import (
+            usp_joint_attention_forward,
+            usp_pid_forward,
+            usp_pit_block_forward,
+            usp_rotary_attention_forward,
+        )
+
+        model = base_model.diffusion_model
+        _patch_pixeldit_blocks(model, usp_joint_attention_forward, usp_rotary_attention_forward, usp_pit_block_forward)
+        model._forward = types.MethodType(usp_pid_forward, model)
+
+
+if hasattr(model_base, "PixelDiTT2I"):
+
+    @USPInjectRegistry.register(model_base.PixelDiTT2I)
+    def _inject_pixeldit(model_patcher, base_model, *args):
+        from ..diffusion_models.pixeldit.xdit_context_parallel import (
+            usp_joint_attention_forward,
+            usp_pit_block_forward,
+            usp_pixdit_forward,
+            usp_rotary_attention_forward,
+        )
+
+        model = base_model.diffusion_model
+        _patch_pixeldit_blocks(model, usp_joint_attention_forward, usp_rotary_attention_forward, usp_pit_block_forward)
+        model._forward = types.MethodType(usp_pixdit_forward, model)
 
 
 if hasattr(model_base, "CosmosPredict2"):
