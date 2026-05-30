@@ -1,6 +1,8 @@
 import os
 import sys
 import gc
+import json
+import logging
 import functools
 from datetime import timedelta
 
@@ -68,6 +70,58 @@ def patch_enable_comfy_kitchen_fsdp(fn):
     return wrapper
 
 
+# To pass comfyui cli basically
+def _apply_worker_comfy_cli_args_from_env():
+    raw_args = os.environ.get("RAYLIGHT_COMFY_CLI_ARGS_JSON")
+    if not raw_args:
+        return
+
+    try:
+        worker_cli_args = json.loads(raw_args)
+    except Exception as exc:
+        logging.warning(f"Failed to parse RAYLIGHT_COMFY_CLI_ARGS_JSON: {exc}")
+        return
+
+    try:
+        import comfy.cli_args
+        import comfy.model_management as comfy_model_management
+        import comfy.utils as comfy_utils
+    except Exception as exc:
+        logging.warning(f"Failed to import Comfy modules for worker CLI arg sync: {exc}")
+        return
+
+    comfy_args = comfy.cli_args.args
+    for key, value in worker_cli_args.items():
+        if hasattr(comfy_args, key):
+            setattr(comfy_args, key, value)
+
+    if "disable_mmap" in worker_cli_args:
+        comfy_utils.DISABLE_MMAP = bool(worker_cli_args["disable_mmap"])
+    if "mmap_torch_files" in worker_cli_args:
+        comfy_utils.MMAP_TORCH_FILES = bool(worker_cli_args["mmap_torch_files"])
+
+    if "disable_smart_memory" in worker_cli_args:
+        comfy_model_management.DISABLE_SMART_MEMORY = bool(worker_cli_args["disable_smart_memory"])
+
+    reserve_vram = worker_cli_args.get("reserve_vram")
+    if reserve_vram is not None:
+        comfy_model_management.EXTRA_RESERVED_VRAM = reserve_vram * 1024 * 1024 * 1024
+
+    if worker_cli_args.get("disable_pinned_memory", False):
+        comfy_model_management.MAX_PINNED_MEMORY = -1
+
+        def _pin_memory_disabled(tensor):
+            del tensor
+            return False
+
+        def _unpin_memory_disabled(tensor):
+            del tensor
+            return False
+
+        comfy_model_management.pin_memory = _pin_memory_disabled
+        comfy_model_management.unpin_memory = _unpin_memory_disabled
+
+
 def _get_guider_conditionings(guider_spec):
     guider_type = guider_spec.get("type")
     if guider_type == "basic":
@@ -79,6 +133,19 @@ def _get_guider_conditionings(guider_spec):
     if "positive" in guider_spec and "negative" in guider_spec:
         return [guider_spec["positive"], guider_spec["negative"]]
     raise ValueError(f"Unsupported RAY_GUIDER type: {guider_type!r}")
+
+
+# Helper funcFor sampler custom
+def _generate_advanced_noise(add_noise, noise_or_seed, latent):
+    if not add_noise:
+        noise_source = Noise_EmptyNoise()
+        return noise_source.generate_noise(latent), noise_source.seed
+
+    if hasattr(noise_or_seed, "generate_noise"):
+        return noise_or_seed.generate_noise(latent), getattr(noise_or_seed, "seed", None)
+
+    noise_source = Noise_RandomNoise(noise_or_seed)
+    return noise_source.generate_noise(latent), noise_source.seed
 
 
 def _build_ray_guider(model, guider_spec):
@@ -172,6 +239,7 @@ class RayWorker:
     def __init__(self, local_rank, device_id, parallel_dict):
         from raylight.comfy_dist import patch_base_getattr
 
+        _apply_worker_comfy_cli_args_from_env()
         patch_base_getattr()
         self.model = None
         self.vae_model = None
@@ -846,8 +914,7 @@ class RayWorker:
         )
         latent["samples"] = latent_image
 
-        noise_source = Noise_RandomNoise(noise_seed) if add_noise else Noise_EmptyNoise()
-        noise = noise_source.generate_noise(latent)
+        noise, sampling_seed = _generate_advanced_noise(add_noise, noise_seed, latent)
 
         noise_mask = None
         if "noise_mask" in latent:
@@ -878,7 +945,7 @@ class RayWorker:
                 denoise_mask=noise_mask,
                 callback=callback,
                 disable_pbar=disable_pbar,
-                seed=noise_source.seed,
+                seed=sampling_seed,
             )
             samples = samples.to(comfy_model_management.intermediate_device())
 

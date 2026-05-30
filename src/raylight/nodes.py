@@ -1,6 +1,7 @@
 import raylight
 import os
 import gc
+import json
 import shutil
 import tempfile
 from typing import Any
@@ -11,6 +12,7 @@ import ray
 import torch
 import comfy
 import folder_paths
+from comfy.cli_args import args as comfy_args
 from yunchang.kernels import AttnType
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
@@ -111,6 +113,28 @@ def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir:
         "working_dir": str(runtime_workdir),
         "env_vars": env_vars,
     }
+
+
+def _worker_cli_args_env_json() -> str:
+    worker_cli_args = {
+        # Ray workers hit cudaHostRegister failures on large LTXV loads often enough
+        # that we disable pinned memory there by default.
+        "disable_pinned_memory": True,
+        "disable_mmap": bool(comfy_args.disable_mmap),
+        "mmap_torch_files": bool(comfy_args.mmap_torch_files),
+        "disable_smart_memory": bool(comfy_args.disable_smart_memory),
+        "disable_async_offload": bool(comfy_args.disable_async_offload),
+        "disable_dynamic_vram": bool(comfy_args.disable_dynamic_vram),
+        "enable_dynamic_vram": bool(comfy_args.enable_dynamic_vram),
+        "force_non_blocking": bool(comfy_args.force_non_blocking),
+        "deterministic": bool(comfy_args.deterministic),
+        "reserve_vram": comfy_args.reserve_vram,
+    }
+    return json.dumps(worker_cli_args, sort_keys=True)
+
+
+def _inject_worker_cli_args(runtime_env: dict[str, Any]):
+    runtime_env.setdefault("env_vars", {})["RAYLIGHT_COMFY_CLI_ARGS_JSON"] = _worker_cli_args_env_json()
 
 
 def _parse_gpu_select(gpu_select: str | None) -> tuple[int, ...] | None:
@@ -508,6 +532,8 @@ class RayInitializer:
         if selected_gpus is not None:
             # Adapted from avtc's Ray GPU visibility restriction idea.
             runtime_env_base.setdefault("env_vars", {})["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_idx) for gpu_idx in selected_gpus)
+
+        _inject_worker_cli_args(runtime_env_base)
 
         if ray_cluster_address in _LOCAL_CLUSTER_ADDRESSES:
             _configure_raylight_ray_tmpdir(runtime_env_base)

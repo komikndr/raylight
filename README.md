@@ -9,6 +9,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 <details><summary><strong>Click to expand changelog</strong></summary>
 
+- [BETA] Add LTXV Custom nodes expansion with Raylight compatibility
 - DP Latent Noise List, FSDP, and DP improvement, added by avtc
 - Add WanT2V Causal
 - Experimental : ControlNet support, by avtc
@@ -19,7 +20,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 - `mmap` option for reduce RAM, with GGUF variant implementation by avtc
 - Docs: add developer docs for FSDP, USP, CFG, and expansion modules
 - Now TensorCoreFP8 and NVFP4 works in FSDP2, check on [CK-Distributed](https://github.com/komikndr/comfy-kitchen-distributed)
-- LTX-2 USP
+- LTX-2/ LTX2.3 USP
 - Kandinsky5 model
 - Fix FSDP error cause by Ray cannot pickle None type return by `comfy.supported_models_base.BASE.__getattr__`
 - TeaCache and EasyCache added thanks to [rmatif](https://github.com/rmatif/raylight/tree/easycache)
@@ -255,14 +256,15 @@ This is experimental mode where all type of parallel group can work at a sime ti
 **Kandinsky5**
 | Model             | USP | FSDP | CFG |
 |-------------------|-----|------|-----|
-| Kandinsky5 I2V    | ✅  | ❌   | ❌  |
-| Kandinsky5 T2V    | ✅  | ❌   | ❌  |
+| Kandinsky5 I2V    | ✅  | ❓   | ❌  |
+| Kandinsky5 T2V    | ✅  | ❓   | ❌  |
 
 
 **LTX-2**
-| Model              | USP | FSDP | CFG |
-|--------------------|-----|------|-----|
-| LTX-2 T/I/A/ 2 V/VA| ✅  | ❌   | ❌  |
+| Model    | USP | FSDP | CFG |
+|----------|-----|------|-----|
+| LTX-2    | ✅  | ❓   | ❌  |
+| LTX-2.3  | ✅  | ❓   | ❌  |
 
 
 **ERNIE-Image**
@@ -288,6 +290,7 @@ This is experimental mode where all type of parallel group can work at a sime ti
 - ✅ = Supported
 - ❌ = Not currently supported.
 - ✅† = Code-ready, awaiting ControlNet model weights.
+- ❓ = Logically supported, awaiting for testing.
 - T = Text
 - I = Image
 - A = Audio
