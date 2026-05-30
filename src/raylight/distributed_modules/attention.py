@@ -1,12 +1,17 @@
+import torch
+
 from xfuser.core.long_ctx_attention import (
     xFuserLongContextAttention,
 )
+from xfuser.core.long_ctx_attention.ring import xdit_ring_flash_attn_func
 
 from yunchang.kernels import AttnType
+from yunchang.globals import PROCESS_GROUP
 from .sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_kernel
 
 _ATTN_TYPE = None
 _SYNC_ULYSSES = None
+_FORCE_RING_ONLY = False
 
 
 def set_attn_type(attn):
@@ -33,15 +38,28 @@ def get_sync_ulysses():
         return _SYNC_ULYSSES
 
 
-def make_xfuser_attention(attn_type, sync_ulysses):
-    print(f"Using XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}")
+def set_force_ring_only(is_force):
+    global _FORCE_RING_ONLY
+    _FORCE_RING_ONLY = bool(is_force)
+
+
+def get_force_ring_only():
+    return bool(_FORCE_RING_ONLY)
+
+
+def make_xfuser_attention(attn_type, sync_ulysses, force_ring_only=None):
+    if force_ring_only is None:
+        force_ring_only = get_force_ring_only()
+    print(f"Using XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}, Force Ring Only: {force_ring_only}")
     attn = AttnType[attn_type]
     if attn_type == "SAGE_FP8_CUDA":
         ensure_hf_fp8_cuda_kernel()
     elif attn_type == "SAGE_FP8_SM90":
         ensure_hf_sm90_kernel
 
-    xfuser_attn = xFuserLongContextAttention(use_sync=sync_ulysses, attn_type=attn)
+    xfuser_attn = None
+    if not force_ring_only:
+        xfuser_attn = xFuserLongContextAttention(use_sync=sync_ulysses, attn_type=attn)
 
     def _attention_xfuser_unmask(
             q,
@@ -82,13 +100,45 @@ def make_xfuser_attention(attn_type, sync_ulysses):
                 mask = mask.unsqueeze(0)
             if mask.ndim == 3:
                 mask = mask.unsqueeze(1)
+        query = q.transpose(1, 2)
+        key = k.transpose(1, 2)
+        value = v.transpose(1, 2)
+
+        # I am testing an issue with where uly=1 and ring>1 could cause vram leakage
+        if force_ring_only:
+            ring_group = PROCESS_GROUP.RING_PG
+            if ring_group is None:
+                raise RuntimeError("Ring process group is not initialized")
+            if join_q is not None:
+                query = torch.cat([query, join_q.transpose(1, 2)], dim=1)
+                out = xdit_ring_flash_attn_func(
+                    query,
+                    key,
+                    value,
+                    group=ring_group,
+                    attn_type=attn,
+                    joint_strategy="rear",
+                    joint_tensor_key=join_k.transpose(1, 2),
+                    joint_tensor_value=join_v.transpose(1, 2),
+                )
+            else:
+                out = xdit_ring_flash_attn_func(
+                    query,
+                    key,
+                    value,
+                    group=ring_group,
+                    attn_type=attn,
+                )
+            if type(out) == tuple:
+                out = out[0]
+            out = out.transpose(1, 2)
         # Check if using join attention, for MMDiT model
-        if join_q is not None:
+        elif join_q is not None:
             out = xfuser_attn(
                 None,
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
+                query,
+                key,
+                value,
                 joint_strategy="rear",
                 joint_tensor_query=join_q.transpose(1, 2),
                 joint_tensor_key=join_k.transpose(1, 2),
@@ -97,9 +147,9 @@ def make_xfuser_attention(attn_type, sync_ulysses):
         else:
             out = xfuser_attn(
                 None,
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
+                query,
+                key,
+                value,
             ).transpose(1, 2)
         if not skip_output_reshape:
             out = (
@@ -108,4 +158,3 @@ def make_xfuser_attention(attn_type, sync_ulysses):
         return out
 
     return _attention_xfuser_unmask
-

@@ -118,6 +118,7 @@ def initialize_xfuser_parallel(local_rank: int, world_size: int, parallel_dict: 
     if parallel_dict.get("is_xdit"):
         xfuser_attn.set_attn_type(parallel_dict["attention"])
         xfuser_attn.set_sync_ulysses(parallel_dict["sync_ulysses"])
+        xfuser_attn.set_force_ring_only(parallel_dict.get("force_ring_only", False))
 
     init_distributed_environment(rank=local_rank, world_size=world_size)
     initialize_model_parallel(

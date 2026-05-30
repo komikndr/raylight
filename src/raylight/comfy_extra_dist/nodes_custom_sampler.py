@@ -895,4 +895,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "UnifiedParallelSamplerCustom": "Unified Parallel SamplerCustom (Advance)",
     "DPSamplerCustomAdvanced": "Data Parallel SamplerCustom Advanced",
     "DPSamplerCustom": "Data Parallel SamplerCustom",
+    "RayBasicScheduler": "BasicScheduler (Ray)",
+    "RayBetaSamplingScheduler": "BetaSamplingScheduler (Ray)",
+    "RaySamplerSASolver": "SamplerSASolver (Ray)",
+    "RaySamplingPercentToSigma": "SamplingPercentToSigma (Ray)",
+    "RayAddNoise": "AddNoise (Ray)",
 }

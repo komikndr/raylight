@@ -316,7 +316,8 @@ class RayWorker:
                 f"Ring={self.xfuser_parallel.config.ring_degree}, "
                 f"CFG={self.xfuser_parallel.config.cfg_degree}, "
                 f"PP={self.xfuser_parallel.config.pp_degree}, "
-                f"DP={self.xfuser_parallel.config.data_parallel_degree}"
+                f"DP={self.xfuser_parallel.config.data_parallel_degree}, "
+                f"Force Ring Only={self.parallel_dict.get('force_ring_only', False)}"
             )
 
     def get_meta_model(self):

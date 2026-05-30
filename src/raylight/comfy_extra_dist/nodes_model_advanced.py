@@ -481,3 +481,15 @@ NODE_CLASS_MAPPINGS = {
     "RayRescaleCFG": RayRescaleCFG,
     "RayModelComputeDtype": RayModelComputeDtype,
 }
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "RayModelSamplingDiscrete": "ModelSamplingDiscrete (Ray)",
+    "RayModelSamplingContinuousEDM": "ModelSamplingContinuousEDM (Ray)",
+    "RayModelSamplingContinuousV": "ModelSamplingContinuousV (Ray)",
+    "RayModelSamplingStableCascade": "ModelSamplingStableCascade (Ray)",
+    "RayModelSamplingSD3": "ModelSamplingSD3 (Ray)",
+    "RayModelSamplingAuraFlow": "ModelSamplingAuraFlow (Ray)",
+    "RayModelSamplingFlux": "ModelSamplingFlux (Ray)",
+    "RayRescaleCFG": "RescaleCFG (Ray)",
+    "RayModelComputeDtype": "ModelComputeDtype (Ray)",
+}

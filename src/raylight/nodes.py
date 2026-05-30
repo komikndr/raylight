@@ -15,6 +15,7 @@ import folder_paths
 from comfy.cli_args import args as comfy_args
 from yunchang.kernels import AttnType
 
+# For naming style with comfyui equivalent nodes use "[Name of Nodes] (Ray)"
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils  # type: ignore
 
@@ -376,6 +377,13 @@ class RayInitializer:
                         "tooltip": "Force a more synchronized Ulysses path. Can help with some VRAM spikes, but may be slower.",
                     },
                 ),
+                "force_ring_only": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Experimental: route USP attention through direct ring attention.",
+                    },
+                ),
                 "FSDP": ("BOOLEAN", {"default": False, "tooltip": "Enable FSDP weight sharding across GPUs."}),
                 "FSDP_CPU_OFFLOAD": (
                     "BOOLEAN",
@@ -415,6 +423,7 @@ class RayInitializer:
         GPU: int,
         ulysses_degree: int,
         ring_degree: int,
+        force_ring_only: bool,
         cfg_degree: int,
         dp_degree: int,
         sync_ulysses: bool,
@@ -446,6 +455,14 @@ class RayInitializer:
         _monkey()
 
         world_size = GPU
+        requested_ulysses_degree = ulysses_degree
+        requested_ring_degree = ring_degree
+        effective_ulysses_degree = ulysses_degree
+        effective_ring_degree = ring_degree
+        if force_ring_only and (ulysses_degree > 0 or ring_degree > 0 or cfg_degree > 0):
+            effective_ulysses_degree = 1
+            effective_ring_degree = ulysses_degree * ring_degree
+
         selected_gpus = _parse_gpu_select(GPU_SELECT)
         if selected_gpus is None:
             max_world_size = torch.cuda.device_count()
@@ -459,8 +476,11 @@ class RayInitializer:
             raise ValueError(f"Too many gpus: requested {world_size} but only {max_world_size} selected/visible")
         if world_size == 0:
             raise ValueError("Num of cuda/cudalike device is 0")
-        if world_size < ulysses_degree * ring_degree * cfg_degree:
-            raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} x {ring_degree=} x {cfg_degree=}")
+        if world_size < effective_ulysses_degree * effective_ring_degree * cfg_degree:
+            raise ValueError(
+                f"ERROR, num_gpus: {world_size}, is lower than "
+                f"ulysses_degree={effective_ulysses_degree} x ring_degree={effective_ring_degree} x {cfg_degree=}"
+            )
         if cfg_degree > 2:
             raise ValueError("CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2")
         if dp_degree < 0:
@@ -481,30 +501,33 @@ class RayInitializer:
         self.parallel_dict["use_mmap"] = use_mmap
         self.parallel_dict["pp_degree"] = 1
         self.parallel_dict["dp_degree"] = dp_degree if dp_degree >= 1 else 1
+        self.parallel_dict["force_ring_only"] = force_ring_only
+        self.parallel_dict["requested_ulysses_degree"] = requested_ulysses_degree
+        self.parallel_dict["requested_ring_degree"] = requested_ring_degree
         _reset_pipefusion_runtime_config(self.parallel_dict)
 
         if ulysses_degree > 0 or ring_degree > 0 or cfg_degree > 0:
-            model_parallel_size = ulysses_degree * ring_degree * cfg_degree
+            model_parallel_size = effective_ulysses_degree * effective_ring_degree * cfg_degree
             if model_parallel_size == 0:
-                raise ValueError(f"""ERROR, parallel product of {ulysses_degree=} x {ring_degree=} x {cfg_degree=} is 0.
+                raise ValueError(f"""ERROR, parallel product of ulysses_degree={effective_ulysses_degree} x ring_degree={effective_ring_degree} x {cfg_degree=} is 0.
                  Please make sure to set any parallel degree to be greater than 0,
                  or switch into DPKSampler and set 0 to all parallel degree""")
             if world_size % model_parallel_size != 0:
                 raise ValueError(
                     "GPU count must be divisible by ulysses_degree x ring_degree x cfg_degree: "
-                    f"{world_size} is not divisible by {ulysses_degree} x {ring_degree} x {cfg_degree}"
+                    f"{world_size} is not divisible by {effective_ulysses_degree} x {effective_ring_degree} x {cfg_degree}"
                 )
             auto_dp_degree = world_size // model_parallel_size
             effective_dp_degree = auto_dp_degree if dp_degree == 0 else dp_degree
             if world_size != model_parallel_size * effective_dp_degree:
                 raise ValueError(
                     "GPU count must equal dp_degree x ulysses_degree x ring_degree x cfg_degree: "
-                    f"{world_size} != {effective_dp_degree} x {ulysses_degree} x {ring_degree} x {cfg_degree}"
+                    f"{world_size} != {effective_dp_degree} x {effective_ulysses_degree} x {effective_ring_degree} x {cfg_degree}"
                 )
             self.parallel_dict["attention"] = XFuser_attention
             self.parallel_dict["is_xdit"] = True
-            self.parallel_dict["ulysses_degree"] = ulysses_degree
-            self.parallel_dict["ring_degree"] = ring_degree
+            self.parallel_dict["ulysses_degree"] = effective_ulysses_degree
+            self.parallel_dict["ring_degree"] = effective_ring_degree
             self.parallel_dict["cfg_degree"] = cfg_degree
             self.parallel_dict["sync_ulysses"] = sync_ulysses
             self.parallel_dict["dp_degree"] = effective_dp_degree
@@ -621,6 +644,13 @@ class RayInitializerAdvanced(RayInitializer):
                     {
                         "default": 1,
                         "tooltip": "Ring attention degree. Usually leave at 1 unless you are intentionally testing ring parallelism.",
+                    },
+                ),
+                "force_ring_only": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Experimental: route USP attention through direct ring attention and force Ulysses degree to 1.",
                     },
                 ),
                 "cfg_degree": (
