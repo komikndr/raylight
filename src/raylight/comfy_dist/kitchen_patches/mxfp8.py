@@ -80,6 +80,30 @@ def install_mxfp8_patches() -> None:
     def _reblock_scale(scale_rows: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         return to_blocked(scale_rows.to(dtype=torch.uint8), flatten=False).view(dtype)
 
+    def _scale_rows_for_gather(qtensor) -> torch.Tensor:
+        return _unblock_scale(qtensor).contiguous()
+
+    def _reblock_gathered_scale(qtensor, gathered_qdata: torch.Tensor, gathered_scale_rows: torch.Tensor) -> torch.Tensor:
+        scale_rows = gathered_scale_rows.contiguous()
+        if scale_rows.dtype != torch.uint8:
+            scale_rows = scale_rows.view(torch.uint8)
+        if scale_rows.dim() == 1:
+            logical_cols = TensorCoreMXFP8Layout.get_logical_shape_from_storage(tuple(gathered_qdata.shape))[1]
+            scale_rows = scale_rows.view(-1, logical_cols // 32)
+        return _reblock_scale(scale_rows, qtensor._params.scale.dtype)
+
+    def _reuse_out_scale(out, gathered_scale: torch.Tensor) -> torch.Tensor:
+        out_scale = getattr(getattr(out, "_params", None), "scale", None)
+        if (
+            isinstance(out_scale, torch.Tensor)
+            and tuple(out_scale.shape) == tuple(gathered_scale.shape)
+            and out_scale.dtype == gathered_scale.dtype
+            and out_scale.device == gathered_scale.device
+        ):
+            out_scale.view(torch.uint8).copy_(gathered_scale.view(torch.uint8))
+            return out_scale
+        return gathered_scale
+
     def _dequantize_arg(arg):
         if isinstance(arg, QuantizedTensor):
             return arg.dequantize()
@@ -146,17 +170,18 @@ def install_mxfp8_patches() -> None:
 
     def pre_all_gather(qtensor: QuantizedTensor, mesh):
         qdata = qtensor._qdata.contiguous()
-        scale = qtensor._params.scale.contiguous()
+        scale_rows = _scale_rows_for_gather(qtensor)
         metadata = {
             "orig_dtype": qtensor._params.orig_dtype,
             "orig_shape": qtensor._params.orig_shape,
             "transposed": qtensor._params.transposed,
             "qdata_shape": tuple(qdata.shape),
         }
-        return (qdata, scale), metadata
+        return (qdata, scale_rows), metadata
 
     def post_all_gather(qtensor: QuantizedTensor, all_gather_outputs, metadata: Any, param_dtype: torch.dtype, *, out=None):
-        gathered_qdata, gathered_scale = all_gather_outputs
+        gathered_qdata, gathered_scale_rows = all_gather_outputs
+        gathered_scale = _reblock_gathered_scale(qtensor, gathered_qdata, gathered_scale_rows)
         orig_shape = metadata.get("orig_shape")
         qdata_shape = metadata.get("qdata_shape")
         if orig_shape is not None and qdata_shape is not None and not metadata.get("transposed", False):
@@ -168,6 +193,10 @@ def install_mxfp8_patches() -> None:
                 if old_storage_rows > 0 and new_storage_rows != old_storage_rows:
                     new_logical_rows = (int(orig_shape[0]) * new_storage_rows + old_storage_rows - 1) // old_storage_rows
                     orig_shape = (new_logical_rows, int(orig_shape[1]))
+        if out is not None:
+            if not isinstance(out, QuantizedTensor):
+                raise TypeError(f"Expected QuantizedTensor out, got {type(out)}")
+            gathered_scale = _reuse_out_scale(out, gathered_scale)
         params = TensorCoreMXFP8Layout.Params(
             scale=gathered_scale,
             orig_dtype=metadata.get("orig_dtype", param_dtype),
@@ -175,8 +204,6 @@ def install_mxfp8_patches() -> None:
             transposed=metadata.get("transposed", False),
         )
         if out is not None:
-            if not isinstance(out, QuantizedTensor):
-                raise TypeError(f"Expected QuantizedTensor out, got {type(out)}")
             out._qdata = gathered_qdata
             out._params = params
             return None
@@ -254,16 +281,19 @@ def install_mxfp8_patches() -> None:
         q_bytes = _wait_tensor_if_available(q_bytes)
 
         s_args = list(args)
-        s_args[input_idx] = input_tensor._params.scale.contiguous().view(torch.uint8)
+        s_args[input_idx] = _scale_rows_for_gather(input_tensor)
         s_ret = op_all_gather(*s_args, **kwargs)
         s_result, s_work = _extract_collective_result(s_ret)
-        s_bytes = s_result if isinstance(s_result, torch.Tensor) else s_args[input_idx]
-        s_bytes = _wait_tensor_if_available(s_bytes)
+        gathered_scale_rows = s_result if isinstance(s_result, torch.Tensor) else s_args[input_idx]
+        gathered_scale_rows = _wait_tensor_if_available(gathered_scale_rows)
+
+        gathered_qdata = q_bytes.view(input_tensor._qdata.dtype)
+        gathered_scale = _reblock_gathered_scale(input_tensor, gathered_qdata, gathered_scale_rows)
 
         wrapped = _wrap_mxfp8_tensor(
             input_tensor,
-            q_bytes.view(input_tensor._qdata.dtype),
-            scale=s_bytes.view(input_tensor._params.scale.dtype),
+            gathered_qdata,
+            scale=gathered_scale,
         )
         if q_work is not None or s_work is not None:
             return wrapped, _CompositeWork(q_work, s_work)
