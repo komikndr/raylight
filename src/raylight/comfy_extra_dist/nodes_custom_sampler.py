@@ -74,6 +74,20 @@ def _collect_grouped_results(results: list, expected_length: int, label: str):
     return [grouped_results[dp_rank] for dp_rank in range(expected_length)]
 
 
+def _clear_ray_worker_vram_after_sampling(ray_actors):
+    gpu_actors = ray_actors["workers"]
+    if not gpu_actors:
+        return
+    parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+    if not parallel_dict.get("clear_vram_after_sampling", False):
+        return
+
+    ray.get([actor.clear_sampling_vram.remote() for actor in gpu_actors])
+    gc.collect()
+    comfy.model_management.unload_all_models()
+    comfy.model_management.soft_empty_cache()
+
+
 def _normalized_degree(value):
     if value is None:
         return 1
@@ -442,7 +456,9 @@ class XFuserSamplerCustomAdvanced:
             )
             for actor in gpu_actors
         ]
-        output, denoised_output = ray.get(futures)[0]
+        results = ray.get(futures)
+        _clear_ray_worker_vram_after_sampling(ray_actors)
+        output, denoised_output = results[0]
         return (output, denoised_output, ray_actors)
 
 
@@ -517,6 +533,7 @@ class XFuserSamplerCustom:
             for actor in gpu_actors
         ]
         results = ray.get(futures)
+        _clear_ray_worker_vram_after_sampling(ray_actors)
         out = results[0]
         return (out, ray_actors)
 
@@ -575,6 +592,7 @@ class UnifiedParallelSamplerCustomAdvanced:
             for actor, group_info in zip(gpu_actors, group_infos)
         ]
         results = ray.get(futures)
+        _clear_ray_worker_vram_after_sampling(ray_actors)
         results = _collect_grouped_results(results, dp_degree, "Unified Parallel SamplerCustomAdvanced")
         outputs, denoised_outputs = _split_advanced_results(results)
         return (outputs, denoised_outputs, ray_actors)
@@ -661,6 +679,7 @@ class UnifiedParallelSamplerCustom:
             for actor, group_info in zip(gpu_actors, group_infos)
         ]
         results = ray.get(futures)
+        _clear_ray_worker_vram_after_sampling(ray_actors)
         out = _collect_grouped_results(results, dp_degree, "Unified Parallel SamplerCustom")
         return (out, ray_actors)
 
@@ -715,6 +734,7 @@ class DPSamplerCustomAdvanced:
             for i, actor in enumerate(gpu_actors)
         ]
         results = ray.get(futures)
+        _clear_ray_worker_vram_after_sampling(ray_actors)
         outputs, denoised_outputs = _split_advanced_results(results)
         return (outputs, denoised_outputs, ray_actors)
 
@@ -804,6 +824,7 @@ class DPSamplerCustom:
             for i, actor in enumerate(gpu_actors)
         ]
         out = ray.get(futures)
+        _clear_ray_worker_vram_after_sampling(ray_actors)
         return (out, ray_actors)
 
 
