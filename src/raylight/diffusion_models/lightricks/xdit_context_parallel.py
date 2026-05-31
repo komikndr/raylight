@@ -89,6 +89,34 @@ def sp_gather_group(group, orig_sizes, dim):
         return group
 
 
+def _sp_split_sequence_tensor(tensor, sp_world_size, sp_rank, dim=1):
+    tensor, _ = pad_to_world_size(tensor, dim=dim)
+    return torch.chunk(tensor, sp_world_size, dim=dim)[sp_rank]
+
+
+def _sp_split_timestep_value(value, sp_world_size, sp_rank):
+    if value is None:
+        return None
+
+    if value.__class__.__name__ == "CompressedTimestep" and hasattr(value, "expand"):
+        local = _sp_split_sequence_tensor(value.expand(), sp_world_size, sp_rank, dim=1)
+        return value.__class__(local, None)
+
+    if torch.is_tensor(value) and value.ndim >= 3 and value.shape[1] > 1:
+        return _sp_split_sequence_tensor(value, sp_world_size, sp_rank, dim=1)
+
+    return value
+
+
+def _sp_split_timestep_group(timestep, sp_world_size, sp_rank):
+    if isinstance(timestep, (list, tuple)):
+        return type(timestep)(
+            _sp_split_timestep_group(item, sp_world_size, sp_rank) for item in timestep
+        )
+
+    return _sp_split_timestep_value(timestep, sp_world_size, sp_rank)
+
+
 def usp_dit_forward(
     self, x, timestep, context, attention_mask, frame_rate=25, transformer_options={}, keyframe_idxs=None, denoise_mask=None, *args, **kwargs
 ):
@@ -147,6 +175,9 @@ def usp_dit_forward(
 
     x = sp_chunk_group(x, sp_world_size, sp_rank, dim=1)
     context = sp_chunk_group(context, sp_world_size, sp_rank, dim=1)
+    timestep = _sp_split_timestep_group(timestep, sp_world_size, sp_rank)
+    if "prompt_timestep" in merged_args:
+        merged_args["prompt_timestep"] = _sp_split_timestep_value(merged_args["prompt_timestep"], sp_world_size, sp_rank)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     # Process transformer blocks
