@@ -229,6 +229,9 @@ def _collect_controlnet_shared_modules(diffusion_model: torch.nn.Module) -> set[
         mod = getattr(diffusion_model, name, None)
         if mod is not None and isinstance(mod, torch.nn.Module) and any(True for _ in mod.parameters()):
             excluded.add(mod)
+    pid_lq_proj = getattr(diffusion_model, "lq_proj", None)
+    if pid_lq_proj is not None and isinstance(pid_lq_proj, torch.nn.Module) and any(True for _ in pid_lq_proj.parameters()):
+        excluded.add(pid_lq_proj)
     return excluded
 
 
@@ -257,7 +260,7 @@ def patch_fsdp(self):
 
     excluded_modules = _collect_controlnet_shared_modules(diffusion_model)
     if excluded_modules:
-        print(f"[Rank {self.rank}] Excluding {len(excluded_modules)} ControlNet-shared modules from FSDP: "
+        print(f"[Rank {self.rank}] Excluding {len(excluded_modules)} side/shared modules from FSDP: "
               f"{[n for n, m in diffusion_model.named_modules() if m in excluded_modules]}")
 
     fully_shard_bottom_up(
@@ -300,7 +303,7 @@ def patch_fsdp(self):
             cpu_offload=self.is_cpu_offload,
         )
         if count > 0:
-            print(f"[Rank {self.rank}] Materialized {count} excluded ControlNet-shared params on {target_device}")
+            print(f"[Rank {self.rank}] Materialized {count} excluded side/shared params on {target_device}")
 
     self.fsdp_state_dict = None
 
