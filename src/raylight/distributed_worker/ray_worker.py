@@ -316,8 +316,7 @@ class RayWorker:
                 f"Ring={self.xfuser_parallel.config.ring_degree}, "
                 f"CFG={self.xfuser_parallel.config.cfg_degree}, "
                 f"PP={self.xfuser_parallel.config.pp_degree}, "
-                f"DP={self.xfuser_parallel.config.data_parallel_degree}, "
-                f"Force Ring Only={self.parallel_dict.get('force_ring_only', False)}"
+                f"DP={self.xfuser_parallel.config.data_parallel_degree}"
             )
 
     def get_meta_model(self):
@@ -392,6 +391,49 @@ class RayWorker:
 
         torch.cuda.empty_cache()
         gc.collect()
+
+    def clear_sampling_vram(self):
+        """Release worker-side CUDA memory after a Ray sampling node finishes.
+
+        Keep the ModelPatcher object alive so cached ComfyUI workflows can run
+        the sampler again without requiring the Ray UNet loader node to rerun.
+        """
+        import comfy.model_management as comfy_model_management
+
+        try:
+            comfy_model_management.unload_all_models()
+        except Exception as e:
+            print(f"[Rank {self.local_rank}] unload_all_models failed in clear_sampling_vram: {e}")
+
+        if self.model is not None:
+            try:
+                self.model.unpatch_model(device_to=getattr(self.model, "offload_device", None))
+            except Exception as e:
+                print(f"[Rank {self.local_rank}] model.unpatch_model() failed in clear_sampling_vram: {e}")
+            try:
+                self.model.cleanup()
+            except Exception as e:
+                print(f"[Rank {self.local_rank}] model.cleanup() failed in clear_sampling_vram: {e}")
+
+        if self.cached_base_model is not None and self.cached_base_model is not self.model:
+            try:
+                self.cached_base_model.cleanup()
+            except Exception as e:
+                print(f"[Rank {self.local_rank}] cached model cleanup failed in clear_sampling_vram: {e}")
+
+        gc.collect()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+        comfy_model_management.soft_empty_cache()
+        return True
 
     def check_model_loaded(self, unet_path, model_options):
         """Check if the currently loaded model matches the given parameters.
@@ -531,39 +573,6 @@ class RayWorker:
             "dp_rank": group_info["dp_rank"],
             "result": result,
         }
-
-    def _force_ring_memory_logging_enabled(self):
-        return bool(self.parallel_dict.get("force_ring_only")) and torch.cuda.is_available()
-
-    def _log_force_ring_cuda_memory(self, label, step=None):
-        if not self._force_ring_memory_logging_enabled():
-            return
-        if os.environ.get("RAYLIGHT_FORCE_RING_MEM_SYNC", "0") == "1":
-            torch.cuda.synchronize()
-        rank = self.xfuser_parallel.global_rank if self.xfuser_parallel is not None else self.local_rank
-        allocated = torch.cuda.memory_allocated() / 1024**2
-        reserved = torch.cuda.memory_reserved() / 1024**2
-        max_allocated = torch.cuda.max_memory_allocated() / 1024**2
-        step_label = "none" if step is None else step
-        print(
-            f"[Raylight][force-ring-sample][rank={rank}][local_rank={self.local_rank}][step={step_label}][{label}] "
-            f"allocated={allocated:.2f}MiB reserved={reserved:.2f}MiB max_allocated={max_allocated:.2f}MiB"
-        )
-
-    def _make_force_ring_memory_callback(self, callback=None):
-        if not self._force_ring_memory_logging_enabled():
-            return callback
-
-        def _callback(*args, **kwargs):
-            step = args[0] if args else None
-            self._log_force_ring_cuda_memory("callback:before", step)
-            result = None
-            if callback is not None:
-                result = callback(*args, **kwargs)
-            self._log_force_ring_cuda_memory("callback:after", step)
-            return result
-
-        return _callback
 
     def set_parallel_dict(self, parallel_dict):
         self.parallel_dict = parallel_dict
@@ -965,14 +974,12 @@ class RayWorker:
         guider = _build_ray_guider(self.model, guider_spec)
         x0_output = {}
         callback = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1, x0_output)
-        callback = self._make_force_ring_memory_callback(callback)
 
         disable_pbar = comfy_utils.PROGRESS_BAR_ENABLED
         if self.local_rank == 0:
             disable_pbar = not comfy_utils.PROGRESS_BAR_ENABLED
 
         with torch.no_grad():
-            self._log_force_ring_cuda_memory("advanced_sample:before")
             samples = guider.sample(
                 noise,
                 latent_image,
@@ -983,7 +990,6 @@ class RayWorker:
                 disable_pbar=disable_pbar,
                 seed=sampling_seed,
             )
-            self._log_force_ring_cuda_memory("advanced_sample:after")
             samples = samples.to(comfy_model_management.intermediate_device())
 
             out = latent.copy()
@@ -1066,8 +1072,6 @@ class RayWorker:
             disable_pbar = not comfy_utils.PROGRESS_BAR_ENABLED
 
         with torch.no_grad():
-            callback = self._make_force_ring_memory_callback()
-            self._log_force_ring_cuda_memory("custom_sample:before")
             samples = comfy_sample.sample_custom(
                 self.model,
                 noise,
@@ -1078,11 +1082,10 @@ class RayWorker:
                 negative,
                 latent_image,
                 noise_mask=noise_mask,
-                callback=callback,
+                callback=None,
                 disable_pbar=disable_pbar,
                 seed=noise_seed,
             )
-            self._log_force_ring_cuda_memory("custom_sample:after")
             out = latent.copy()
             out["samples"] = samples
 
@@ -1209,8 +1212,6 @@ class RayWorker:
             disable_pbar = not comfy_utils.PROGRESS_BAR_ENABLED
 
         with torch.no_grad():
-            callback = self._make_force_ring_memory_callback()
-            self._log_force_ring_cuda_memory("sample:before")
             samples = comfy_sample.sample(
                 self.model,
                 noise,
@@ -1227,11 +1228,10 @@ class RayWorker:
                 last_step=last_step,
                 force_full_denoise=force_full_denoise,
                 noise_mask=noise_mask,
-                callback=callback,
+                callback=None,
                 disable_pbar=disable_pbar,
                 seed=seed,
             )
-            self._log_force_ring_cuda_memory("sample:after")
             out = latent.copy()
             out["samples"] = samples
 

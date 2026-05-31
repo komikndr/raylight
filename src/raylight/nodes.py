@@ -34,6 +34,20 @@ class AnyType(str):
 any_type = AnyType("*")
 
 
+def _clear_ray_worker_vram_after_sampling(ray_actors):
+    gpu_actors = ray_actors["workers"]
+    if not gpu_actors:
+        return
+    parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+    if not parallel_dict.get("clear_vram_after_sampling", False):
+        return
+
+    ray.get([actor.clear_sampling_vram.remote() for actor in gpu_actors])
+    gc.collect()
+    comfy.model_management.unload_all_models()
+    comfy.model_management.soft_empty_cache()
+
+
 def _raylight_ray_tmpdir() -> Path:
     return Path(os.environ.get("RAYLIGHT_RAY_TMPDIR", Path(tempfile.gettempdir()) / "raylight-ray")).resolve()
 
@@ -377,11 +391,11 @@ class RayInitializer:
                         "tooltip": "Force a more synchronized Ulysses path. Can help with some VRAM spikes, but may be slower.",
                     },
                 ),
-                "force_ring_only": (
+                "clear_vram_after_sampling": (
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Experimental: route USP attention through direct ring attention.",
+                        "tooltip": "Release Ray worker VRAM after sampling so regular Comfy nodes can use the GPU.",
                     },
                 ),
                 "FSDP": ("BOOLEAN", {"default": False, "tooltip": "Enable FSDP weight sharding across GPUs."}),
@@ -423,10 +437,10 @@ class RayInitializer:
         GPU: int,
         ulysses_degree: int,
         ring_degree: int,
-        force_ring_only: bool,
         cfg_degree: int,
         dp_degree: int,
         sync_ulysses: bool,
+        clear_vram_after_sampling: bool,
         FSDP: bool,
         FSDP_CPU_OFFLOAD: bool,
         XFuser_attention: str,
@@ -455,13 +469,8 @@ class RayInitializer:
         _monkey()
 
         world_size = GPU
-        requested_ulysses_degree = ulysses_degree
-        requested_ring_degree = ring_degree
         effective_ulysses_degree = ulysses_degree
         effective_ring_degree = ring_degree
-        if force_ring_only and (ulysses_degree > 0 or ring_degree > 0 or cfg_degree > 0):
-            effective_ulysses_degree = 1
-            effective_ring_degree = ulysses_degree * ring_degree
 
         selected_gpus = _parse_gpu_select(GPU_SELECT)
         if selected_gpus is None:
@@ -501,9 +510,7 @@ class RayInitializer:
         self.parallel_dict["use_mmap"] = use_mmap
         self.parallel_dict["pp_degree"] = 1
         self.parallel_dict["dp_degree"] = dp_degree if dp_degree >= 1 else 1
-        self.parallel_dict["force_ring_only"] = force_ring_only
-        self.parallel_dict["requested_ulysses_degree"] = requested_ulysses_degree
-        self.parallel_dict["requested_ring_degree"] = requested_ring_degree
+        self.parallel_dict["clear_vram_after_sampling"] = clear_vram_after_sampling
         _reset_pipefusion_runtime_config(self.parallel_dict)
 
         if ulysses_degree > 0 or ring_degree > 0 or cfg_degree > 0:
@@ -646,11 +653,11 @@ class RayInitializerAdvanced(RayInitializer):
                         "tooltip": "Ring attention degree. Usually leave at 1 unless you are intentionally testing ring parallelism.",
                     },
                 ),
-                "force_ring_only": (
+                "clear_vram_after_sampling": (
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Experimental: route USP attention through direct ring attention and force Ulysses degree to 1.",
+                        "tooltip": "Release Ray worker VRAM after sampling so regular Comfy nodes can use the GPU.",
                     },
                 ),
                 "cfg_degree": (
@@ -1098,6 +1105,7 @@ class XFuserKSamplerAdvanced:
         ]
 
         results = ray.get(futures)
+        _clear_ray_worker_vram_after_sampling(ray_actors)
         return (results[0][0], ray_actors)
 
 
@@ -1219,6 +1227,7 @@ class UnifiedParallelSampler:
         ]
 
         results = ray.get(futures)
+        _clear_ray_worker_vram_after_sampling(ray_actors)
         results = _collect_grouped_results(results, dp_degree, "Unified Parallel Sampler")
         return (results, ray_actors)
 
@@ -1354,6 +1363,7 @@ class DPKSamplerAdvanced:
         ]
 
         results = ray.get(futures)
+        _clear_ray_worker_vram_after_sampling(ray_actors)
         results = [result[0] for result in results]
         return (results, ray_actors)
 
