@@ -1,9 +1,10 @@
+import os
 import torch
 
 from xfuser.core.long_ctx_attention import (
     xFuserLongContextAttention,
 )
-from xfuser.core.long_ctx_attention.ring import xdit_ring_flash_attn_func
+from xfuser.core.long_ctx_attention.ring.ring_flash_attn import xdit_ring_flash_attn_forward
 
 from yunchang.kernels import AttnType
 from yunchang.globals import PROCESS_GROUP
@@ -12,6 +13,33 @@ from .sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_ke
 _ATTN_TYPE = None
 _SYNC_ULYSSES = None
 _FORCE_RING_ONLY = False
+_FORCE_RING_ATTENTION_CALL_COUNT = 0
+
+
+def _force_ring_mem_log_interval():
+    try:
+        return int(os.environ.get("RAYLIGHT_FORCE_RING_MEM_LOG_INTERVAL", "1"))
+    except ValueError:
+        return 1
+
+
+def _log_force_ring_memory(label, call_idx):
+    if not torch.cuda.is_available():
+        return
+    interval = _force_ring_mem_log_interval()
+    if interval <= 0 or call_idx % interval != 0:
+        return
+    try:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    except Exception:
+        rank = 0
+    allocated = torch.cuda.memory_allocated() / 1024**2
+    reserved = torch.cuda.memory_reserved() / 1024**2
+    max_allocated = torch.cuda.max_memory_allocated() / 1024**2
+    print(
+        f"[Raylight][force-ring-attn][rank={rank}][call={call_idx}][{label}] "
+        f"allocated={allocated:.2f}MiB reserved={reserved:.2f}MiB max_allocated={max_allocated:.2f}MiB"
+    )
 
 
 def set_attn_type(attn):
@@ -106,29 +134,38 @@ def make_xfuser_attention(attn_type, sync_ulysses, force_ring_only=None):
 
         # I am testing an issue with where uly=1 and ring>1 could cause vram leakage
         if force_ring_only:
+            global _FORCE_RING_ATTENTION_CALL_COUNT
+            _FORCE_RING_ATTENTION_CALL_COUNT += 1
+            call_idx = _FORCE_RING_ATTENTION_CALL_COUNT
             ring_group = PROCESS_GROUP.RING_PG
             if ring_group is None:
                 raise RuntimeError("Ring process group is not initialized")
+            _log_force_ring_memory("before", call_idx)
             if join_q is not None:
                 query = torch.cat([query, join_q.transpose(1, 2)], dim=1)
-                out = xdit_ring_flash_attn_func(
+                out = xdit_ring_flash_attn_forward(
+                    ring_group,
                     query,
                     key,
                     value,
-                    group=ring_group,
+                    None,
+                    causal=False,
                     attn_type=attn,
                     joint_strategy="rear",
                     joint_tensor_key=join_k.transpose(1, 2),
                     joint_tensor_value=join_v.transpose(1, 2),
                 )
             else:
-                out = xdit_ring_flash_attn_func(
+                out = xdit_ring_flash_attn_forward(
+                    ring_group,
                     query,
                     key,
                     value,
-                    group=ring_group,
+                    None,
+                    causal=False,
                     attn_type=attn,
                 )
+            _log_force_ring_memory("after", call_idx)
             if type(out) == tuple:
                 out = out[0]
             out = out.transpose(1, 2)
