@@ -439,6 +439,7 @@ def load_lora_for_models_quantized(model, lora, strength_model):
     function_keys = []
     other_patch_counts = {}
     merged_patch_groups = {}
+    sidecar_lora_count = 0
 
     def merged_group(module_key):
         return merged_patch_groups.setdefault(
@@ -476,11 +477,15 @@ def load_lora_for_models_quantized(model, lora, strength_model):
                 continue
             module_key = _module_key_from_weight_key(key)
             module = _get_module_by_key(new_modelpatcher.model, module_key)
-            if module is not None and _is_linear_or_conv_module(module):
-                group = merged_group(module_key)
-                group["weight_patches"].append((strength_model, patch_data, 1.0, offset, function))
-                group["handled_keys"].add(key)
-            else:
+            if module is None:
+                unsupported_keys.append(loaded_key)
+                continue
+
+            if _adapter_has_dora(patch_data) or _adapter_has_reshape(patch_data):
+                unsupported_keys.append(loaded_key)
+                continue
+
+            if _is_linear_or_conv_module(module):
                 grouped_adapters.setdefault(module_key, []).append(
                     {
                         "adapter": patch_data,
@@ -490,6 +495,19 @@ def load_lora_for_models_quantized(model, lora, strength_model):
                         "handled_keys": {key},
                     }
                 )
+                sidecar_lora_count += 1
+                continue
+
+            grouped_adapters.setdefault(module_key, []).append(
+                {
+                    "adapter": patch_data,
+                    "offset": offset,
+                    "strength": strength_model,
+                    "key": key,
+                    "handled_keys": {key},
+                }
+            )
+            sidecar_lora_count += 1
             continue
 
         diff = _diff_tensor_from_patch(patch_data)
@@ -513,9 +531,20 @@ def load_lora_for_models_quantized(model, lora, strength_model):
             if param_name in direct_diff_counts:
                 direct_diff_counts[param_name] += 1
             if _is_linear_or_conv_module(module):
-                group = merged_group(module_key)
-                group[f"{param_name}_patches"].append((strength_model, patch_data, 1.0, None, None))
-                group["handled_keys"].add(key)
+                adapter = DirectDiffBypassAdapter(
+                    weight_diff=diff if param_name == "weight" else None,
+                    bias_diff=diff if param_name == "bias" else None,
+                    key=module_key,
+                )
+                grouped_adapters.setdefault(module_key, []).append(
+                    {
+                        "adapter": adapter,
+                        "offset": None,
+                        "strength": strength_model,
+                        "key": key,
+                        "handled_keys": {key},
+                    }
+                )
                 continue
 
             group = diff_groups.setdefault(module_key, {"weight": None, "bias": None, "handled_keys": set()})
@@ -614,10 +643,11 @@ def load_lora_for_models_quantized(model, lora, strength_model):
         strength_model,
     )
     logging.warning(
-        "[Raylight LoRA][quant-bypass] adapters=%s direct_diff=%s other=%s grouped=%d unsupported=%d hooks=%d",
+        "[Raylight LoRA][quant-bypass] adapters=%s direct_diff=%s other=%s sidecar_lora=%d grouped=%d unsupported=%d hooks=%d",
         adapter_counts,
         direct_diff_counts,
         other_patch_counts,
+        sidecar_lora_count,
         len(grouped_adapters),
         len(unsupported_keys),
         hook_count,
