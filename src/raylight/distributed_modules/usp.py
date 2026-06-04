@@ -468,6 +468,18 @@ if hasattr(model_base, "Lumina2"):
         model._forward = types.MethodType(usp_dit_forward, model)
 
 
+if hasattr(model_base, "Ideogram4"):
+
+    @USPInjectRegistry.register(model_base.Ideogram4)
+    def _inject_ideogram4(model_patcher, base_model, *args):
+        from ..diffusion_models.ideogram4.xdit_context_parallel import usp_attention_forward, usp_dit_forward
+
+        model = base_model.diffusion_model
+        for block in model.layers:
+            block.attention.forward = types.MethodType(usp_attention_forward, block.attention)
+        model._forward = types.MethodType(usp_dit_forward, model)
+
+
 if hasattr(model_base, "HiDreamO1"):
 
     @USPInjectRegistry.register(model_base.HiDreamO1)

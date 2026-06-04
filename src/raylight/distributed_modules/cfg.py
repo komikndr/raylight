@@ -213,6 +213,15 @@ if hasattr(model_base, "Lumina2"):
         return cfg_parallel_forward_wrapper
 
 
+if hasattr(model_base, "Ideogram4"):
+
+    @CFGParallelInjectRegistry.register(model_base.Ideogram4)
+    def _inject_ideogram4():
+        from ..diffusion_models.ideogram4.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
 if hasattr(model_base, "Kandinsky5"):
 
     @CFGParallelInjectRegistry.register(model_base.Kandinsky5)
