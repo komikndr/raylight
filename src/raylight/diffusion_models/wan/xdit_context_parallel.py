@@ -1016,6 +1016,8 @@ def usp_scail_dit_forward(
     freqs=None,
     pose_latents=None,
     reference_latent=None,
+    ref_mask_latents=None,
+    sam_latents=None,
     transformer_options={},
     *args,
     **kwargs,
@@ -1024,6 +1026,8 @@ def usp_scail_dit_forward(
         x = torch.cat((reference_latent, x), dim=2)
 
     x = self.patch_embedding(x.float()).to(x.dtype)
+    if ref_mask_latents is not None:
+        x = x + self.patch_embedding_mask(ref_mask_latents.float()).to(x.dtype)
     grid_sizes = x.shape[2:]
     transformer_options["grid_sizes"] = grid_sizes
     x = x.flatten(2).transpose(1, 2)
@@ -1031,6 +1035,8 @@ def usp_scail_dit_forward(
     scail_pose_seq_len = 0
     if pose_latents is not None:
         scail_x = self.patch_embedding_pose(pose_latents.float()).to(x.dtype)
+        if sam_latents is not None:
+            scail_x = scail_x + self.patch_embedding_mask(sam_latents.float()).to(x.dtype)
         scail_x = scail_x.flatten(2).transpose(1, 2)
         scail_pose_seq_len = scail_x.shape[1]
         x = torch.cat([x, scail_x], dim=1)
