@@ -296,6 +296,13 @@ def usp_dit_forward(
             full_ref_seq_len = full_ref.shape[1]
             x = torch.concat((full_ref, x), dim=1)
 
+    context_latents = kwargs.get("context_latents", None)
+    main_len = x.shape[1]
+    if context_latents is not None:
+        for lat in context_latents:
+            cl = self.patch_embedding(lat.float().to(x.device)).to(x.dtype).flatten(2).transpose(1, 2)
+            x = torch.cat([x, cl], dim=1)
+
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     sp_world = get_sequence_parallel_world_size()
     sp_rank = get_sequence_parallel_rank()
@@ -350,6 +357,8 @@ def usp_dit_forward(
     torch._dynamo.graph_break()
 
     x = self.head(x, e)
+    if context_latents is not None:
+        x = x[:, :main_len]
     if full_ref_seq_len > 0:
         x = x[:, full_ref_seq_len:]
 
