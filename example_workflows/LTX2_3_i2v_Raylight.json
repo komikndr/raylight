@@ -234,7 +234,7 @@
       "flags": {
         "collapsed": false
       },
-      "order": 32,
+      "order": 31,
       "mode": 0,
       "inputs": [
         {
@@ -539,7 +539,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 20,
+      "order": 28,
       "mode": 0,
       "inputs": [
         {
@@ -608,7 +608,7 @@
         26
       ],
       "flags": {},
-      "order": 24,
+      "order": 23,
       "mode": 0,
       "inputs": [
         {
@@ -652,7 +652,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 21,
+      "order": 20,
       "mode": 0,
       "inputs": [
         {
@@ -721,7 +721,7 @@
         200
       ],
       "flags": {},
-      "order": 30,
+      "order": 32,
       "mode": 0,
       "inputs": [
         {
@@ -796,7 +796,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 22,
+      "order": 21,
       "mode": 0,
       "inputs": [
         {
@@ -937,7 +937,7 @@
         170
       ],
       "flags": {},
-      "order": 25,
+      "order": 24,
       "mode": 0,
       "inputs": [
         {
@@ -1186,54 +1186,6 @@
       ]
     },
     {
-      "id": 366,
-      "type": "PrimitiveInt",
-      "pos": [
-        -1141.3086203358603,
-        6217.926424289294
-      ],
-      "size": [
-        370,
-        110
-      ],
-      "flags": {},
-      "order": 4,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "INT",
-          "type": "INT",
-          "links": [
-            673,
-            675
-          ]
-        }
-      ],
-      "title": "Width",
-      "properties": {
-        "Node name for S&R": "PrimitiveInt",
-        "enableTabs": false,
-        "tabWidth": 65,
-        "tabXOffset": 10,
-        "hasSecondTab": false,
-        "secondTabText": "Send Back",
-        "secondTabOffset": 80,
-        "secondTabWidth": 65,
-        "cnr_id": "comfy-core",
-        "ver": "0.16.3",
-        "ue_properties": {
-          "widget_ue_connectable": {},
-          "version": "7.7",
-          "input_ue_unconnectable": {}
-        }
-      },
-      "widgets_values": [
-        1280,
-        "fixed"
-      ]
-    },
-    {
       "id": 353,
       "type": "PrimitiveInt",
       "pos": [
@@ -1245,7 +1197,7 @@
         110
       ],
       "flags": {},
-      "order": 5,
+      "order": 4,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -1293,7 +1245,7 @@
         110
       ],
       "flags": {},
-      "order": 6,
+      "order": 5,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -1343,7 +1295,7 @@
       "flags": {
         "collapsed": true
       },
-      "order": 23,
+      "order": 22,
       "mode": 0,
       "inputs": [
         {
@@ -1408,59 +1360,6 @@
       "widgets_values": [
         "a * b + 1"
       ]
-    },
-    {
-      "id": 357,
-      "type": "CLIPTextEncode",
-      "pos": [
-        -132.69489016006548,
-        5480.580407715678
-      ],
-      "size": [
-        600,
-        390
-      ],
-      "flags": {},
-      "order": 26,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "clip",
-          "type": "CLIP",
-          "link": 743
-        }
-      ],
-      "outputs": [
-        {
-          "name": "CONDITIONING",
-          "type": "CONDITIONING",
-          "links": [
-            687
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "CLIPTextEncode",
-        "enableTabs": false,
-        "tabWidth": 65,
-        "tabXOffset": 10,
-        "hasSecondTab": false,
-        "secondTabText": "Send Back",
-        "secondTabOffset": 80,
-        "secondTabWidth": 65,
-        "cnr_id": "comfy-core",
-        "ver": "0.3.56",
-        "ue_properties": {
-          "widget_ue_connectable": {},
-          "version": "7.7",
-          "input_ue_unconnectable": {}
-        }
-      },
-      "widgets_values": [
-        "Egyptian royal in blue-and-gold headdress and high collar, white dress with golden embroidery and armbands, desert, robot soldiers in formation left and right. She walks steadily forward, head held level and gaze fixed ahead—no dipping or lowering of the head. The camera performs a single, smooth push-in only: starting in a wider shot of her, the robots, and the desert, it moves steadily forward until she is in a medium or medium-close frame, then holds. She stops, posture and head still upright, and says: “The old gods are silent. I am not.” Robot soldiers shift or march in place; sand and fabric move with the wind. No pull-back; the only camera move is the continuous push-in."
-      ],
-      "color": "#232",
-      "bgcolor": "#353"
     },
     {
       "id": 361,
@@ -1601,7 +1500,7 @@
         58
       ],
       "flags": {},
-      "order": 7,
+      "order": 6,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -1634,7 +1533,7 @@
         110
       ],
       "flags": {},
-      "order": 8,
+      "order": 7,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -1665,7 +1564,7 @@
         58
       ],
       "flags": {},
-      "order": 9,
+      "order": 8,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -1698,7 +1597,7 @@
         130
       ],
       "flags": {},
-      "order": 10,
+      "order": 9,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -1733,7 +1632,7 @@
         130
       ],
       "flags": {},
-      "order": 31,
+      "order": 30,
       "mode": 0,
       "inputs": [
         {
@@ -1983,7 +1882,7 @@
         184.87935303020652
       ],
       "flags": {},
-      "order": 11,
+      "order": 10,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -2006,7 +1905,7 @@
         189.35890875820826
       ],
       "flags": {},
-      "order": 12,
+      "order": 11,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -2030,7 +1929,7 @@
         178.59762243597055
       ],
       "flags": {},
-      "order": 13,
+      "order": 12,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -2054,7 +1953,7 @@
         1054.769169761564
       ],
       "flags": {},
-      "order": 14,
+      "order": 13,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -2078,7 +1977,7 @@
         530
       ],
       "flags": {},
-      "order": 15,
+      "order": 14,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -2113,7 +2012,7 @@
         }
       },
       "widgets_values": [
-        "Screenshot (1).png",
+        "LTX2_3_i2v_Raylight.jpg",
         "image"
       ]
     },
@@ -2129,7 +2028,7 @@
         110
       ],
       "flags": {},
-      "order": 16,
+      "order": 15,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -2174,7 +2073,7 @@
         110
       ],
       "flags": {},
-      "order": 17,
+      "order": 16,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -2219,7 +2118,7 @@
         370
       ],
       "flags": {},
-      "order": 18,
+      "order": 17,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -2403,7 +2302,8 @@
       ],
       "properties": {
         "Node name for S&R": "easy cleanGpuUsed"
-      }
+      },
+      "widgets_values": []
     },
     {
       "id": 75,
@@ -2567,7 +2467,7 @@
         102
       ],
       "flags": {},
-      "order": 28,
+      "order": 26,
       "mode": 0,
       "inputs": [
         {
@@ -2611,7 +2511,7 @@
         82
       ],
       "flags": {},
-      "order": 19,
+      "order": 18,
       "mode": 0,
       "inputs": [
         {
@@ -2636,6 +2536,107 @@
       "widgets_values": [
         "tx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors",
         1
+      ]
+    },
+    {
+      "id": 357,
+      "type": "CLIPTextEncode",
+      "pos": [
+        -132.69489016006548,
+        5480.580407715678
+      ],
+      "size": [
+        600,
+        390
+      ],
+      "flags": {},
+      "order": 25,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 743
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            687
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.3.56",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "Cinematic 3D cartoon sci-fi jungle, the initial image shows a lush futuristic jungle with glowing alien plants, neon vines, ancient sci-fi ruins, a circular portal-like arch, waterfalls, floating drones, reflective turquoise water, and a small explorer character standing in the foreground looking into the scene. Animate the scene with a slow cinematic push-in toward the glowing archway. The jungle leaves gently sway in the wind, bioluminescent vines pulse softly, glowing flowers flicker, water ripples with reflections, waterfalls flow in the background, and small drones hover and drift around the ruins. The explorer subtly shifts posture while looking forward, as if amazed by the living sci-fi jungle. Keep the 3D cartoon style, vibrant colors, soft depth of field, magical atmosphere, smooth camera motion, and no scene cuts."
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 366,
+      "type": "PrimitiveInt",
+      "pos": [
+        -1141.3086203358603,
+        6217.926424289294
+      ],
+      "size": [
+        370,
+        110
+      ],
+      "flags": {},
+      "order": 19,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "links": [
+            673,
+            675
+          ]
+        }
+      ],
+      "title": "Width",
+      "properties": {
+        "Node name for S&R": "PrimitiveInt",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "cnr_id": "comfy-core",
+        "ver": "0.16.3",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        1280,
+        "fixed"
       ]
     }
   ],
@@ -3290,10 +3291,10 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.7339134000000007,
+      "scale": 0.6671940000000006,
       "offset": [
-        2090.690175623332,
-        -5118.0352080071125
+        2128.655531271122,
+        -5130.455692126257
       ]
     },
     "frontendVersion": "1.45.15",
