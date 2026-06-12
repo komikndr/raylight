@@ -89,32 +89,47 @@ def sp_gather_group(group, orig_sizes, dim):
         return group
 
 
-def _sp_split_sequence_tensor(tensor, sp_world_size, sp_rank, dim=1):
-    tensor, _ = pad_to_world_size(tensor, dim=dim)
-    return torch.chunk(tensor, sp_world_size, dim=dim)[sp_rank]
-
-
-def _sp_split_timestep_value(value, sp_world_size, sp_rank):
-    if value is None:
-        return None
-
-    if value.__class__.__name__ == "CompressedTimestep" and hasattr(value, "expand"):
-        local = _sp_split_sequence_tensor(value.expand(), sp_world_size, sp_rank, dim=1)
-        return value.__class__(local, None)
-
-    if torch.is_tensor(value) and value.ndim >= 3 and value.shape[1] > 1:
-        return _sp_split_sequence_tensor(value, sp_world_size, sp_rank, dim=1)
-
-    return value
-
-
-def _sp_split_timestep_group(timestep, sp_world_size, sp_rank):
+def process_usp_timestep(timestep, sp_rank, sp_world_size):
     if isinstance(timestep, (list, tuple)):
         return type(timestep)(
-            _sp_split_timestep_group(item, sp_world_size, sp_rank) for item in timestep
+            process_usp_timestep(item, sp_rank, sp_world_size) for item in timestep
         )
 
-    return _sp_split_timestep_value(timestep, sp_world_size, sp_rank)
+    if torch.is_tensor(timestep) and timestep.ndim >= 3:
+        orig_len = timestep.size(1)
+        if orig_len == 0:
+            return timestep
+
+        padded_len = ((orig_len + sp_world_size - 1) // sp_world_size) * sp_world_size
+        chunk_size = padded_len // sp_world_size
+        start = sp_rank * chunk_size
+        end = start + chunk_size
+
+        if start >= orig_len:
+            return timestep[:, -1:, :].expand(-1, chunk_size, -1).clone()
+        if end <= orig_len:
+            return timestep[:, start:end, :].clone()
+
+        real_part = timestep[:, start:, :]
+        padding = timestep[:, -1:, :].expand(-1, end - orig_len, -1)
+        return torch.cat([real_part, padding], dim=1)
+
+    if hasattr(timestep, "num_frames") and hasattr(timestep, "patches_per_frame"):
+        total_len = timestep.num_frames * timestep.patches_per_frame
+        if total_len == 0:
+            return timestep.data[:, :0, :]
+
+        padded_len = ((total_len + sp_world_size - 1) // sp_world_size) * sp_world_size
+        chunk_size = padded_len // sp_world_size
+        start = sp_rank * chunk_size
+        end = start + chunk_size
+
+        indices = torch.arange(start, end, device=timestep.data.device)
+        valid_indices = torch.clamp(indices, max=total_len - 1)
+        frame_indices = valid_indices // timestep.patches_per_frame
+        return timestep.data[:, frame_indices, :]
+
+    return timestep
 
 
 def usp_dit_forward(
@@ -175,9 +190,9 @@ def usp_dit_forward(
 
     x = sp_chunk_group(x, sp_world_size, sp_rank, dim=1)
     context = sp_chunk_group(context, sp_world_size, sp_rank, dim=1)
-    timestep = _sp_split_timestep_group(timestep, sp_world_size, sp_rank)
+    timestep = process_usp_timestep(timestep, sp_rank, sp_world_size)
     if "prompt_timestep" in merged_args:
-        merged_args["prompt_timestep"] = _sp_split_timestep_value(merged_args["prompt_timestep"], sp_world_size, sp_rank)
+        merged_args["prompt_timestep"] = process_usp_timestep(merged_args["prompt_timestep"], sp_rank, sp_world_size)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     # Process transformer blocks
