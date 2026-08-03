@@ -112,6 +112,40 @@ def _ensure_runtime_workdir(module_dir: Path) -> Path:
     return runtime_dir
 
 
+def _sanitized_worker_alloc_conf():
+    """Strip `backend:cudaMallocAsync` from PYTORCH_CUDA_ALLOC_CONF for Ray workers.
+
+    ComfyUI's cuda_malloc.py appends `backend:cudaMallocAsync` to
+    PYTORCH_CUDA_ALLOC_CONF in os.environ before torch is imported, and local
+    Ray workers inherit it. Under NCCL collectives (Ulysses/Ring all-to-all)
+    the cudaMallocAsync pool interacts badly with comm buffers: workers climb
+    to the VRAM ceiling and OOM within the first sampling steps, while the
+    native caching allocator completes the same workload with headroom
+    (observed with MiniMax H3 int8_convrot on 2x V100-32GB, torch 2.7.1+cu118;
+    single-GPU runs with cudaMallocAsync are unaffected).
+
+    Returns the cleaned value to inject into the worker env, or None to leave
+    the inherited env untouched. Set RAYLIGHT_KEEP_CUDA_MALLOC_ASYNC=1 to opt
+    out of the sanitization.
+    """
+    if os.environ.get("RAYLIGHT_KEEP_CUDA_MALLOC_ASYNC"):
+        return None
+    conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+    if not conf:
+        return None
+    parts = [p for p in (part.strip() for part in conf.split(",")) if p]
+    kept = [p for p in parts if not p.startswith("backend:")]
+    if len(kept) == len(parts):
+        return None
+    print(
+        "[Raylight] Stripping allocator backend override from worker "
+        f"PYTORCH_CUDA_ALLOC_CONF ('{conf}' -> '{','.join(kept)}'); "
+        "cudaMallocAsync is known to OOM under NCCL collectives. "
+        "Set RAYLIGHT_KEEP_CUDA_MALLOC_ASYNC=1 to keep it."
+    )
+    return ",".join(kept)
+
+
 def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir: Path):
     python_path_entries = [str(repo_root)]
     existing = os.environ.get("PYTHONPATH")
@@ -123,6 +157,9 @@ def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir:
         "PYTHONPATH": python_path,
         "COMFYUI_BASE_DIRECTORY": str(repo_root),
     }
+    alloc_conf = _sanitized_worker_alloc_conf()
+    if alloc_conf is not None:
+        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf
 
     return {
         "py_modules": [str(module_dir)],
