@@ -1,7 +1,7 @@
 import torch
 
 import comfy
-from comfy.ldm.minimax.model import pack_audio, patchify_video, rope_rotation_table, time_shift_sigma, unpack_audio, unpatchify_video, PackedLayout, VISUAL_COND_TIMESTEP, AUDIO_COND_TIMESTEP
+from comfy.ldm.minimax.model import AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP, PackedLayout, mask_row_values, pack_audio, patchify_video, rope_rotation_table, time_shift_sigma, unpack_audio, unpatchify_video
 from xfuser.core.distributed import get_sequence_parallel_rank, get_sequence_parallel_world_size, get_sp_group
 
 import raylight.distributed_modules.attention as xfuser_attn
@@ -20,30 +20,51 @@ def _split_packed_sequence(h, rope_freqs, mod_segments):
     end = start + local_size
     local_segments = []
     for segment_start, segment_end, row in mod_segments:
+        original_start = segment_start
         segment_start = max(segment_start, start)
         segment_end = min(segment_end, end)
         if segment_start < segment_end:
+            if isinstance(row, torch.Tensor):
+                row = row[segment_start - original_start:segment_end - original_start]
             local_segments.append((segment_start - start, segment_end - start, row))
     return h[start:end], rope_freqs[:, start:end], local_segments
 
 
 def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}):
-    sequence_length = x.shape[0]
+    s = x.shape[0]
     q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
-    q = self.q_norm(q.view(sequence_length, self.heads, self.head_dim))
-    k = self.k_norm(k.view(sequence_length, self.heads, self.head_dim))
-    v = v.view(sequence_length, self.heads, self.head_dim)
+    v = v.view(s, self.heads, self.head_dim)
     if rope_freqs is not None:
+        q = q.view(1, s, self.heads, self.head_dim)
+        k = k.view(1, s, self.heads, self.head_dim)
+        qw = comfy.model_management.cast_to(self.q_norm.weight, device=x.device)
+        kw = comfy.model_management.cast_to(self.k_norm.weight, device=x.device)
         rot = rope_freqs.shape[-3] * 2
-        q[..., :rot], k[..., :rot] = comfy.quant_ops.ck.apply_rope_split_half(q[..., :rot], k[..., :rot], rope_freqs)
+        if comfy.model_management.in_training:
+            q, k = comfy.quant_ops.ck.rms_rope_split_half(
+                q, k, rope_freqs, qw, kw, epsilon=self.q_norm.eps, rot_dim=rot)
+        else:
+            comfy.quant_ops.ck.rms_rope_split_half_(
+                q, k, rope_freqs, qw, kw, epsilon=self.q_norm.eps, rot_dim=rot)
+        q = q[0]
+        k = k[0]
+    else:
+        q = self.q_norm(q.view(s, self.heads, self.head_dim))
+        k = self.k_norm(k.view(s, self.heads, self.head_dim))
+    v = v.clone()
     q = q.transpose(0, 1).unsqueeze(0)
     k = k.transpose(0, 1).unsqueeze(0)
     v = v.transpose(0, 1).unsqueeze(0)
-    out = xfuser_optimized_attention(q, k, v, self.heads, skip_reshape=True)
+    out = xfuser_optimized_attention(q, k, v, self.heads, skip_reshape=True, transformer_options=transformer_options)
     return self.out_proj(out.squeeze(0))
 
 
-def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_payload=None, **kwargs):
+def usp_mlp_forward(self, x):
+    gate, up = self.fc1(x).chunk(2, dim=-1)
+    return self.fc2(torch.nn.functional.silu(gate).mul_(up))
+
+
+def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_payload=None, denoise_mask=None, audio_denoise_mask=None, **kwargs):
     video_x, audio_x = x[0], x[1]
     orig_t, orig_h, orig_w = video_x.shape[2], video_x.shape[3], video_x.shape[4]
     video_x = comfy.ldm.common_dit.pad_to_patch_size(video_x, self.patch_size)
@@ -61,8 +82,7 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     if layout is None or layout.signature != (text_len, latent_t, lat_h, lat_w, audio_t):
         layout = PackedLayout(text_len, latent_t, lat_h, lat_w, audio_t,
                               keyframes=payload.get("keyframes"),
-                              refs=payload.get("refs"),
-                              frame_count=payload.get("frame_count"))
+                              refs=payload.get("refs"))
 
     # model_base passes model_sampling.timestep(sigma) = sigma * 1000
     shift_v = float(transformer_options.get("minimax_h3_sigma_shift_video", self.sigma_shift_video))
@@ -74,15 +94,46 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     # distinct timesteps are known analytically: text/pad follow video, cond rows pin near 1
     vis_aug = float(payload.get("visual_cond_noise_aug", VISUAL_COND_TIMESTEP))
     aud_aug = float(payload.get("audio_cond_noise_aug", AUDIO_COND_TIMESTEP))
-    has_vis_cond = any(k in ("cond", "ref_img") for _, _, k in layout.segments)
-    has_aud_cond = any(k == "ref_audio" for _, _, k in layout.segments)
     seg_t = {"text": t_v, "video": t_v, "audio": t_a,
              "cond": max(t_v, vis_aug), "ref_img": max(t_v, vis_aug),
-             "ref_audio": max(t_a, aud_aug)}
-    unique_t = sorted({t_v, t_a} | ({seg_t["cond"]} if has_vis_cond else set())
-                      | ({seg_t["ref_audio"]} if has_aud_cond else set()))
+             "cond_audio": max(t_a, aud_aug), "ref_audio": max(t_a, aud_aug)}
+
+    # masked rows run at their own strength: mask value m puts a row at sigma = m * sigma_stream,
+    # so its label is 1 - m * sigma, clamped at the cond timestep for fully preserved rows
+    t_pin_v = max(t_v, VISUAL_COND_TIMESTEP)
+    t_pin_a = max(t_a, AUDIO_COND_TIMESTEP)
+    video_rows_t = None
+    audio_rows_t = None
+    if denoise_mask is not None:
+        m = mask_row_values(denoise_mask[0, 0].to(torch.float32), latent_t, lat_h, lat_w)
+        if m is not None:
+            rows_t = (1.0 - m * sigma_v.to(m.device)).clamp(max=t_pin_v)
+            if rows_t.unique().numel() == 1:
+                seg_t["video"] = float(rows_t[0])
+            else:
+                video_rows_t = rows_t
+    if audio_denoise_mask is not None:
+        m = audio_denoise_mask[0, 0].to(torch.float32).reshape(-1)
+        if not bool((m >= 1.0 - 1e-3).all()):
+            sigma_a = 1.0 - t_a
+            rows_t = (1.0 - m * sigma_a).clamp(max=t_pin_a)
+            if rows_t.unique().numel() == 1:
+                seg_t["audio"] = float(rows_t[0])
+            else:
+                audio_rows_t = rows_t
+
+    unique_t = sorted({t_v, t_a} | {seg_t[k] for _, _, k in layout.segments}
+                      | (set(video_rows_t.unique().tolist()) if video_rows_t is not None else set())
+                      | (set(audio_rows_t.unique().tolist()) if audio_rows_t is not None else set()))
     t_row = {t: i for i, t in enumerate(unique_t)}
-    seg_tag = {"text": 1, "video": 0, "audio": 2, "cond": 0, "ref_img": 0, "ref_audio": 2}
+    seg_tag = {"text": 1, "video": 0, "audio": 2, "cond": 0, "ref_img": 0, "cond_audio": 2, "ref_audio": 2}
+
+    def rows_to_mod_index(rows_t, tag):
+        # per-row timestep values -> per-row mod-row indices into the t_emb table
+        levels = rows_t.unique()
+        base = torch.tensor([t_row[v] * 3 + tag for v in levels.tolist()],
+                            dtype=torch.long, device=rows_t.device)
+        return base[torch.searchsorted(levels, rows_t)]
 
     text_tags = payload.get("text_token_tags")
     mod_segments = []
@@ -96,6 +147,10 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
                 if i == b - a or tags[i] != tags[run_start]:
                     mod_segments.append((a + run_start, a + i, row_base + int(tags[run_start])))
                     run_start = i
+        elif kind == "video" and video_rows_t is not None:
+            mod_segments.append((a, b, rows_to_mod_index(video_rows_t, seg_tag[kind])))
+        elif kind == "audio" and audio_rows_t is not None:
+            mod_segments.append((a, b, rows_to_mod_index(audio_rows_t, seg_tag[kind])))
         else:
             mod_segments.append((a, b, row_base + seg_tag[kind]))
 
@@ -179,8 +234,16 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     h = get_sp_group().all_gather(h.contiguous(), dim=0)
     h = h[:h_orig_size]
 
-    video_seg = next((a, b, t_row[seg_t["video"]]) for a, b, k in layout.segments if k == "video")
-    audio_seg = next((a, b, t_row[seg_t["audio"]]) for a, b, k in layout.segments if k == "audio")
+    va, vb, _ = next(s for s in layout.segments if s[2] == "video")
+    aa, ab, _ = next(s for s in layout.segments if s[2] == "audio")
+    if video_rows_t is not None:
+        video_seg = (va, vb, rows_to_mod_index(video_rows_t, 0) // 3)
+    else:
+        video_seg = (va, vb, t_row[seg_t["video"]])
+    if audio_rows_t is not None:
+        audio_seg = (aa, ab, rows_to_mod_index(audio_rows_t, 0) // 3)
+    else:
+        audio_seg = (aa, ab, t_row[seg_t["audio"]])
     v, a = self.final_layer(h, t_emb, video_seg, audio_seg)
 
     video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
