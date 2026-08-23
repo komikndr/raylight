@@ -886,6 +886,10 @@ class RayWorker:
             if self.lora_list is not None:
                 self.load_lora()
 
+            if self.parallel_dict.get("is_quant", False):
+                self.set_state_dict()
+                self._patch_fsdp_for_sampling()
+
             base_model = getattr(self.model, "model", self.model)
             self.overwrite_cast_dtype = getattr(base_model, "manual_cast_dtype", None)
             self.is_model_loaded = True

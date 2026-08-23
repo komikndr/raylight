@@ -1,5 +1,6 @@
 """Site-packages comfy_kitchen gateway + distributed monkey patches."""
 
+from contextlib import contextmanager
 from functools import wraps
 from typing import Iterable
 
@@ -67,6 +68,15 @@ def restore_sitepkg_ck_patches(layouts=("fp8", "nvfp4", "int8")):
             patcher[1]()
 
 
+@contextmanager
+def temporary_sitepkg_ck_patches(layouts=("fp8", "nvfp4", "int8")):
+    install_sitepkg_ck_patches(layouts=layouts)
+    try:
+        yield
+    finally:
+        restore_sitepkg_ck_patches(layouts=layouts)
+
+
 def register_sitepkg_ck_patcher(layout, install_fn, restore_fn):
     _SITEPKG_LAYOUT_PATCHERS[layout] = (install_fn, restore_fn)
 
@@ -113,6 +123,7 @@ __all__ = [
     "get_layout_class",
     "install_sitepkg_ck_patches",
     "restore_sitepkg_ck_patches",
+    "temporary_sitepkg_ck_patches",
     "register_sitepkg_ck_patcher",
     "patch_enable_comfy_kitchen_fsdp",
 ]

@@ -624,9 +624,7 @@ def _release_quant_keys(full_sd: dict[str, Any], param_name: str) -> None:
         param_name,
         f"{prefix}weight_scale",
         f"{prefix}weight_scale_2",
-        f"{prefix}input_scale",
         f"{prefix}scale_weight",
-        f"{prefix}scale_input",
         f"{prefix}comfy_quant",
         f"{prefix}super_block_scale_scale",
         f"{prefix}super_block_min_scale",
@@ -671,10 +669,10 @@ def load_from_full_model_state_dict(
                     f"Expected quantized tensor for {param_name}, but could not build it ({_quant_payload_debug_info(param_name, full_sd)})"
                 )
             if hasattr(sharded_meta_param, "device_mesh"):
-                sharded_tensor = DTensor.from_local(
+                sharded_tensor = DTensor(
                     quant_tensor,
-                    device_mesh=sharded_meta_param.device_mesh,
-                    placements=sharded_meta_param.placements,
+                    sharded_meta_param._spec,
+                    requires_grad=sharded_meta_param.requires_grad,
                 )
             else:
                 sharded_tensor = quant_tensor
