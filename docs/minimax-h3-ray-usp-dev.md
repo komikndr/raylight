@@ -59,6 +59,7 @@ The first pass used:
 6 denoising steps
 4-step LoRA
 MiniMax H3 Sigma Shift: video shift = 12
+MiniMax H3 Sigma Shift: audio shift = 6
 audio generation enabled
 MiniMax H3 SLA Attention enabled
 ```
