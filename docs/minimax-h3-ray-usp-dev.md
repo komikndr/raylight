@@ -79,6 +79,14 @@ The latent-upscale pass used the ER-SDE Beta sampler without Sigma Shift. The te
 0.9231, 0.8780, 0.8000, 0.6316, 0.3158, 0.0000
 ```
 
+### SLA latent-upscale workflow example
+
+When SLA Attention is enabled, select exactly one of the three sigma schedules above and connect its `SIGMAS` output to the ER-SDE Beta sampler used for the latent-upscale pass. Do not apply MiniMax H3 Sigma Shift to this second pass. Keep the SLA-configured Ray actors connected through the scheduler and guider path as in the first pass.
+
+The screenshot shows the tested 3-, 4-, and 5-step schedules together with the MiniMax H3 Latent Upscaler. Only one schedule is used for a given run; the three nodes are shown together for reference. The upscaler settings in the image are an example and are not requirements of SLA Attention.
+
+![MiniMax H3 SLA latent-upscale sigma schedules](images/minimax-h3-sla-upscale-sigmas.png)
+
 The three-step upscale pass used a packed sequence length of 132,710 tokens and completed in approximately 3:55. Video quality remained visually valid across repeated runs, without the temporal grey-frame collapse found during development, and audio remained correct.
 
 ## Validation
