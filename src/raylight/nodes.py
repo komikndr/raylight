@@ -25,6 +25,7 @@ from .distributed_worker.ray_worker import (
     ray_nccl_tester,
 )
 from .distributed_worker.ray_worker_vae import combine_dist_vae_partials, combine_seedvr2_vae_partials
+from .distributed_worker.sampling_config import configure_sampling_features
 
 
 class AnyType(str):
@@ -1108,6 +1109,7 @@ class XFuserKSamplerAdvanced:
             disable_noise = True
 
         gpu_actors = ray_actors["workers"]
+        configure_sampling_features(ray_actors)
         futures = [
             actor.common_ksampler.remote(
                 noise_seed,
@@ -1229,6 +1231,7 @@ class UnifiedParallelSampler:
         positive = _normalize_grouped_inputs(positive, dp_degree, "positive")
         negative = _normalize_grouped_inputs(negative, dp_degree, "negative")
         latent_image = _normalize_grouped_inputs(latent_image, dp_degree, "latent_image")
+        configure_sampling_features(ray_actors)
         futures = [
             actor.common_ksampler.remote(
                 noise_list[group_info["dp_rank"]],
@@ -1366,6 +1369,7 @@ class DPKSamplerAdvanced:
             disable_noise = True
 
         # Each GPU gets its own noise/conditioning — decoupled from FSDP sharding
+        configure_sampling_features(ray_actors)
         futures = [
             actor.common_ksampler.remote(
                 noise_list[i],

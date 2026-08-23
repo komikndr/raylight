@@ -46,6 +46,12 @@ from raylight.distributed_worker.ray_worker_vae import (
     ray_seedvr2_vae_decode_partial_impl,
 )
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
+from raylight.diffusion_models.minimax.block_cache import CONFIG_KEY as H3_BLOCK_CACHE_CONFIG_KEY, RUNTIME_KEY as H3_BLOCK_CACHE_RUNTIME_KEY
+from raylight.diffusion_models.minimax.sla import (
+    CONFIG_KEY as H3_SLA_CONFIG_KEY,
+    RUNTIME_KEY as H3_SLA_RUNTIME_KEY,
+    set_active_runtime as h3_sla_set_active_runtime,
+)
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 from ray.exceptions import RayActorError
 
@@ -739,6 +745,21 @@ class RayWorker:
 
     def model_function_runner_get_values(self, fn, *args, **kwargs):
         return fn(self.model, *args, **kwargs)
+
+    def configure_minimax_h3_block_cache(self, config):
+        transformer_options = self.model.model_options.setdefault("transformer_options", {})
+        runtime = transformer_options.pop(H3_BLOCK_CACHE_RUNTIME_KEY, None)
+        if runtime is not None:
+            runtime.clear()
+        transformer_options[H3_BLOCK_CACHE_CONFIG_KEY] = dict(config)
+
+    def configure_minimax_h3_sla(self, config):
+        transformer_options = self.model.model_options.setdefault("transformer_options", {})
+        runtime = transformer_options.pop(H3_SLA_RUNTIME_KEY, None)
+        if runtime is not None:
+            runtime.clear()
+        h3_sla_set_active_runtime(None)
+        transformer_options[H3_SLA_CONFIG_KEY] = dict(config)
 
     def get_local_rank(self):
         return self.local_rank

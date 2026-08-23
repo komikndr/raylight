@@ -6,11 +6,18 @@ from xfuser.core.distributed import get_sequence_parallel_rank, get_sequence_par
 
 import raylight.distributed_modules.attention as xfuser_attn
 from ..utils import pad_to_world_size
+from . import sla as h3_sla
+from .block_cache import CONFIG_KEY, RUNTIME_KEY
 
 
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
+# SLA (PlagueKind port): wrap the Ulysses attention hook. After xFuser's
+# all-to-all each rank owns the FULL global sequence for its own head slice,
+# which is exactly where single-GPU SLA selection must run to stay
+# semantically valid (a pre-all-to-all hook would only see the local shard).
+h3_sla.install_on(xfuser_attn.get_last_xfuser_attention())
 
 
 def _split_packed_sequence(h, rope_freqs, mod_segments):
@@ -211,11 +218,59 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     rope_freqs, _ = pad_to_world_size(rope_freqs, dim=1)
     h, rope_freqs, mod_segments = _split_packed_sequence(h, rope_freqs, mod_segments)
 
+    # SLA (PlagueKind port): publish per-step state to the attention hook.
+    # The prefix is the start of the video segment in the packed global
+    # layout [text | cond/ref | audio | video] -- everything before it must
+    # stay exactly attended (protect_audio). No runtime (or disabled) ->
+    # clear any stale active runtime so the hook stays a dense pass-through.
+    sla_runtime = transformer_options.get(h3_sla.RUNTIME_KEY)
+    if sla_runtime is None or not sla_runtime.config.enabled:
+        h3_sla.set_active_runtime(None)
+    else:
+        video_start = 0
+        for seg_start, seg_stop, seg_kind in layout.segments:
+            if seg_kind == "video":
+                video_start = seg_start
+                break
+        sla_runtime.begin_step(
+            sigma_v,
+            prefix=video_start,
+            global_len=layout.seq_len,
+            local_len=h.shape[0],
+            rank=get_sequence_parallel_rank(),
+            world_size=get_sequence_parallel_world_size(),
+        )
+        h3_sla.set_active_runtime(sla_runtime)
+
     # blocks
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
-    prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.blocks), device, transformer_options)
-    for i, block in enumerate(self.blocks):
+    block_cache_config = transformer_options.get(CONFIG_KEY, {})
+    block_cache = transformer_options.get(RUNTIME_KEY)
+    if block_cache_config.get("enabled", False) is not True or block_cache is None:
+        block_plan = None
+        blocks = list(self.blocks)
+    else:
+        cache_key = block_cache.conditioning_key(transformer_options)
+        cache_signature = (
+            tuple(h.shape),
+            str(h.dtype),
+            str(h.device),
+            layout.signature,
+            tuple(layout.segments),
+        )
+        block_plan = block_cache.plan(
+            cache_key,
+            1.0 - t_v,
+            cache_signature,
+            len(self.blocks),
+            get_sequence_parallel_rank(),
+        )
+        blocks = list(self.blocks) if block_plan.mode == "FULL" else list(self.blocks)[:block_plan.prefix]
+
+    h_warm = None
+    prefetch_queue = comfy.model_prefetch.make_prefetch_queue(blocks, device, transformer_options)
+    for i, block in enumerate(blocks):
         comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, block)
         if ("double_block", i) in blocks_replace:
             def block_wrap(args):
@@ -227,8 +282,15 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
                 {"original_block": block_wrap})["img"]
         else:
             h = block(h, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)
+        if block_plan is not None and block_plan.mode == "FULL" and i + 1 == block_plan.prefix:
+            h_warm = h.detach().clone()
     if prefetch_queue is not None:
         comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)
+    if block_plan is not None:
+        if block_plan.mode == "FULL":
+            block_cache.store_residual(cache_key, cache_signature, h - h_warm)
+        else:
+            h = h + block_plan.residual
 
     # ===================== SP GATHER ===================== #
     h = get_sp_group().all_gather(h.contiguous(), dim=0)
