@@ -47,6 +47,8 @@ dense_last_steps = 0
 protect_audio = true
 ```
 
+![MiniMax H3 SLA Attention Ray USP node](images/minimax-h3-sla-node.png)
+
 The protected packed prefix covers text, conditioning, reference, and audio tokens before the video segment.
 
 ## Hardware and workflow validation
