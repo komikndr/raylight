@@ -136,14 +136,8 @@ Its job is to split the model weights among GPUs.
   ```bash
   export NCCL_IB_DISABLE=1
   ```
-- Ray workers remove `backend:cudaMallocAsync` from their inherited
-  `PYTORCH_CUDA_ALLOC_CONF` by default. This avoids allocator-related OOMs during
-  NCCL collectives while leaving the ComfyUI host process unchanged. To preserve
-  `cudaMallocAsync` in Ray workers:
-  ```bash
-  export RAYLIGHT_KEEP_CUDA_MALLOC_ASYNC=1
-  ```
-  Other allocator options, such as `expandable_segments:True`, are preserved.
+- Ray workers inherit `PYTORCH_CUDA_ALLOC_CONF` from the ComfyUI process, including
+  `backend:cudaMallocAsync` when ComfyUI is started with `--cuda-malloc`.
 - Example WF just open from your comfyui menu and browse templates
 - **GPU Topology** is very important, not all PCIe in your motherboard is equal.
 - VRAM leakage, when using [Ring > 1 instead of Ulysses](https://github.com/feifeibear/long-context-attention/issues/112).

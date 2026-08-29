@@ -113,26 +113,6 @@ def _ensure_runtime_workdir(module_dir: Path) -> Path:
     return runtime_dir
 
 
-def _sanitized_worker_alloc_conf():
-    if os.environ.get("RAYLIGHT_KEEP_CUDA_MALLOC_ASYNC") == "1":
-        return None
-
-    conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
-    if not conf:
-        return None
-
-    parts = [part.strip() for part in conf.split(",") if part.strip()]
-    kept = [part for part in parts if part != "backend:cudaMallocAsync"]
-    if len(kept) == len(parts):
-        return None
-
-    print(
-        "[Raylight] Removing backend:cudaMallocAsync from Ray worker "
-        "PYTORCH_CUDA_ALLOC_CONF. Set RAYLIGHT_KEEP_CUDA_MALLOC_ASYNC=1 to keep it."
-    )
-    return ",".join(kept)
-
-
 def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir: Path):
     python_path_entries = [str(repo_root)]
     existing = os.environ.get("PYTHONPATH")
@@ -144,9 +124,6 @@ def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir:
         "PYTHONPATH": python_path,
         "COMFYUI_BASE_DIRECTORY": str(repo_root),
     }
-    alloc_conf = _sanitized_worker_alloc_conf()
-    if alloc_conf is not None:
-        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf
 
     return {
         "py_modules": [str(module_dir)],
