@@ -21,6 +21,7 @@ consumer hardware. Its maintained additions include:
 - MiniMax H3 block caching with configurable sigma threshold, sampling range, cache
   depth, maximum consecutive cached steps, and debug statistics.
 - MiniMax H3 workflow examples and regression tests for the supported distributed paths.
+- The K3U Adapter compatibility bridge for explicitly supported standard ComfyUI nodes.
 - Preservation of ComfyUI's `cudaMallocAsync` configuration in Ray workers, preventing
   Raylight from silently replacing the allocator selected by the user.
 
@@ -36,11 +37,30 @@ continue to work.
 Repository: [Karmabu/raylight](https://github.com/Karmabu/raylight)
 
 
+## K3U Adapter compatibility bridge
+
+K3U Adapter is a small, conservative boundary that lets explicitly supported standard
+ComfyUI nodes participate in Raylight workflows without copying third-party nodes into
+Raylight, importing them into Ray workers, or changing the sampling math.
+
+![K3U Adapter workflow with KJNodes Model Preview Override](docs/images/k3u-adapter.png)
+
+The first supported integration is
+`K3U Export → KJNodes Model Preview Override → K3U Import → XFuser SamplerCustom Advanced`.
+The original KJNodes wrapper and TAEH3 decoder stay on the ComfyUI driver, while Raylight
+only exposes read-only step snapshots from the existing callback path.
+
+`k3u_adapter_context` is the extension point for future compatibility work. New integrations
+will be added individually through an explicit allowlist and dedicated tests; it is not a
+best-effort adapter for arbitrary `MODEL` patches or custom nodes.
+
+
 ## UPDATE
 
 <details><summary><strong>Click to expand changelog</strong></summary>
 
 - LTX 2.5
+- K3U Adapter bridge for KJNodes Model Preview Override, including driver-side TAEH3 previews
 - Wan Animate 2
 - Minimax H3
 - Fix Dist VAE
@@ -87,6 +107,7 @@ Repository: [Karmabu/raylight](https://github.com/Karmabu/raylight)
 ## Table of Contents
 - [Raylight](#raylight)
 - [Karmabu maintained fork](#karmabu-maintained-fork)
+- [K3U Adapter compatibility bridge](#k3u-adapter-compatibility-bridge)
 - [UPDATE](#update)
 - [Documentation](#documentation)
 - [What exactly is Raylight](#what-exactly-is-raylight)

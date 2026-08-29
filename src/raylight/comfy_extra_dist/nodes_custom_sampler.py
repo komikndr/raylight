@@ -432,7 +432,8 @@ class XFuserSamplerCustomAdvanced:
                 "sampler": ("SAMPLER",),
                 "sigmas": ("SIGMAS",),
                 "latent_image": ("LATENT",),
-            }
+            },
+            "optional": {"k3u_adapter_context": ("K3U_ADAPTER_CONTEXT",)},
         }
 
     RETURN_TYPES = ("LATENT", "LATENT", "RAY_ACTORS")
@@ -440,25 +441,30 @@ class XFuserSamplerCustomAdvanced:
     FUNCTION = "ray_sample"
     CATEGORY = "Raylight/extra/custom_sampling/samplers"
 
-    def ray_sample(self, add_noise, noise_seed, guider, sampler, sigmas, latent_image):
+    def ray_sample(self, add_noise, noise_seed, guider, sampler, sigmas, latent_image, k3u_adapter_context=None):
         gc.collect()
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
         ray_actors = _extract_ray_actors_from_guider(guider)
         gpu_actors = ray_actors["workers"]
         configure_sampling_features(ray_actors)
-        futures = [
-            actor.custom_sampler_advanced.remote(
-                add_noise,
-                noise_seed,
-                guider,
-                sampler,
-                sigmas,
-                latent_image,
+        if k3u_adapter_context is None:
+            futures = [
+                actor.custom_sampler_advanced.remote(
+                    add_noise,
+                    noise_seed,
+                    guider,
+                    sampler,
+                    sigmas,
+                    latent_image,
+                )
+                for actor in gpu_actors
+            ]
+            results = ray.get(futures)
+        else:
+            results = k3u_adapter_context.sample_xfuser_advanced(
+                gpu_actors, add_noise, noise_seed, guider, sampler, sigmas, latent_image
             )
-            for actor in gpu_actors
-        ]
-        results = ray.get(futures)
         _clear_ray_worker_vram_after_sampling(ray_actors)
         output, denoised_output = results[0]
         return (output, denoised_output, ray_actors)
