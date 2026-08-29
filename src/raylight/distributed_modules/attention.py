@@ -7,6 +7,7 @@ from .sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_ke
 
 _ATTN_TYPE = None
 _SYNC_ULYSSES = None
+_LAST_XFUSER_ATTN = None
 
 
 def set_attn_type(attn):
@@ -33,6 +34,17 @@ def get_sync_ulysses():
         return _SYNC_ULYSSES
 
 
+def get_last_xfuser_attention():
+    """The most recently created ``xFuserLongContextAttention`` instance.
+
+    Each model's xdit_context_parallel module calls ``make_xfuser_attention``
+    once at import time and captures its own instance immediately after, so
+    this is a per-module hand-off, not a shared global. Used e.g. by the
+    MiniMax H3 SLA port to wrap the Ulysses attention hook.
+    """
+    return _LAST_XFUSER_ATTN
+
+
 def make_xfuser_attention(attn_type, sync_ulysses):
     print(f"Using XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}")
     attn = AttnType[attn_type]
@@ -42,6 +54,8 @@ def make_xfuser_attention(attn_type, sync_ulysses):
         ensure_hf_sm90_kernel
 
     xfuser_attn = xFuserLongContextAttention(use_sync=sync_ulysses, attn_type=attn)
+    global _LAST_XFUSER_ATTN
+    _LAST_XFUSER_ATTN = xfuser_attn
 
     def _attention_xfuser_unmask(
             q,

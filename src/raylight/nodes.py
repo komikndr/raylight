@@ -25,6 +25,7 @@ from .distributed_worker.ray_worker import (
     ray_nccl_tester,
 )
 from .distributed_worker.ray_worker_vae import combine_dist_vae_partials, combine_seedvr2_vae_partials
+from .distributed_worker.sampling_config import configure_sampling_features
 
 
 class AnyType(str):
@@ -112,26 +113,6 @@ def _ensure_runtime_workdir(module_dir: Path) -> Path:
     return runtime_dir
 
 
-def _sanitized_worker_alloc_conf():
-    if os.environ.get("RAYLIGHT_KEEP_CUDA_MALLOC_ASYNC") == "1":
-        return None
-
-    conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
-    if not conf:
-        return None
-
-    parts = [part.strip() for part in conf.split(",") if part.strip()]
-    kept = [part for part in parts if part != "backend:cudaMallocAsync"]
-    if len(kept) == len(parts):
-        return None
-
-    print(
-        "[Raylight] Removing backend:cudaMallocAsync from Ray worker "
-        "PYTORCH_CUDA_ALLOC_CONF. Set RAYLIGHT_KEEP_CUDA_MALLOC_ASYNC=1 to keep it."
-    )
-    return ",".join(kept)
-
-
 def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir: Path):
     python_path_entries = [str(repo_root)]
     existing = os.environ.get("PYTHONPATH")
@@ -143,9 +124,6 @@ def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir:
         "PYTHONPATH": python_path,
         "COMFYUI_BASE_DIRECTORY": str(repo_root),
     }
-    alloc_conf = _sanitized_worker_alloc_conf()
-    if alloc_conf is not None:
-        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf
 
     return {
         "py_modules": [str(module_dir)],
@@ -1108,6 +1086,7 @@ class XFuserKSamplerAdvanced:
             disable_noise = True
 
         gpu_actors = ray_actors["workers"]
+        configure_sampling_features(ray_actors)
         futures = [
             actor.common_ksampler.remote(
                 noise_seed,
@@ -1229,6 +1208,7 @@ class UnifiedParallelSampler:
         positive = _normalize_grouped_inputs(positive, dp_degree, "positive")
         negative = _normalize_grouped_inputs(negative, dp_degree, "negative")
         latent_image = _normalize_grouped_inputs(latent_image, dp_degree, "latent_image")
+        configure_sampling_features(ray_actors)
         futures = [
             actor.common_ksampler.remote(
                 noise_list[group_info["dp_rank"]],
@@ -1366,6 +1346,7 @@ class DPKSamplerAdvanced:
             disable_noise = True
 
         # Each GPU gets its own noise/conditioning — decoupled from FSDP sharding
+        configure_sampling_features(ray_actors)
         futures = [
             actor.common_ksampler.remote(
                 noise_list[i],

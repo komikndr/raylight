@@ -46,6 +46,12 @@ from raylight.distributed_worker.ray_worker_vae import (
     ray_seedvr2_vae_decode_partial_impl,
 )
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
+from raylight.diffusion_models.minimax.block_cache import CONFIG_KEY as H3_BLOCK_CACHE_CONFIG_KEY, RUNTIME_KEY as H3_BLOCK_CACHE_RUNTIME_KEY
+from raylight.diffusion_models.minimax.sla import (
+    CONFIG_KEY as H3_SLA_CONFIG_KEY,
+    RUNTIME_KEY as H3_SLA_RUNTIME_KEY,
+    set_active_runtime as h3_sla_set_active_runtime,
+)
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 from ray.exceptions import RayActorError
 
@@ -740,6 +746,21 @@ class RayWorker:
     def model_function_runner_get_values(self, fn, *args, **kwargs):
         return fn(self.model, *args, **kwargs)
 
+    def configure_minimax_h3_block_cache(self, config):
+        transformer_options = self.model.model_options.setdefault("transformer_options", {})
+        runtime = transformer_options.pop(H3_BLOCK_CACHE_RUNTIME_KEY, None)
+        if runtime is not None:
+            runtime.clear()
+        transformer_options[H3_BLOCK_CACHE_CONFIG_KEY] = dict(config)
+
+    def configure_minimax_h3_sla(self, config):
+        transformer_options = self.model.model_options.setdefault("transformer_options", {})
+        runtime = transformer_options.pop(H3_SLA_RUNTIME_KEY, None)
+        if runtime is not None:
+            runtime.clear()
+        h3_sla_set_active_runtime(None)
+        transformer_options[H3_SLA_CONFIG_KEY] = dict(config)
+
     def get_local_rank(self):
         return self.local_rank
 
@@ -1101,6 +1122,7 @@ class RayWorker:
         sigmas,
         latent_image,
         grouped_output=False,
+        adapter_event_queue=None,
     ):
         import comfy.model_management as comfy_model_management
         import comfy.nested_tensor as comfy_nested_tensor
@@ -1140,23 +1162,45 @@ class RayWorker:
 
         guider = _build_ray_guider(self.model, guider_spec)
         x0_output = {}
-        callback = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1, x0_output)
+        preview_emitter = None
+        if adapter_event_queue is None:
+            callback = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1, x0_output)
+        else:
+            from raylight.expansion.karmabu_adapters.worker import WorkerPreviewEmitter
+
+            preview_emitter = WorkerPreviewEmitter(self, adapter_event_queue, x0_output)
+            callback = preview_emitter.callback
 
         disable_pbar = comfy_utils.PROGRESS_BAR_ENABLED
         if self.local_rank == 0:
             disable_pbar = not comfy_utils.PROGRESS_BAR_ENABLED
 
         with torch.no_grad():
-            samples = guider.sample(
-                noise,
-                latent_image,
-                sampler,
-                sigmas,
-                denoise_mask=noise_mask,
-                callback=callback,
-                disable_pbar=disable_pbar,
-                seed=sampling_seed,
-            )
+            if preview_emitter is None:
+                samples = guider.sample(
+                    noise,
+                    latent_image,
+                    sampler,
+                    sigmas,
+                    denoise_mask=noise_mask,
+                    callback=callback,
+                    disable_pbar=disable_pbar,
+                    seed=sampling_seed,
+                )
+            else:
+                try:
+                    samples = guider.sample(
+                        noise,
+                        latent_image,
+                        sampler,
+                        sigmas,
+                        denoise_mask=noise_mask,
+                        callback=callback,
+                        disable_pbar=disable_pbar,
+                        seed=sampling_seed,
+                    )
+                finally:
+                    preview_emitter.close()
             samples = samples.to(comfy_model_management.intermediate_device())
 
             out = latent.copy()

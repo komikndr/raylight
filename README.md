@@ -5,11 +5,62 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
 
+## Karmabu maintained fork
+
+This repository is a community-maintained fork of
+[komikndr/raylight](https://github.com/komikndr/raylight). It keeps the original
+Raylight architecture, node names, workflow compatibility, documentation, credits,
+and license while providing an independently maintained development path.
+
+The fork currently focuses on MiniMax H3 acceleration and reliable multi-GPU use on
+consumer hardware. Its maintained additions include:
+
+- MiniMax H3 integration with Raylight Unified Sequence Parallelism (USP).
+- Ulysses-aware MiniMax H3 Sparse Linear Attention (SLA), with configurable sparsity,
+  protected audio/prefix tokens, dense final steps, and runtime diagnostics.
+- MiniMax H3 block caching with configurable sigma threshold, sampling range, cache
+  depth, maximum consecutive cached steps, and debug statistics.
+- MiniMax H3 workflow examples and regression tests for the supported distributed paths.
+- The K3U Adapter compatibility bridge for explicitly supported standard ComfyUI nodes.
+- Preservation of ComfyUI's `cudaMallocAsync` configuration in Ray workers, preventing
+  Raylight from silently replacing the allocator selected by the user.
+
+Karmabu contributions that were accepted upstream, including MiniMax H3 sigma shift and
+audio-sampling compatibility, are also part of this history. Features inherited unchanged
+from Raylight remain credited to their original authors and contributors.
+
+Development in this fork follows a review-and-test approach: upstream changes may be
+integrated selectively, but fork-specific fixes do not depend on upstream acceptance.
+The Python package and node identifiers remain `raylight` so existing ComfyUI workflows
+continue to work.
+
+Repository: [Karmabu/raylight](https://github.com/Karmabu/raylight)
+
+
+## K3U Adapter compatibility bridge
+
+K3U Adapter is a small, conservative boundary that lets explicitly supported standard
+ComfyUI nodes participate in Raylight workflows without copying third-party nodes into
+Raylight, importing them into Ray workers, or changing the sampling math.
+
+![K3U Adapter workflow with KJNodes Model Preview Override](docs/images/k3u-adapter.png)
+
+The first supported integration is
+`K3U Export → KJNodes Model Preview Override → K3U Import → XFuser SamplerCustom Advanced`.
+The original KJNodes wrapper and TAEH3 decoder stay on the ComfyUI driver, while Raylight
+only exposes read-only step snapshots from the existing callback path.
+
+`k3u_adapter_context` is the extension point for future compatibility work. New integrations
+will be added individually through an explicit allowlist and dedicated tests; it is not a
+best-effort adapter for arbitrary `MODEL` patches or custom nodes.
+
+
 ## UPDATE
 
 <details><summary><strong>Click to expand changelog</strong></summary>
 
 - LTX 2.5
+- K3U Adapter bridge for KJNodes Model Preview Override, including driver-side TAEH3 previews
 - Wan Animate 2
 - Minimax H3
 - Fix Dist VAE
@@ -55,6 +106,8 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 ## Table of Contents
 - [Raylight](#raylight)
+- [Karmabu maintained fork](#karmabu-maintained-fork)
+- [K3U Adapter compatibility bridge](#k3u-adapter-compatibility-bridge)
 - [UPDATE](#update)
 - [Documentation](#documentation)
 - [What exactly is Raylight](#what-exactly-is-raylight)
@@ -136,14 +189,8 @@ Its job is to split the model weights among GPUs.
   ```bash
   export NCCL_IB_DISABLE=1
   ```
-- Ray workers remove `backend:cudaMallocAsync` from their inherited
-  `PYTORCH_CUDA_ALLOC_CONF` by default. This avoids allocator-related OOMs during
-  NCCL collectives while leaving the ComfyUI host process unchanged. To preserve
-  `cudaMallocAsync` in Ray workers:
-  ```bash
-  export RAYLIGHT_KEEP_CUDA_MALLOC_ASYNC=1
-  ```
-  Other allocator options, such as `expandable_segments:True`, are preserved.
+- Ray workers inherit `PYTORCH_CUDA_ALLOC_CONF` from the ComfyUI process, including
+  `backend:cudaMallocAsync` when ComfyUI is started with `--cuda-malloc`.
 - Example WF just open from your comfyui menu and browse templates
 - **GPU Topology** is very important, not all PCIe in your motherboard is equal.
 - VRAM leakage, when using [Ring > 1 instead of Ulysses](https://github.com/feifeibear/long-context-attention/issues/112).
@@ -399,7 +446,10 @@ https://github.com/user-attachments/assets/d5e262c7-16d5-4260-b847-27be2d809920
 ## Installation
 
 **Manual**
-1. Clone this repository under `ComfyUI/custom_nodes`.
+1. Clone the maintained fork under `ComfyUI/custom_nodes`:
+   ```bash
+   git clone --branch feat-minimax-h3-block-cache https://github.com/Karmabu/raylight.git
+   ```
 2. `cd raylight`
 3. Install dependencies:
    your_python_env - pip install -r requirements.txt
@@ -421,7 +471,8 @@ https://github.com/user-attachments/assets/d5e262c7-16d5-4260-b847-27be2d809920
 7. Restart ComfyUI.
 
 **ComfyUI Manager**
-1. Find raylight in the manager and install it.
+1. The Raylight entry in ComfyUI Manager installs the upstream repository, not this fork.
+2. To use the Karmabu-maintained features, follow the manual installation above.
 
 **Windows**
 1. After numerous testing, it still does not work on out of the box PyTorch, however if you want to try:
