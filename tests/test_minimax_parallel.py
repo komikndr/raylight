@@ -126,3 +126,13 @@ def test_minimax_usp_routes_sidecar_fc2_lora():
     assert "diffusion_model.blocks." in source
     assert "diffusion_model.token_refiner.blocks." in source
     assert source.count("usp_mlp_forward") >= 2
+
+
+def test_minimax_usp_passes_pdd_schedule_to_final_layer():
+    function = _function(RAYLIGHT, "usp_dit_forward")
+    call = next(node for node in ast.walk(function) if isinstance(node, ast.Call) and _call_name(node) == "self.final_layer")
+
+    assert len(call.args) == 7
+    assert ast.unparse(call.args[4]) == "sigma_v"
+    assert ast.unparse(call.args[5]) == "transformer_options.get('sample_sigmas')"
+    assert ast.unparse(call.args[6]) == "(shift_v, shift_a)"

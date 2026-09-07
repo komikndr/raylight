@@ -234,6 +234,36 @@ def _collect_controlnet_shared_modules(diffusion_model: torch.nn.Module) -> set[
     return excluded
 
 
+def _expand_shape_changing_patches(model_patcher) -> None:
+    for key, patches in model_patcher.patches.items():
+        if not isinstance(key, str) or not key.endswith(".weight"):
+            continue
+
+        weight, _, _ = get_key_weight(model_patcher.model, key)
+        target_shape = comfy_dist.lora.calculate_shape(patches, weight, key)
+        if target_shape == weight.shape:
+            continue
+
+        state_weight = model_patcher.fsdp_state_dict.get(key)
+        if state_weight is None:
+            raise RuntimeError(f"Cannot expand shape-changing patch without FSDP state weight: {key}")
+
+        model_patcher.fsdp_state_dict[key] = comfy_dist.lora.pad_tensor_to_shape(state_weight, target_shape)
+        comfy.utils.set_attr_param(model_patcher.model, key, torch.empty(target_shape, dtype=weight.dtype, device=weight.device))
+
+        bias_key = f"{key[:-len('.weight')]}.bias"
+        module = comfy.utils.get_attr(model_patcher.model, key[:-len(".weight")])
+        bias = getattr(module, "bias", None)
+        if bias is None:
+            continue
+        state_bias = model_patcher.fsdp_state_dict.get(bias_key)
+        if state_bias is None:
+            raise RuntimeError(f"Cannot expand shape-changing patch without FSDP state bias: {bias_key}")
+        bias_shape = (target_shape[0], *bias.shape[1:])
+        model_patcher.fsdp_state_dict[bias_key] = comfy_dist.lora.pad_tensor_to_shape(state_bias, bias_shape)
+        comfy.utils.set_attr_param(model_patcher.model, bias_key, torch.empty(bias_shape, dtype=bias.dtype, device=bias.device))
+
+
 def patch_fsdp(self):
     print(f"[Rank {self.rank}] Applying FSDP to {type(self.model.diffusion_model).__name__}")
 
@@ -247,6 +277,7 @@ def patch_fsdp(self):
         raise ValueError("FSDP state_dict is None. Call set_fsdp_state_dict before patch_fsdp.")
 
     diffusion_model = self.model.diffusion_model
+    _expand_shape_changing_patches(self)
     fsdp_kwargs = {"reshard_after_forward": True}
     has_qt_runtime = freeze_and_detect_qt(diffusion_model)
     has_quant_sd = _state_dict_has_quant_payload(self.fsdp_state_dict)
@@ -507,14 +538,14 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
                     m.bias_function = []
 
                 if weight_key in self.patches:
-                    if force_patch_weights:
+                    if force_patch_weights or comfy_dist.lora.calculate_shape(self.patches[weight_key], m.weight, weight_key) != m.weight.shape:
                         self.patch_weight_to_device(weight_key)
                     else:
                         _, set_func, convert_func = get_key_weight(self.model, weight_key)
                         m.weight_function = [LowVramPatch(weight_key, self.patches, convert_func, set_func)]
                         patch_counter += 1
                 if bias_key in self.patches:
-                    if force_patch_weights:
+                    if force_patch_weights or comfy_dist.lora.calculate_shape(self.patches[bias_key], m.bias, bias_key) != m.bias.shape:
                         self.patch_weight_to_device(bias_key)
                     else:
                         _, set_func, convert_func = get_key_weight(self.model, bias_key)

@@ -74,6 +74,30 @@ def load_lora(lora, to_load, log_missing=True):
     return patch_dict
 
 
+def calculate_shape(patches, weight, key, original_weights=None):
+    current_shape = weight.shape
+
+    for p in patches:
+        v = p[1]
+        offset = p[3]
+
+        if offset is not None or isinstance(v, list):
+            continue
+
+        if isinstance(v, weight_adapter.WeightAdapterBase):
+            adapter_shape = v.calculate_shape(key)
+            if adapter_shape is not None:
+                current_shape = adapter_shape
+            continue
+
+        if len(v) == 2:
+            patch_type, patch_data = v
+            if patch_type == "diff" and len(patch_data) > 1 and patch_data[1]["pad_weight"]:
+                current_shape = patch_data[0].shape
+
+    return current_shape
+
+
 def calculate_weight(patches, weight, key, intermediate_dtype=torch.float32, original_weights=None, device_mesh=None):
     for p in patches:
         strength = p[0]

@@ -181,6 +181,10 @@ class LoRAAdapter(WeightAdapterBase):
         else:
             return None
 
+    def calculate_shape(self, key):
+        reshape = self.weights[5]
+        return tuple(reshape) if reshape is not None else None
+
     def calculate_weight(
         self,
         weight,
@@ -199,7 +203,7 @@ class LoRAAdapter(WeightAdapterBase):
         dora_scale = v[4]
         reshape = v[5]
 
-        if reshape is not None:
+        if reshape is not None and weight.shape != tuple(reshape):
             weight = pad_tensor_to_shape(weight, reshape)
 
         if v[2] is not None:

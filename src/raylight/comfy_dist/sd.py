@@ -271,6 +271,9 @@ class MergedWeightBypassAdapter(comfy.weight_adapter.WeightAdapterBase):
             if bias is None:
                 return None
 
+        if bias.shape[0] != out_features:
+            bias = comfy_dist.lora.pad_tensor_to_shape(bias, (out_features, *bias.shape[1:]))
+
         if self.bias_patches:
             bias = comfy_dist.lora.calculate_weight(
                 self.bias_patches,
@@ -396,6 +399,39 @@ def _sample_keys(keys, limit=8):
     return [str(key) for key in list(keys)[:limit]]
 
 
+def _merge_replacement_entries(module_key, entries):
+    if not any(isinstance(item["adapter"], MergedWeightBypassAdapter) for item in entries):
+        return entries
+
+    weight_patches = []
+    bias_patches = []
+    handled_keys = set()
+    for item in entries:
+        adapter = item["adapter"]
+        handled_keys.update(item.get("handled_keys", {item["key"]}))
+        if isinstance(adapter, MergedWeightBypassAdapter):
+            weight_patches.extend(adapter.weight_patches)
+            bias_patches.extend(adapter.bias_patches)
+        elif isinstance(adapter, DirectDiffBypassAdapter):
+            weight_diff, bias_diff = adapter.weights
+            if weight_diff is not None:
+                weight_patches.append((item["strength"], ("diff", (weight_diff,)), 1.0, item["offset"], None))
+            if bias_diff is not None:
+                bias_patches.append((item["strength"], ("diff", (bias_diff,)), 1.0, item["offset"], None))
+        elif isinstance(adapter, comfy_dist.weight_adapter.WeightAdapterBase):
+            weight_patches.append((item["strength"], adapter, 1.0, item["offset"], None))
+        else:
+            return entries
+
+    return [{
+        "adapter": MergedWeightBypassAdapter(module_key, weight_patches, bias_patches),
+        "offset": None,
+        "strength": 1.0,
+        "key": module_key,
+        "handled_keys": handled_keys,
+    }]
+
+
 def load_lora_for_models(model, lora, strength_model):
     key_map = {}
     if model is not None:
@@ -454,6 +490,24 @@ def load_lora_for_models_quantized(model, lora, strength_model, dynamic_sidecar=
             {"weight_patches": [], "bias_patches": [], "handled_keys": set()},
         )
 
+    reshape_modules = set()
+    for loaded_key, patch_data in loaded.items():
+        key = loaded_key
+        offset = None
+        function = None
+        if isinstance(loaded_key, tuple):
+            key = loaded_key[0]
+            if len(loaded_key) > 1:
+                offset = loaded_key[1]
+            if len(loaded_key) > 2:
+                function = loaded_key[2]
+        if not isinstance(key, str) or offset is not None or function is not None or not _adapter_has_reshape(patch_data):
+            continue
+        module_key = _module_key_from_weight_key(key)
+        module = _get_module_by_key(new_modelpatcher.model, module_key)
+        if module is not None and _is_linear_or_conv_module(module):
+            reshape_modules.add(module_key)
+
     for loaded_key, patch_data in loaded.items():
         key = loaded_key
         offset = None
@@ -486,6 +540,12 @@ def load_lora_for_models_quantized(model, lora, strength_model, dynamic_sidecar=
             module = _get_module_by_key(new_modelpatcher.model, module_key)
             if module is None:
                 unsupported_keys.append(loaded_key)
+                continue
+
+            if module_key in reshape_modules:
+                group = merged_group(module_key)
+                group["weight_patches"].append((strength_model, patch_data, 1.0, offset, function))
+                group["handled_keys"].add(key)
                 continue
 
             if _adapter_has_dora(patch_data) or _adapter_has_reshape(patch_data):
@@ -537,6 +597,11 @@ def load_lora_for_models_quantized(model, lora, strength_model, dynamic_sidecar=
 
             if param_name in direct_diff_counts:
                 direct_diff_counts[param_name] += 1
+            if module_key in reshape_modules and _is_linear_or_conv_module(module):
+                group = merged_group(module_key)
+                group[f"{param_name}_patches"].append((strength_model, patch_data, 1.0, offset, function))
+                group["handled_keys"].add(key)
+                continue
             if _is_linear_or_conv_module(module):
                 adapter = DirectDiffBypassAdapter(
                     weight_diff=diff if param_name == "weight" else None,
@@ -617,6 +682,8 @@ def load_lora_for_models_quantized(model, lora, strength_model, dynamic_sidecar=
     sidecar_groups = {key: entries[:] for key, entries in previous_groups.items()}
     for key, entries in grouped_adapters.items():
         sidecar_groups.setdefault(key, []).extend(entries)
+    for key, entries in sidecar_groups.items():
+        sidecar_groups[key] = _merge_replacement_entries(key, entries)
     new_modelpatcher.set_attachments(FSDP_LORA_SIDECAR_ATTACHMENT, sidecar_groups)
 
     manager = comfy.weight_adapter.BypassInjectionManager()
@@ -624,7 +691,9 @@ def load_lora_for_models_quantized(model, lora, strength_model, dynamic_sidecar=
     for key, entries in sidecar_groups.items():
         for item in entries:
             loaded_keys.update(item.get("handled_keys", {item["key"]}))
-        if not dynamic_sidecar and len(entries) == 1 and entries[0]["offset"] is None:
+        if len(entries) == 1 and entries[0]["offset"] is None and (
+            not dynamic_sidecar or isinstance(entries[0]["adapter"], MergedWeightBypassAdapter)
+        ):
             manager.add_adapter(key, entries[0]["adapter"], strength=entries[0]["strength"])
             continue
 

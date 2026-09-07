@@ -244,7 +244,7 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
         audio_seg = (aa, ab, rows_to_mod_index(audio_rows_t, 0) // 3)
     else:
         audio_seg = (aa, ab, t_row[seg_t["audio"]])
-    v, a = self.final_layer(h, t_emb, video_seg, audio_seg)
+    v, a = self.final_layer(h, t_emb, video_seg, audio_seg, sigma_v, transformer_options.get("sample_sigmas"), (shift_v, shift_a))
 
     video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
     video_out = video_out[:, :, :orig_t, :orig_h, :orig_w]

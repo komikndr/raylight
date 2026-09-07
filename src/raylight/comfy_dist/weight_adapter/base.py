@@ -40,6 +40,9 @@ class WeightAdapterBase:
     ):
         raise NotImplementedError
 
+    def calculate_shape(self, key):
+        return None
+
     def h(self, x, base_out):
         return torch.zeros_like(base_out)
 
