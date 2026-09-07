@@ -4,6 +4,7 @@ from xfuser.core.long_ctx_attention import (
 
 from yunchang.kernels import AttnType
 from .sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_kernel
+from .inner_attention import INNER_ATTENTION_KEY, InnerAttentionDispatcher
 
 _ATTN_TYPE = None
 _SYNC_ULYSSES = None
@@ -42,6 +43,7 @@ def make_xfuser_attention(attn_type, sync_ulysses):
         ensure_hf_sm90_kernel
 
     xfuser_attn = xFuserLongContextAttention(use_sync=sync_ulysses, attn_type=attn)
+    inner_dispatcher = InnerAttentionDispatcher(xfuser_attn)
 
     def _attention_xfuser_unmask(
             q,
@@ -86,27 +88,27 @@ def make_xfuser_attention(attn_type, sync_ulysses):
         key = k.transpose(1, 2)
         value = v.transpose(1, 2)
 
-        # Check if using join attention, for MMDiT model
-        if join_q is not None:
-            out = xfuser_attn(
-                None,
-                query,
-                key,
-                value,
-                joint_strategy="rear",
-                joint_tensor_query=join_q.transpose(1, 2),
-                joint_tensor_key=join_k.transpose(1, 2),
-                joint_tensor_value=join_v.transpose(1, 2),
-                softmax_scale=kwargs.get("scale", None),
-            ).transpose(1, 2)
-        else:
-            out = xfuser_attn(
-                None,
-                query,
-                key,
-                value,
-                softmax_scale=kwargs.get("scale", None),
-            ).transpose(1, 2)
+        # For custom inner attentnion, such as SLA, maybe SOL
+        transformer_options = kwargs.get("transformer_options", {})
+        processor = transformer_options.get(INNER_ATTENTION_KEY)
+        with inner_dispatcher.scope(processor, transformer_options):
+            if join_q is not None:
+                out = xfuser_attn(
+                    None, query, key, value,
+                    joint_strategy="rear",
+                    joint_tensor_query=join_q.transpose(1, 2),
+                    joint_tensor_key=join_k.transpose(1, 2),
+                    joint_tensor_value=join_v.transpose(1, 2),
+                    softmax_scale=kwargs.get("scale", None),
+                ).transpose(1, 2)
+            else:
+                out = xfuser_attn(
+                    None,
+                    query,
+                    key,
+                    value,
+                    softmax_scale=kwargs.get("scale", None),
+                ).transpose(1, 2)
         if not skip_output_reshape:
             out = (
                 out.transpose(1, 2).reshape(b, -1, heads * dim_head)
