@@ -1,6 +1,7 @@
 import torch
 
 import comfy
+from comfy_extras.nodes_minimax_h3 import MiniMaxH3FunControlBlockPatch
 from comfy.ldm.minimax.model import AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP, PackedLayout, mask_row_values, pack_audio, patchify_video, rope_rotation_table, time_shift_sigma, unpack_audio, unpatchify_video
 from xfuser.core.distributed import get_sequence_parallel_rank, get_sequence_parallel_world_size, get_sp_group
 
@@ -30,7 +31,25 @@ def _split_packed_sequence(h, rope_freqs, mod_segments):
     return h[start:end], rope_freqs[:, start:end], local_segments
 
 
+def _run_control_patch(patch, args, block_wrap, full_size):
+    local_size = args["img"].shape[0]
+    with comfy.model_prefetch.pause_malloc_graph():
+        full_h = get_sp_group().all_gather(args["img"].contiguous(), dim=0)[:full_size]
+        full_args = {**args, "img": full_h}
+        patch.control_patch.before_block(patch.block_index, full_args)
+    out = patch.previous(args, {"original_block": block_wrap}) if patch.previous is not None else block_wrap(args)
+    with comfy.model_prefetch.pause_malloc_graph():
+        full_out = {"img": get_sp_group().all_gather(out["img"].contiguous(), dim=0)[:full_size]}
+        result = patch.control_patch.after_block(patch.block_index, full_args, full_out)["img"]
+        padded_size = get_sequence_parallel_world_size() * local_size
+        result = torch.nn.functional.pad(result, (0, 0, 0, padded_size - full_size))
+        start = get_sequence_parallel_rank() * local_size
+        return result[start:start + local_size]
+
+
 def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}):
+    if self.comfy_attention.function is not None:
+        raise ValueError("Checkpoint-selected MiniMax H3 attention is not supported by Raylight USP")
     s = x.shape[0]
     q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
     v = v.view(s, self.heads, self.head_dim)
@@ -83,6 +102,7 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
         layout = PackedLayout(text_len, latent_t, lat_h, lat_w, audio_t,
                               keyframes=payload.get("keyframes"),
                               refs=payload.get("refs"))
+    transformer_options["minimax_h3_layout"] = layout
 
     # model_base passes model_sampling.timestep(sigma) = sigma * 1000
     shift_v = float(transformer_options.get("minimax_h3_sigma_shift_video", self.sigma_shift_video))
@@ -217,14 +237,20 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.blocks), device, transformer_options)
     for i, block in enumerate(self.blocks):
         comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, block)
+        transformer_options["block_index"] = i
         if ("double_block", i) in blocks_replace:
             def block_wrap(args):
+                if args.get("attention") is not None and get_sequence_parallel_world_size() > 1:
+                    raise ValueError("MiniMax H3 block attention patches need full sequence; use Raylight SLA for USP")
                 return {"img": block(args["img"], args["t_emb"], args["mod_segments"], args["rope_freqs"],
-                                     transformer_options=args["transformer_options"])}
-            h = blocks_replace[("double_block", i)](
-                {"img": h, "t_emb": t_emb, "mod_segments": mod_segments, "rope_freqs": rope_freqs,
-                 "transformer_options": transformer_options},
-                {"original_block": block_wrap})["img"]
+                                     transformer_options=args["transformer_options"], attention=args.get("attention"))}
+            args = {"img": h, "t_emb": t_emb, "mod_segments": mod_segments, "rope_freqs": rope_freqs,
+                    "layout": layout, "transformer_options": transformer_options}
+            patch = blocks_replace[("double_block", i)]
+            if isinstance(patch, MiniMaxH3FunControlBlockPatch) and patch.control_patch.active:
+                h = _run_control_patch(patch, args, block_wrap, h_orig_size)
+            else:
+                h = patch(args, {"original_block": block_wrap})["img"]
         else:
             h = block(h, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)
     if prefetch_queue is not None:

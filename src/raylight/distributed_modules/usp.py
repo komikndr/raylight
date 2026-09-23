@@ -380,6 +380,16 @@ if hasattr(model_base, "HunyuanVideo"):
         model.forward_orig = types.MethodType(usp_dit_forward, model)
 
 
+if hasattr(model_base, "QwenImage21"):
+
+    @USPInjectRegistry.register(model_base.QwenImage21)
+    def _inject_qwen21(model_patcher, base_model, *args):
+        from ..diffusion_models.qwen_image.xdit_context_parallel21 import usp_dit_forward
+
+        model = base_model.diffusion_model
+        model._forward = types.MethodType(usp_dit_forward, model)
+
+
 if hasattr(model_base, "QwenImage"):
 
     @USPInjectRegistry.register(model_base.QwenImage)

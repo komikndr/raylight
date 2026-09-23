@@ -10,6 +10,7 @@ from xfuser.core.distributed import (
 )
 from ..utils import pad_to_world_size
 from comfy.ldm.flux.math import apply_rope
+from comfy.ldm.flux.layers import modulated_norm
 import raylight.distributed_modules.attention as xfuser_attn
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
@@ -292,6 +293,8 @@ def usp_single_stream_forward(
     transformer_options={},
     **kwargs
 ) -> Tensor:
+    if self.comfy_attention.function is not None:
+        raise ValueError("Checkpoint-selected attention is not supported by Raylight USP")
     if self.modulation:
         mod, _ = self.modulation(vec)
     else:
@@ -300,7 +303,7 @@ def usp_single_stream_forward(
     transformer_patches = transformer_options.get("patches", {})
     extra_options = transformer_options.copy()
 
-    qkv, mlp = torch.split(self.linear1(apply_mod(self.pre_norm(x), (1 + mod.scale), mod.shift, modulation_dims)), [3 * self.hidden_size, self.mlp_hidden_dim_first], dim=-1)
+    qkv, mlp = torch.split(self.linear1(modulated_norm(x, self.pre_norm, mod.scale, mod.shift, modulation_dims)), [3 * self.hidden_size, self.mlp_hidden_dim_first], dim=-1)
 
     q, k, v = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
     del qkv
@@ -346,6 +349,8 @@ def usp_double_stream_forward(
     transformer_options={},
     **kwargs
 ):
+    if self.comfy_attention.function is not None:
+        raise ValueError("Checkpoint-selected attention is not supported by Raylight USP")
     if self.modulation:
         img_mod1, img_mod2 = self.img_mod(vec)
         txt_mod1, txt_mod2 = self.txt_mod(vec)
@@ -356,8 +361,7 @@ def usp_double_stream_forward(
     extra_options = transformer_options.copy()
 
     # prepare image for attention
-    img_modulated = self.img_norm1(img)
-    img_modulated = apply_mod(img_modulated, (1 + img_mod1.scale), img_mod1.shift, modulation_dims_img)
+    img_modulated = modulated_norm(img, self.img_norm1, img_mod1.scale, img_mod1.shift, modulation_dims_img)
     img_qkv = self.img_attn.qkv(img_modulated)
     del img_modulated
     img_q, img_k, img_v = img_qkv.view(img_qkv.shape[0], img_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
@@ -365,8 +369,7 @@ def usp_double_stream_forward(
     img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
 
     # prepare txt for attention
-    txt_modulated = self.txt_norm1(txt)
-    txt_modulated = apply_mod(txt_modulated, (1 + txt_mod1.scale), txt_mod1.shift, modulation_dims_txt)
+    txt_modulated = modulated_norm(txt, self.txt_norm1, txt_mod1.scale, txt_mod1.shift, modulation_dims_txt)
     txt_qkv = self.txt_attn.qkv(txt_modulated)
     del txt_modulated
     txt_q, txt_k, txt_v = txt_qkv.view(txt_qkv.shape[0], txt_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
@@ -402,12 +405,12 @@ def usp_double_stream_forward(
     # calculate the img bloks
     img += apply_mod(self.img_attn.proj(img_attn), img_mod1.gate, None, modulation_dims_img)
     del img_attn
-    img += apply_mod(self.img_mlp(apply_mod(self.img_norm2(img), (1 + img_mod2.scale), img_mod2.shift, modulation_dims_img)), img_mod2.gate, None, modulation_dims_img)
+    img += apply_mod(self.img_mlp(modulated_norm(img, self.img_norm2, img_mod2.scale, img_mod2.shift, modulation_dims_img)), img_mod2.gate, None, modulation_dims_img)
 
     # calculate the txt bloks
     txt += apply_mod(self.txt_attn.proj(txt_attn), txt_mod1.gate, None, modulation_dims_txt)
     del txt_attn
-    txt += apply_mod(self.txt_mlp(apply_mod(self.txt_norm2(txt), (1 + txt_mod2.scale), txt_mod2.shift, modulation_dims_txt)), txt_mod2.gate, None, modulation_dims_txt)
+    txt += apply_mod(self.txt_mlp(modulated_norm(txt, self.txt_norm2, txt_mod2.scale, txt_mod2.shift, modulation_dims_txt)), txt_mod2.gate, None, modulation_dims_txt)
 
     if txt.dtype == torch.float16:
         txt = torch.nan_to_num(txt, nan=0.0, posinf=65504, neginf=-65504)

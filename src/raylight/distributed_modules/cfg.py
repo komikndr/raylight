@@ -80,6 +80,15 @@ if hasattr(model_base, "WAN21"):
         return cfg_parallel_forward_wrapper
 
 
+if hasattr(model_base, "QwenImage21"):
+
+    @CFGParallelInjectRegistry.register(model_base.QwenImage21)
+    def _inject_qwen21():
+        from ..diffusion_models.qwen_image.xdit_cfg_parallel import cfg_parallel_forward_wrapper_qwen21
+
+        return cfg_parallel_forward_wrapper_qwen21
+
+
 if hasattr(model_base, "QwenImage"):
 
     @CFGParallelInjectRegistry.register(model_base.QwenImage)

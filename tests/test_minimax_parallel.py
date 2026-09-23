@@ -1,5 +1,9 @@
 import ast
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
+
+import torch
 
 
 ROOT = Path(__file__).parents[3]
@@ -136,3 +140,48 @@ def test_minimax_usp_passes_pdd_schedule_to_final_layer():
     assert ast.unparse(call.args[4]) == "sigma_v"
     assert ast.unparse(call.args[5]) == "transformer_options.get('sample_sigmas')"
     assert ast.unparse(call.args[6]) == "(shift_v, shift_a)"
+
+
+def test_minimax_control_patch_uses_full_sequence_and_returns_local_shard():
+    function = _function(RAYLIGHT, "_run_control_patch")
+    module = ast.Module(body=[function], type_ignores=[])
+    control_inputs = []
+    control_outputs = []
+    full_input = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+    full_output = full_input + 10
+
+    class Group:
+        def __init__(self):
+            self.calls = 0
+
+        def all_gather(self, value, dim):
+            self.calls += 1
+            assert dim == 0
+            return torch.cat((full_input, torch.zeros(1, 2))) if self.calls == 1 else torch.cat((full_output, torch.zeros(1, 2)))
+
+    group = Group()
+    scope = {
+        "torch": torch,
+        "comfy": SimpleNamespace(model_prefetch=SimpleNamespace(pause_malloc_graph=nullcontext)),
+        "get_sp_group": lambda: group,
+        "get_sequence_parallel_world_size": lambda: 2,
+        "get_sequence_parallel_rank": lambda: 1,
+    }
+    exec(compile(module, str(RAYLIGHT), "exec"), scope)
+
+    control = SimpleNamespace(
+        before_block=lambda index, args: control_inputs.append((index, args["img"].clone(), args["layout"])),
+        after_block=lambda index, args, out: (control_outputs.append((index, out["img"].clone())) or {"img": out["img"] + 3}),
+    )
+    patch = SimpleNamespace(block_index=0, control_patch=control, previous=None)
+    layout = object()
+    local_input = torch.tensor([[6., 7.], [8., 9.], [0., 0.]])
+    args = {"img": local_input, "layout": layout}
+    result = scope["_run_control_patch"](patch, args, lambda data: {"img": data["img"] + 10}, 5)
+
+    assert group.calls == 2
+    assert control_inputs[0][0] == control_outputs[0][0] == 0
+    assert control_inputs[0][2] is layout
+    torch.testing.assert_close(control_inputs[0][1], full_input)
+    torch.testing.assert_close(control_outputs[0][1], full_output)
+    torch.testing.assert_close(result, torch.tensor([[19., 20.], [21., 22.], [0., 0.]]))
