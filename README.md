@@ -9,6 +9,11 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 <details><summary><strong>Click to expand changelog</strong></summary>
 
+- Prevent materialized view FSDP using direct DTensor class instead of sugarcoated PyTorch handler thanks to https://github.com/StanLukuvka for insight.
+- **BETA** Qwen 2.1 Image USP.
+- Fix bug with PDD Lora Minimax.
+- Custom attention implementation that can run on top of USP (such example is Minimax SLA)
+- Minimax SLA thanks to https://github.com/Karmabu.
 - LTX 2.5
 - Wan Animate 2
 - Minimax H3
@@ -262,10 +267,11 @@ This is experimental mode where all type of parallel group can work at a sime ti
 
 
 **Qwen**
-| Model             | USP | FSDP | CFG |
-|-------------------|-----|------|-----|
-| Qwen Image/Edit   | ✅  | ✅   | ✅  |
-| ControlNet        | ✅  | ✅   | ✅  |
+| Model                 | USP | FSDP | CFG |
+|-----------------------|-----|------|-----|
+| Qwen Image/Edit       | ✅  | ✅   | ✅  |
+| Qwen Image 2.1 (BETA) | ✅  | ❌   | ❓  |
+| ControlNet            | ✅  | ✅   | ✅  |
 
 
 **Z Image, Lumina 2**
