@@ -78,6 +78,7 @@ class MiniMaxH3SLA:
         self.protect_audio = protect_audio
         self._kernel = None
         self._kernel_checked = False
+        self._logged_success = False
         self._logged_failure = False
 
     def prepare(self, transformer_options=None, minimax_payload=None):
@@ -111,8 +112,12 @@ class MiniMaxH3SLA:
         if kernel is None:
             return dense_attention(q, k, v, **kwargs)
         try:
-            return kernel(q, k, v, sparsity_ratio=self.sparsity_ratio, block_size=self.block_size,
-                          protected_ranges=prepared["protected_ranges"], **kwargs)
+            out = kernel(q, k, v, sparsity_ratio=self.sparsity_ratio, block_size=self.block_size,
+                         protected_ranges=prepared["protected_ranges"], **kwargs)
+            if not self._logged_success:
+                print("[Raylight] Using custom attention: MiniMax H3 SLA")
+                self._logged_success = True
+            return out
         except Exception as error:
             if not self._logged_failure:
                 logging.warning("[Raylight] H3 SLA kernel failed; using dense attention (%s)", error)
