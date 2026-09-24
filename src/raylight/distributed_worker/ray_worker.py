@@ -883,11 +883,13 @@ class RayWorker:
             model_management.soft_empty_cache()
             gc.collect()
 
+            if self.parallel_dict.get("is_quant", False):
+                self.set_state_dict()
+
             if self.lora_list is not None:
                 self.load_lora()
 
             if self.parallel_dict.get("is_quant", False):
-                self.set_state_dict()
                 self._patch_fsdp_for_sampling()
 
             base_model = getattr(self.model, "model", self.model)

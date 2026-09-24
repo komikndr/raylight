@@ -11,7 +11,7 @@ from raylight.diffusion_models.wan.pipefusion import (
 from raylight.distributed_worker.pipefusion_schema import build_stage_plan
 
 from comfy.sd import model_detection_error_hint
-from comfy import model_detection, model_management
+from comfy import model_base, model_detection, model_management
 import comfy
 
 
@@ -432,6 +432,53 @@ def _merge_replacement_entries(module_key, entries):
     }]
 
 
+def _materialize_minimax_pdd_heads(model_patcher, groups):
+    if not isinstance(model_patcher.model, model_base.MiniMaxH3) or model_patcher.fsdp_state_dict is None:
+        return set()
+
+    handled_keys = set()
+    state_dict = model_patcher.fsdp_state_dict
+    for name in ("video_out", "audio_out"):
+        module_key = f"diffusion_model.final_layer.{name}"
+        group = groups.get(module_key)
+        if group is None:
+            continue
+
+        module = getattr(model_patcher.model.diffusion_model.final_layer, name)
+        weight_key = f"{module_key}.weight"
+        weight = state_dict[weight_key]
+        target_shape = comfy_dist.lora.calculate_shape(group["weight_patches"], weight, weight_key)
+        if target_shape[0] == module.out_features and module.weight.shape[0] == module.out_features:
+            continue
+
+        if group["weight_patches"]:
+            weight = comfy_dist.lora.calculate_weight(group["weight_patches"], weight.to(copy=True), weight_key, intermediate_dtype=weight.dtype)
+        if weight.shape != target_shape or weight.shape[0] % module.out_features:
+            raise ValueError(f"Invalid MiniMax PDD head shape for {weight_key}: {tuple(weight.shape)}")
+        bias_key = f"{module_key}.bias"
+        bias = state_dict[bias_key]
+        bias_shape = (weight.shape[0],)
+        if bias.shape != bias_shape:
+            bias = comfy_dist.lora.pad_tensor_to_shape(bias, bias_shape)
+        else:
+            bias = bias.clone()
+        if group["bias_patches"]:
+            bias = comfy_dist.lora.calculate_weight(group["bias_patches"], bias, bias_key, intermediate_dtype=bias.dtype)
+        if bias.shape != bias_shape:
+            raise ValueError(f"Invalid MiniMax PDD bias shape for {bias_key}: {tuple(bias.shape)}")
+
+        state_dict[weight_key] = weight
+        state_dict[bias_key] = bias
+        if module.weight.shape != weight.shape:
+            comfy.utils.set_attr_param(model_patcher.model, weight_key, torch.empty(weight.shape, dtype=module.weight.dtype, device=module.weight.device))
+        if module.bias.shape != bias.shape:
+            comfy.utils.set_attr_param(model_patcher.model, bias_key, torch.empty(bias.shape, dtype=module.bias.dtype, device=module.bias.device))
+        handled_keys.update(group["handled_keys"])
+        del groups[module_key]
+
+    return handled_keys
+
+
 def load_lora_for_models(model, lora, strength_model):
     key_map = {}
     if model is not None:
@@ -507,6 +554,12 @@ def load_lora_for_models_quantized(model, lora, strength_model, dynamic_sidecar=
         module = _get_module_by_key(new_modelpatcher.model, module_key)
         if module is not None and _is_linear_or_conv_module(module):
             reshape_modules.add(module_key)
+
+    if isinstance(new_modelpatcher.model, model_base.MiniMaxH3) and new_modelpatcher.fsdp_state_dict is not None:
+        for name in ("video_out", "audio_out"):
+            module = getattr(new_modelpatcher.model.diffusion_model.final_layer, name)
+            if module.weight.shape[0] > module.out_features:
+                reshape_modules.add(f"diffusion_model.final_layer.{name}")
 
     for loaded_key, patch_data in loaded.items():
         key = loaded_key
@@ -656,6 +709,7 @@ def load_lora_for_models_quantized(model, lora, strength_model, dynamic_sidecar=
             }
         )
 
+    materialized_keys = _materialize_minimax_pdd_heads(new_modelpatcher, merged_patch_groups)
     merged_forward_count = 0
     merged_weight_patch_count = 0
     merged_bias_patch_count = 0
@@ -687,7 +741,7 @@ def load_lora_for_models_quantized(model, lora, strength_model, dynamic_sidecar=
     new_modelpatcher.set_attachments(FSDP_LORA_SIDECAR_ATTACHMENT, sidecar_groups)
 
     manager = comfy.weight_adapter.BypassInjectionManager()
-    loaded_keys = set()
+    loaded_keys = set(materialized_keys)
     for key, entries in sidecar_groups.items():
         for item in entries:
             loaded_keys.update(item.get("handled_keys", {item["key"]}))
@@ -769,7 +823,7 @@ def load_lora_for_models_quantized(model, lora, strength_model, dynamic_sidecar=
             len(function_keys),
             _sample_keys(function_keys),
         )
-    if len(loaded) > 0 and hook_count == 0 and not fallback_to_patches:
+    if len(loaded) > 0 and hook_count == 0 and not fallback_to_patches and not materialized_keys:
         logging.warning("[Raylight LoRA][%s] loaded patches are nonzero but created bypass hooks=0", mode)
 
     new_modelpatcher.set_injections("quantized_lora_bypass", injections)
