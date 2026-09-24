@@ -358,6 +358,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         fsdp_state_dict: dict | None = None,
         device_mesh=None,
         is_cpu_offload: bool = False,
+        fast_disk=False,
     ):
         super().__init__(
             model=model,
@@ -365,6 +366,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
             offload_device=offload_device,
             size=size,
             weight_inplace_update=weight_inplace_update,
+            fast_disk=fast_disk,
         )
         self.rank = rank
         self.fsdp_state_dict = fsdp_state_dict
@@ -684,6 +686,7 @@ class PipefusionModelPatcher(comfy.model_patcher.ModelPatcher):
         pipefusion_config: "PipeFusionConfig | None" = None,
         stage_plan: "StagePlan | None" = None,
         parallel_context: "XFuserParallelContext | None" = None,
+        fast_disk=False,
     ):
         super().__init__(
             model=model,
@@ -691,6 +694,7 @@ class PipefusionModelPatcher(comfy.model_patcher.ModelPatcher):
             offload_device=offload_device,
             size=size,
             weight_inplace_update=weight_inplace_update,
+            fast_disk=fast_disk,
         )
         self.pipefusion_config = pipefusion_config
         self.pipefusion_stage = stage_plan
