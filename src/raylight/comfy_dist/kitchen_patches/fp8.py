@@ -100,6 +100,9 @@ def install_fp8_patches() -> None:
             out_dtype=out_dtype,
         )
 
+    def _aligned_mm(input_qdata, weight_qdata):
+        return input_qdata.shape[-1] % 16 == 0 and weight_qdata.shape[-1] % 16 == 0
+
     @maybe_register(torch.ops.aten.linear.default)
     def handle_linear(qt, args, kwargs):
         input_tensor, weight = args[0], args[1]
@@ -121,6 +124,9 @@ def install_fp8_patches() -> None:
         if input_qdata.ndim > 2:
             output_shape = (*input_qdata.shape[:-1], weight_qdata.shape[0])
             input_qdata = input_qdata.reshape(-1, input_qdata.shape[-1])
+
+        if not _aligned_mm(input_qdata, weight_qdata.t()):
+            return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
 
         try:
             output = _fp8_scaled_mm(input_qdata, weight_qdata.t(), scale_a, scale_b, bias, out_dtype)
@@ -148,6 +154,9 @@ def install_fp8_patches() -> None:
         else:
             return torch.mm(*dequantize_args(args))
 
+        if not _aligned_mm(a_qdata, b_qdata):
+            return torch.mm(*dequantize_args(args))
+
         try:
             return _fp8_scaled_mm(a_qdata, b_qdata, scale_a, scale_b, out_dtype=out_dtype)
         except (RuntimeError, TypeError) as e:
@@ -169,6 +178,9 @@ def install_fp8_patches() -> None:
             b_qdata, scale_b = _get_plain_tensors(b)
             out_dtype = kwargs.get("out_dtype", a.dtype)
         else:
+            return torch.addmm(*dequantize_args(args))
+
+        if not _aligned_mm(a_qdata, b_qdata):
             return torch.addmm(*dequantize_args(args))
 
         try:

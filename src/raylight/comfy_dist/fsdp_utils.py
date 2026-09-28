@@ -648,6 +648,7 @@ def load_from_full_model_state_dict(
 ):
     meta_sharded_sd = model.state_dict()
     sharded_sd: dict[str, torch.Tensor] = {}
+    unsharded_params = []
     for param_name, sharded_meta_param in meta_sharded_sd.items():
         parent_module, leaf_name = _get_parent_module_and_name(model, param_name)
         is_buffer = leaf_name in parent_module._buffers
@@ -657,9 +658,8 @@ def load_from_full_model_state_dict(
                 if strict:
                     raise ValueError(f"Missing parameter {param_name} in state_dict")
                 continue
-            _materialize_unsharded_param(model, param_name, sharded_meta_param, full_tensor, device, cpu_offload)
-            if release_sd:
-                full_sd[param_name] = None
+            unsharded_params.append((param_name, sharded_meta_param, full_tensor))
+            sharded_sd[param_name] = full_tensor
             continue
 
         if not is_buffer and _is_quant_param(param_name, full_sd, sharded_meta_param):
@@ -705,5 +705,9 @@ def load_from_full_model_state_dict(
         if release_sd:
             full_sd[param_name] = None
     out = model.load_state_dict(sharded_sd, strict=strict, assign=True)
+    for param_name, meta_param, full_tensor in unsharded_params:
+        _materialize_unsharded_param(model, param_name, meta_param, full_tensor, device, cpu_offload)
+        if release_sd:
+            full_sd[param_name] = None
     _materialize_missing_ignored_params(model, full_sd, device, strict, cpu_offload, release_sd)
     return out
