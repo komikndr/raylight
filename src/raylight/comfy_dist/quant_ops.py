@@ -37,7 +37,7 @@ def patch_temp_fix_ck_ops(func):
         self = args[0]
         parallel_dict = getattr(self, "parallel_dict", {}) or {}
         overwrite_cast_dtype = getattr(self, "overwrite_cast_dtype", None)
-        layouts = parallel_dict.get("comfy_kitchen_layouts", ("fp8", "nvfp4", "int8"))
+        layouts = parallel_dict.get("comfy_kitchen_layouts", ("fp8", "nvfp4", "int8", "mxfp8"))
         install_ck_patches = bool(parallel_dict.get("is_quant", False))
         ck_patched = False
         restore_sitepkg_ck_patches = None
