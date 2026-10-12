@@ -169,6 +169,7 @@ def usp_joint_attention_forward(
     rotary_emb,
     attention_mask=None,
     transformer_options={},
+    **kwargs,
 ):
     batch_size = img_hidden_states.shape[0]
     instruct_size = instruct_hidden_states.shape[1]
@@ -227,6 +228,7 @@ def usp_img_self_attention_forward(
     attention_mask=None,
     image_rotary_emb=None,
     transformer_options={},
+    **kwargs,
 ):
     return usp_attention_forward(
         self,
@@ -248,6 +250,7 @@ def usp_double_stream_forward(
     joint_attention_mask=None,
     img_attention_mask=None,
     transformer_options={},
+    **kwargs,
 ):
     instruct_size = instruct_hidden_states.shape[1]
 

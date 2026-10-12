@@ -226,7 +226,7 @@ def usp_dit_forward(
     return img
 
 
-def usp_single_stream_forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mask=None, modulation_dims=None, transformer_options={}) -> Tensor:
+def usp_single_stream_forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mask=None, modulation_dims=None, transformer_options={}, **kwargs) -> Tensor:
     if self.comfy_attention.function is not None:
         raise ValueError("Checkpoint-selected attention is not supported by Raylight USP")
     if self.modulation:
@@ -267,6 +267,7 @@ def usp_double_stream_forward(
     modulation_dims_img=None,
     modulation_dims_txt=None,
     transformer_options={},
+    **kwargs,
 ):
     if self.comfy_attention.function is not None:
         raise ValueError("Checkpoint-selected attention is not supported by Raylight USP")

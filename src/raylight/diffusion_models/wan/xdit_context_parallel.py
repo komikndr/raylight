@@ -103,6 +103,7 @@ def usp_causal_ar_forward_block(
     crossattn_caches,
     clip_fea=None,
     transformer_options={},
+    **kwargs,
 ):
     x = comfy.ldm.common_dit.pad_to_patch_size(x, self.patch_size)
     bs, c, t, h, w = x.shape
@@ -180,7 +181,7 @@ def usp_causal_ar_forward_block(
     return x[:, :, :t, :h, :w]
 
 
-def usp_causal_ar_self_attn_forward(self, x, freqs, kv_cache=None, transformer_options={}):
+def usp_causal_ar_self_attn_forward(self, x, freqs, kv_cache=None, transformer_options={}, **kwargs):
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
     q = apply_rope1(self.norm_q(self.q(x)).view(b, s, n, d), freqs)
@@ -229,6 +230,7 @@ def usp_causal_ar_block_forward(
     kv_cache=None,
     crossattn_cache=None,
     transformer_options={},
+    **kwargs,
 ):
     from comfy.ldm.wan.model import repeat_e
 
@@ -747,7 +749,7 @@ def usp_s2v_dit_forward(
     return x
 
 
-def usp_music_self_attn_forward(self, x, freqs):
+def usp_music_self_attn_forward(self, x, freqs, **kwargs):
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
     q = self.q_proj(x).view(b, s, n, d)

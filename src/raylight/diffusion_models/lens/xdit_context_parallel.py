@@ -28,6 +28,7 @@ def usp_lens_attention_forward(
     freqs_cis,
     attention_mask=None,
     transformer_options=None,
+    **kwargs,
 ):
     bsz, seq_img, _ = hidden_states.shape
     seq_txt = encoder_hidden_states.shape[1]

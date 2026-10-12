@@ -178,7 +178,8 @@ def usp_general_dit_forward(
 # ============================ PREDICT2 ======================== #
 # original code from: https://github.com/nvidia-cosmos/cosmos-predict2
 def usp_xfuser_attention_op(
-    q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H_D: torch.Tensor, transformer_options: Optional[dict] = {}
+    q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H_D: torch.Tensor, transformer_options: Optional[dict] = {},
+    **kwargs,
 ) -> torch.Tensor:
     in_q_shape = q_B_S_H_D.shape
     in_k_shape = k_B_S_H_D.shape

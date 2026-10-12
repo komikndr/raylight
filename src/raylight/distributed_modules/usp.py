@@ -1,5 +1,6 @@
 import types
 from comfy import model_base
+from comfy.ldm.modules.attention import ComfyAttention
 
 
 class USPInjectRegistry:
@@ -414,6 +415,10 @@ if hasattr(model_base, "MiniMaxH3"):
 
         model = base_model.diffusion_model
         sidecar_groups = model_patcher.get_attachment(FSDP_LORA_SIDECAR_ATTACHMENT) or {}
+        for block in model.blocks:
+            for attention in block.attn.modules():
+                if isinstance(attention, ComfyAttention) and attention.function is not None:
+                    raise ValueError("Checkpoint-selected MiniMax H3 attention is not supported by Raylight USP")
         for i, block in enumerate(model.blocks):
             block.attn.forward = types.MethodType(usp_attn_forward, block.attn)
             if f"diffusion_model.blocks.{i}.mlp.fc2" in sidecar_groups:

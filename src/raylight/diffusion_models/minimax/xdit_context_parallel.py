@@ -47,9 +47,7 @@ def _run_control_patch(patch, args, block_wrap, full_size):
         return result[start:start + local_size]
 
 
-def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}):
-    if self.comfy_attention.function is not None:
-        raise ValueError("Checkpoint-selected MiniMax H3 attention is not supported by Raylight USP")
+def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}, **kwargs):
     s = x.shape[0]
     q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
     v = v.view(s, self.heads, self.head_dim)
@@ -78,7 +76,7 @@ def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}):
     return self.out_proj(out.squeeze(0))
 
 
-def usp_mlp_forward(self, x):
+def usp_mlp_forward(self, x, **kwargs):
     gate, up = self.fc1(x).chunk(2, dim=-1)
     return self.fc2(torch.nn.functional.silu(gate).mul_(up))
 

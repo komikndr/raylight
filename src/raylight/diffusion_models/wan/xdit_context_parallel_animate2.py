@@ -29,7 +29,7 @@ def _local_frame_slice(frame, hw, local_start, local_end):
     return start, end
 
 
-def usp_animate2_self_attn_forward_pose(self, x, freqs, transformer_options={}):
+def usp_animate2_self_attn_forward_pose(self, x, freqs, transformer_options={}, **kwargs):
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
     q = apply_rope1(self.norm_q(self.q(x)).view(b, s, n, d), freqs)
     k = apply_rope1(self.norm_k(self.k(x)).view(b, s, n, d), freqs)
@@ -40,14 +40,15 @@ def usp_animate2_self_attn_forward_pose(self, x, freqs, transformer_options={}):
     return self.o(out), k, v
 
 
-def usp_animate2_kv_from_input(self, x, freqs, transformer_options={}):
+def usp_animate2_kv_from_input(self, x, freqs, transformer_options={}, **kwargs):
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
     k = apply_rope1(self.norm_k(self.k(x)).view(b, s, n, d), freqs)
     return k, self.v(x).view(b, s, n, d)
 
 
 def usp_animate2_self_attn_forward_gen(
-    self, x, freqs, k_pose, v_pose, f_gen, hw, buffers, ref_strength=1.0, transformer_options={}
+    self, x, freqs, k_pose, v_pose, f_gen, hw, buffers, ref_strength=1.0, transformer_options={},
+    **kwargs,
 ):
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
     q = apply_rope1(self.norm_q(self.q(x)).view(b, s, n, d), freqs)

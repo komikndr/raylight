@@ -105,7 +105,7 @@ def usp_dit_forward(self, x, timesteps, context, attention_mask=None, ref_latent
     return out
 
 
-def usp_attention_forward(self, x, freqs=None, mask=None, transformer_options={}):
+def usp_attention_forward(self, x, freqs=None, mask=None, transformer_options={}, **kwargs):
     transformer_patches = transformer_options.get("patches", {})
     extra_options = transformer_options.copy()
     q, k, v, gate = self.wq(x), self.wk(x), self.wv(x), self.gate(x)

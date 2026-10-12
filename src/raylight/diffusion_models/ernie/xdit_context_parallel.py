@@ -28,7 +28,7 @@ def usp_forward(self, x, timesteps, context, **kwargs):
     ).execute(x, timesteps, context, **kwargs)
 
 
-def usp_attention_forward(self, x: torch.Tensor, attention_mask: torch.Tensor = None, image_rotary_emb: torch.Tensor = None) -> torch.Tensor:
+def usp_attention_forward(self, x: torch.Tensor, attention_mask: torch.Tensor = None, image_rotary_emb: torch.Tensor = None, **kwargs) -> torch.Tensor:
     batch_size, seq_len, _ = x.shape
 
     q_flat = self.to_q(x)

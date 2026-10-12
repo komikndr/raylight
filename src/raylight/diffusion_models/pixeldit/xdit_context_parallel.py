@@ -28,7 +28,7 @@ def _pad_and_chunk_pos(pos):
     return pos.squeeze(0), orig_size
 
 
-def usp_joint_attention_forward(self, x, y, pos_img, pos_txt=None, attn_mask=None, transformer_options={}):
+def usp_joint_attention_forward(self, x, y, pos_img, pos_txt=None, attn_mask=None, transformer_options={}, **kwargs):
     B, Nx, _ = x.shape
     _, Ny, _ = y.shape
     H = self.num_heads
@@ -67,7 +67,7 @@ def usp_joint_attention_forward(self, x, y, pos_img, pos_txt=None, attn_mask=Non
     return self.proj_x(out_x), self.proj_y(out_y)
 
 
-def usp_rotary_attention_forward(self, x, pos, mask=None, transformer_options={}):
+def usp_rotary_attention_forward(self, x, pos, mask=None, transformer_options={}, **kwargs):
     B, N, _ = x.shape
     H = self.num_heads
     D = self.head_dim
@@ -78,7 +78,7 @@ def usp_rotary_attention_forward(self, x, pos, mask=None, transformer_options={}
     return self.proj(x)
 
 
-def usp_pit_block_forward(self, x, s_cond, image_height, image_width, patch_size, mask=None, transformer_options={}):
+def usp_pit_block_forward(self, x, s_cond, image_height, image_width, patch_size, mask=None, transformer_options={}, **kwargs):
     BL, P2, _ = x.shape
     B = transformer_options.get("_raylight_pixeldit_batch")
     local_l = transformer_options.get("_raylight_pixeldit_local_l")

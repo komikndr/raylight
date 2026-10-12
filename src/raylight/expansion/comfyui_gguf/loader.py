@@ -5,6 +5,7 @@ import torch
 import gguf
 import re
 import os
+import json
 
 from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
@@ -53,10 +54,42 @@ def get_list_field(reader, field_name, field_type):
 
 
 def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", return_arch=False, is_text_model=False, use_mmap=True):
+    state_dict, arch, metadata = _load_gguf_state_dict(path, handle_prefix, is_text_model, use_mmap)
+    return (state_dict, arch) if return_arch else state_dict
+
+
+def gguf_sd_loader_with_metadata(path, use_mmap=True):
+    state_dict, arch, metadata = _load_gguf_state_dict(path, "model.diffusion_model.", False, use_mmap)
+    return state_dict, metadata
+
+
+def _ltx_gguf_config(state_dict):
+    table = state_dict.get("transformer_blocks.0.scale_shift_table")
+    video_registers = state_dict.get("video_embeddings_connector.learnable_registers")
+    audio_registers = state_dict.get("audio_embeddings_connector.learnable_registers")
+    if table is None or video_registers is None or audio_registers is None or table.shape[0] != 9:
+        return {}
+    return {
+        "cross_attention_adaln": True,
+        "caption_proj_before_connector": True,
+        "caption_projection_first_linear": "caption_projection.linear_1.weight" in state_dict,
+        "connector_num_attention_heads": video_registers.shape[1] // 128,
+        "audio_connector_num_attention_heads": audio_registers.shape[1] // 128,
+        "connector_apply_gated_attention": "video_embeddings_connector.transformer_1d_blocks.0.attn1.to_gate_logits.weight" in state_dict,
+        "ff_bias": "transformer_blocks.0.ff.net.0.proj.bias" in state_dict,
+        "audio_ff_bias": "transformer_blocks.0.audio_ff.net.0.proj.bias" in state_dict,
+    }
+
+
+def _load_gguf_state_dict(path, handle_prefix, is_text_model, use_mmap):
     """
     Read state dict as fake tensors
     """
     reader = gguf.GGUFReader(path)
+    metadata = {}
+    config = get_field(reader, "config", str)
+    if config is not None:
+        metadata["config"] = config
 
     # filter and strip prefix
     has_prefix = False
@@ -145,9 +178,11 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", return_arch=Fal
         max_key = max(qsd.keys(), key=lambda k: qsd[k].numel())
         state_dict[max_key].is_largest_weight = True
 
-    if return_arch:
-        return (state_dict, arch_str)
-    return state_dict
+    if not is_text_model and arch_str == "ltxv" and "config" not in metadata:
+        config = _ltx_gguf_config(state_dict)
+        if config:
+            metadata["config"] = json.dumps({"transformer": config})
+    return state_dict, arch_str, metadata
 
 
 # for remapping llama.cpp -> original key names

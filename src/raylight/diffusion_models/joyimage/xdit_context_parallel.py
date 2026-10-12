@@ -17,7 +17,7 @@ sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
 
 
-def usp_attention_forward(self, img, txt, image_rotary_emb, transformer_options=None):
+def usp_attention_forward(self, img, txt, image_rotary_emb, transformer_options=None, **kwargs):
     heads = self.num_attention_heads
 
     img_q, img_k, img_v = self.img_attn_qkv(img).chunk(3, dim=-1)

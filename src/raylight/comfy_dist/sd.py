@@ -928,7 +928,7 @@ def pipefusion_load_diffusion_model_state_dict(sd, pipefusion_config, parallel_c
     parameters = comfy.utils.calculate_parameters(sd)
     weight_dtype = comfy.utils.weight_dtype(sd)
 
-    load_device = model_management.get_torch_device()
+    load_device = model_options.get("load_device", model_management.get_torch_device())
     model_config = model_detection.model_config_from_unet(sd, "", metadata=metadata)
 
     if model_config is not None:
@@ -936,7 +936,7 @@ def pipefusion_load_diffusion_model_state_dict(sd, pipefusion_config, parallel_c
     else:
         new_sd = model_detection.convert_diffusers_mmdit(sd, "")
         if new_sd is not None:
-            model_config = model_detection.model_config_from_unet(new_sd, "")
+            model_config = model_detection.model_config_from_unet(new_sd, "", metadata=metadata)
             if model_config is None:
                 return None
         else:
@@ -953,7 +953,7 @@ def pipefusion_load_diffusion_model_state_dict(sd, pipefusion_config, parallel_c
                 else:
                     logging.warning("{} {}".format(diffusers_keys[k], k))
 
-    offload_device = model_management.unet_offload_device()
+    offload_device = model_options.get("offload_device", model_management.unet_offload_device())
     unet_weight_dtype = list(model_config.supported_inference_dtypes)
     if model_config.quant_config is not None:
         weight_dtype = None
@@ -967,7 +967,7 @@ def pipefusion_load_diffusion_model_state_dict(sd, pipefusion_config, parallel_c
         manual_cast_dtype = model_management.unet_manual_cast(None, load_device, model_config.supported_inference_dtypes)
     else:
         manual_cast_dtype = model_management.unet_manual_cast(unet_dtype, load_device, model_config.supported_inference_dtypes)
-    model_config.set_inference_dtype(unet_dtype, manual_cast_dtype)
+    model_config.set_inference_dtype(unet_dtype, manual_cast_dtype, device=load_device)
 
     if custom_operations is not None:
         model_config.custom_operations = custom_operations
@@ -1025,7 +1025,7 @@ def pipefusion_load_diffusion_model(unet_path, pipefusion_config, parallel_conte
 
 def gguf_load_diffusion_model(unet_path, model_options={}, dequant_dtype=None, patch_dtype=None):
     from raylight.expansion.comfyui_gguf.ops import GGMLOps
-    from raylight.expansion.comfyui_gguf.loader import gguf_sd_loader
+    from raylight.expansion.comfyui_gguf.loader import gguf_sd_loader_with_metadata
     from raylight.expansion.comfyui_gguf.nodes import GGUFModelPatcher
 
     ops = GGMLOps()
@@ -1047,8 +1047,8 @@ def gguf_load_diffusion_model(unet_path, model_options={}, dequant_dtype=None, p
     use_mmap = model_options.get("use_mmap", True)
 
     # init model
-    sd = gguf_sd_loader(unet_path, use_mmap=use_mmap)
-    model = comfy.sd.load_diffusion_model_state_dict(sd, model_options={"custom_operations": ops})
+    sd, metadata = gguf_sd_loader_with_metadata(unet_path, use_mmap=use_mmap)
+    model = comfy.sd.load_diffusion_model_state_dict(sd, model_options={**model_options, "custom_operations": ops}, metadata=metadata)
     if model is None:
         logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
         raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))
@@ -1196,7 +1196,7 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
     parameters = comfy.utils.calculate_parameters(sd)
     weight_dtype = comfy.utils.weight_dtype(sd)
 
-    load_device = model_management.get_torch_device()
+    load_device = model_options.get("load_device", model_management.get_torch_device())
     model_config = model_detection.model_config_from_unet(sd, "", metadata=metadata)
 
     if model_config is not None:
@@ -1204,7 +1204,7 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
     else:
         new_sd = model_detection.convert_diffusers_mmdit(sd, "")
         if new_sd is not None:  # diffusers mmdit
-            model_config = model_detection.model_config_from_unet(new_sd, "")
+            model_config = model_detection.model_config_from_unet(new_sd, "", metadata=metadata)
             if model_config is None:
                 return None
         else:  # diffusers unet
@@ -1221,7 +1221,7 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
                 else:
                     logging.warning("{} {}".format(diffusers_keys[k], k))
 
-    offload_device = model_management.unet_offload_device()
+    offload_device = model_options.get("offload_device", model_management.unet_offload_device())
     unet_weight_dtype = list(model_config.supported_inference_dtypes)
     if model_config.quant_config is not None:
         weight_dtype = None
@@ -1235,7 +1235,7 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
         manual_cast_dtype = model_management.unet_manual_cast(None, load_device, model_config.supported_inference_dtypes)
     else:
         manual_cast_dtype = model_management.unet_manual_cast(unet_dtype, load_device, model_config.supported_inference_dtypes)
-    model_config.set_inference_dtype(unet_dtype, manual_cast_dtype)
+    model_config.set_inference_dtype(unet_dtype, manual_cast_dtype, device=load_device)
 
     if custom_operations is not None:
         model_config.custom_operations = custom_operations

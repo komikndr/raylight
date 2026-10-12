@@ -168,6 +168,7 @@ def usp_attention_forward(
     attention_mask=None,
     image_rotary_emb=None,
     transformer_options={},
+    **kwargs,
 ):
     batch_size = hidden_states.shape[0]
 
