@@ -159,6 +159,7 @@ def _worker_cli_args_env_json() -> str:
         # Ray workers hit cudaHostRegister failures on large LTXV loads often enough
         # that we disable pinned memory there by default.
         "disable_pinned_memory": True,
+        "fast_disk": bool(comfy_args.fast_disk),
         "disable_mmap": bool(comfy_args.disable_mmap),
         "mmap_torch_files": bool(comfy_args.mmap_torch_files),
         "disable_smart_memory": bool(comfy_args.disable_smart_memory),
