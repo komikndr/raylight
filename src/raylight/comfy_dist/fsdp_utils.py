@@ -720,6 +720,7 @@ def load_from_full_model_state_dict(
             sharded_sd[param_name] = torch.nn.Parameter(
                 sharded_tensor, requires_grad=sharded_meta_param.requires_grad)
             if release_sd:
+                own_params.discard(param_name)
                 _release_quant_keys(full_sd, param_name, keep=own_params)
             continue
         full_tensor = full_sd.get(param_name)
@@ -744,6 +745,7 @@ def load_from_full_model_state_dict(
         sharded_sd[param_name] = sharded_tensor if is_buffer else torch.nn.Parameter(
             sharded_tensor, requires_grad=sharded_meta_param.requires_grad)
         if release_sd:
+            own_params.discard(param_name)
             full_sd[param_name] = None
     out = model.load_state_dict(sharded_sd, strict=strict, assign=True)
     for param_name, meta_param, full_tensor in unsharded_params:
