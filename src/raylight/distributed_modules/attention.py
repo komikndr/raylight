@@ -1,3 +1,5 @@
+import functools
+
 from xfuser.core.long_ctx_attention import (
     xFuserLongContextAttention,
 )
@@ -34,8 +36,41 @@ def get_sync_ulysses():
         return _SYNC_ULYSSES
 
 
+def _patch_ring_lse_padding():
+    """Trim the log-sum-exp the torch attention backends return.
+
+    `_scaled_dot_product_efficient_attention` pads its log-sum-exp out to a 32
+    element boundary, and yunchang hands it back unsliced, so ring attention
+    combines an S row output with a ceil32(S) row lse and raises
+
+        The size of tensor a (14880) must match the size of tensor b (14857)
+
+    for any sequence that is not a multiple of 32. Ulysses never reaches this
+    path, which is why it only appears once ring_degree > 1.
+    """
+    try:
+        from yunchang import kernels
+    except ImportError:
+        return
+    if getattr(kernels, "_raylight_lse_trimmed", False):
+        return
+    original = kernels.pytorch_attn_forward
+
+    @functools.wraps(original)
+    def trimmed(*args, **kwargs):
+        out, lse = original(*args, **kwargs)[:2]
+        seq = out.shape[1]
+        if lse.shape[-1] > seq:
+            lse = lse[..., :seq]
+        return out, lse
+
+    kernels.pytorch_attn_forward = trimmed
+    kernels._raylight_lse_trimmed = True
+
+
 def make_xfuser_attention(attn_type, sync_ulysses):
     print(f"Using XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}")
+    _patch_ring_lse_padding()
     attn = AttnType[attn_type]
     if attn_type == "SAGE_FP8_CUDA":
         ensure_hf_fp8_cuda_kernel()
