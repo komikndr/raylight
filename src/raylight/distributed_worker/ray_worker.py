@@ -4,6 +4,7 @@ import gc
 import json
 import logging
 import functools
+import time
 from datetime import timedelta
 
 import torch
@@ -1520,23 +1521,45 @@ def ensure_fresh_actors(ray_actors_init):
     ray_actors, ray_actor_fn = ray_actors_init
     gpu_actors = ray_actors["workers"]
 
+    # Only respawn when the actors are gone. A live actor that already holds a
+    # model is the reuse case, handled by check_model_loaded in the loader.
     needs_restart = False
     try:
-        is_loaded = ray.get(gpu_actors[0].get_is_model_loaded.remote())
-        if is_loaded:
-            needs_restart = True
+        ray.get(gpu_actors[0].get_is_model_loaded.remote())
     except RayActorError:
         # Actor already dead or crashed
         needs_restart = True
 
-    needs_restart = False
     if needs_restart:
         for actor in gpu_actors:
             try:
                 ray.get(actor.kill.remote())
             except Exception:
                 pass  # ignore already dead
-        ray_actors = ray_actor_fn()
+            try:
+                # A graceful kill raises on an actor that is already gone and
+                # leaves its registered name held, which blocks the respawn.
+                ray.kill(actor, no_restart=True)
+            except Exception:
+                pass
+
+        # Ray releases actor names asynchronously, so recreating RayWorker:N
+        # can still hit ActorAlreadyExistsError for a short window.
+        last_exc = None
+        for _ in range(40):
+            try:
+                ray_actors = ray_actor_fn()
+                break
+            except Exception as exc:
+                if "already taken" not in str(exc):
+                    raise
+                last_exc = exc
+                time.sleep(0.5)
+        else:
+            raise RuntimeError(
+                "Ray worker names were never released, cannot respawn workers. "
+                "Kill the cluster or restart ComfyUI."
+            ) from last_exc
         gpu_actors = ray_actors["workers"]
 
     parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
