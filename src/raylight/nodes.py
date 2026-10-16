@@ -132,6 +132,35 @@ def _sanitized_worker_alloc_conf():
     return ",".join(kept)
 
 
+def _add_nvrtc_library_path(env_vars: dict[str, str]):
+    """Put torch's bundled nvrtc on the worker's loader path.
+
+    A worker does not inherit the loader path the server process has, so a
+    TorchScript function whose fuser compiles through nvrtc fails there with
+
+        nvrtc: error: failed to open libnvrtc-builtins.so.<ver>
+
+    even though the library ships with torch. Ring attention hits this, since
+    yunchang's update_out_and_lse is scripted.
+    """
+    try:
+        import nvidia
+    except ImportError:
+        return
+    roots = [Path(p) for p in getattr(nvidia, "__path__", [])]
+    dirs = []
+    for root in roots:
+        for lib in sorted(root.glob("*/lib")):
+            if any(lib.glob("libnvrtc-builtins.so*")):
+                dirs.append(str(lib))
+    if not dirs:
+        return
+    existing = os.environ.get("LD_LIBRARY_PATH")
+    if existing:
+        dirs.extend(part for part in existing.split(os.pathsep) if part)
+    env_vars["LD_LIBRARY_PATH"] = os.pathsep.join(dict.fromkeys(dirs))
+
+
 def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir: Path):
     python_path_entries = [str(repo_root)]
     existing = os.environ.get("PYTHONPATH")
@@ -143,6 +172,7 @@ def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir:
         "PYTHONPATH": python_path,
         "COMFYUI_BASE_DIRECTORY": str(repo_root),
     }
+    _add_nvrtc_library_path(env_vars)
     alloc_conf = _sanitized_worker_alloc_conf()
     if alloc_conf is not None:
         env_vars["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf
