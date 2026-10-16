@@ -149,6 +149,9 @@ Its job is to split the model weights among GPUs.
   export RAYLIGHT_KEEP_CUDA_MALLOC_ASYNC=1
   ```
   Other allocator options, such as `expandable_segments:True`, are preserved.
+- Quantized FSDP models load one worker at a time by default to limit peak host RAM.
+  Set `RAYLIGHT_PARALLEL_QUANT_LOAD=1` before starting ComfyUI to load workers
+  concurrently. This can reduce loading time but increase peak host RAM usage.
 - Example WF just open from your comfyui menu and browse templates
 - **GPU Topology** is very important, not all PCIe in your motherboard is equal.
 - VRAM leakage, when using [Ring > 1 instead of Ulysses](https://github.com/feifeibear/long-context-attention/issues/112).

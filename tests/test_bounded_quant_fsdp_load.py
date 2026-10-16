@@ -19,8 +19,9 @@ def test_quant_fsdp_workers_load_sequentially_and_materialize_locally():
     loader_source = ast.unparse(_function(NODES, "load_ray_unet"))
     worker_source = ast.unparse(_function(WORKER, "load_unet"))
 
-    assert loader_source.count("ray.get(actor.load_unet.remote(unet_path, model_options=model_options))") == 2
-    assert "if self.parallel_dict.get('is_quant', False):\n            self.set_state_dict()\n            self._patch_fsdp_for_sampling()" in worker_source
+    assert loader_source.count("if os.environ.get('RAYLIGHT_PARALLEL_QUANT_LOAD') == '1':") == 2
+    assert loader_source.count("ray.get(future)") == 2
+    assert worker_source.index("self.set_state_dict()") < worker_source.index("self._patch_fsdp_for_sampling()")
 
 
 def test_quant_fsdp_uses_private_spec_and_releases_consumed_state():

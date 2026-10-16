@@ -960,10 +960,12 @@ class RayUNETLoader:
                         loaded_futures.append(actor.set_state_dict.remote())
 
                 else:
-                    # Collect the futures and wait once: ray.get() inside the loop
-                    # makes each rank wait for the previous one to finish loading.
                     for actor in gpu_actors:
-                        loaded_futures.append(actor.load_unet.remote(unet_path, model_options=model_options))
+                        future = actor.load_unet.remote(unet_path, model_options=model_options)
+                        if os.environ.get("RAYLIGHT_PARALLEL_QUANT_LOAD") == "1":
+                            loaded_futures.append(future)
+                        else:
+                            ray.get(future)
 
             else:
                 # Multiple replicas — load model per group
@@ -988,7 +990,11 @@ class RayUNETLoader:
 
                     else:
                         for actor in group_actors:
-                            loaded_futures.append(actor.load_unet.remote(unet_path, model_options=model_options))
+                            future = actor.load_unet.remote(unet_path, model_options=model_options)
+                            if os.environ.get("RAYLIGHT_PARALLEL_QUANT_LOAD") == "1":
+                                loaded_futures.append(future)
+                            else:
+                                ray.get(future)
 
             ray.get(loaded_futures)
             loaded_futures = []
