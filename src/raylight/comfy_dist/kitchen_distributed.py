@@ -65,14 +65,24 @@ _SITEPKG_PATCH_DEPTH = {}
 
 
 def install_sitepkg_ck_patches(layouts=("fp8", "nvfp4", "int8", "mxfp8")):
-    for layout in _normalize_layouts(layouts):
-        patcher = _SITEPKG_LAYOUT_PATCHERS.get(layout)
-        if patcher is None:
-            continue
-        depth = _SITEPKG_PATCH_DEPTH.get(layout, 0)
-        _SITEPKG_PATCH_DEPTH[layout] = depth + 1
-        if depth == 0:
-            patcher[0]()
+    installed = []
+    try:
+        for layout in _normalize_layouts(layouts):
+            patcher = _SITEPKG_LAYOUT_PATCHERS.get(layout)
+            if patcher is None:
+                continue
+            depth = _SITEPKG_PATCH_DEPTH.get(layout, 0)
+            if depth == 0:
+                try:
+                    patcher[0]()
+                except Exception:
+                    patcher[1]()
+                    raise
+            _SITEPKG_PATCH_DEPTH[layout] = depth + 1
+            installed.append(layout)
+    except Exception:
+        restore_sitepkg_ck_patches(installed)
+        raise
 
 
 def restore_sitepkg_ck_patches(layouts=("fp8", "nvfp4", "int8", "mxfp8")):
@@ -83,9 +93,9 @@ def restore_sitepkg_ck_patches(layouts=("fp8", "nvfp4", "int8", "mxfp8")):
         depth = _SITEPKG_PATCH_DEPTH.get(layout, 0)
         if depth == 0:
             continue
-        _SITEPKG_PATCH_DEPTH[layout] = depth - 1
         if depth == 1:
             patcher[1]()
+        _SITEPKG_PATCH_DEPTH[layout] = depth - 1
 
 
 @contextmanager
