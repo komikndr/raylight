@@ -56,17 +56,35 @@ def _normalize_layouts(layouts):
     return ("fp8", "nvfp4", "int8", "mxfp8")
 
 
+#A patched scope can call into another one - loading a model from inside a
+#sampler or an encode does exactly that - and the inner install is a no-op
+#because the layout is already patched. Its restore is not, so without a count
+#of the open scopes the inner exit strips the patches the outer one is still
+#using. Touch the layout classes only at the outermost edges.
+_SITEPKG_PATCH_DEPTH = {}
+
+
 def install_sitepkg_ck_patches(layouts=("fp8", "nvfp4", "int8", "mxfp8")):
     for layout in _normalize_layouts(layouts):
         patcher = _SITEPKG_LAYOUT_PATCHERS.get(layout)
-        if patcher is not None:
+        if patcher is None:
+            continue
+        depth = _SITEPKG_PATCH_DEPTH.get(layout, 0)
+        _SITEPKG_PATCH_DEPTH[layout] = depth + 1
+        if depth == 0:
             patcher[0]()
 
 
 def restore_sitepkg_ck_patches(layouts=("fp8", "nvfp4", "int8", "mxfp8")):
     for layout in reversed(_normalize_layouts(layouts)):
         patcher = _SITEPKG_LAYOUT_PATCHERS.get(layout)
-        if patcher is not None:
+        if patcher is None:
+            continue
+        depth = _SITEPKG_PATCH_DEPTH.get(layout, 0)
+        if depth == 0:
+            continue
+        _SITEPKG_PATCH_DEPTH[layout] = depth - 1
+        if depth == 1:
             patcher[1]()
 
 
