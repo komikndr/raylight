@@ -49,6 +49,22 @@ def _clear_ray_worker_vram_after_sampling(ray_actors):
     comfy.model_management.soft_empty_cache()
 
 
+def _free_host_vram_before_worker_load():
+    """Release host-held models before workers claim their share of the cards.
+
+    The text encoder and VAE live in the ComfyUI process; the UNet shards live
+    in the workers. Nothing frees the former until a sampler node runs, which
+    is after the loader has already tried to place the shards. That is only
+    survivable while the host's models are small or merely staged -- with a
+    14 GiB encoder actually resident, or with every card carrying a shard so
+    none is spare, the worker load hits a card the host has not let go of yet.
+    By then the conditioning has been computed, so the encoder is dead weight.
+    """
+    gc.collect()
+    comfy.model_management.unload_all_models()
+    comfy.model_management.soft_empty_cache()
+
+
 def _raylight_ray_tmpdir() -> Path:
     return Path(os.environ.get("RAYLIGHT_RAY_TMPDIR", Path(tempfile.gettempdir()) / "raylight-ray")).resolve()
 
@@ -847,6 +863,7 @@ class RayPipeFusionConfig:
         pipefusion_stage_splits: str = "",
         pipefusion_debug: bool = False,
     ):
+        _free_host_vram_before_worker_load()
         ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
 
         updated_parallel_dict = dict(parallel_dict)
@@ -895,6 +912,7 @@ class RayUNETLoader:
     CATEGORY = "Raylight"
 
     def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, lora=None):
+        _free_host_vram_before_worker_load()
         ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
 
         model_options = {}
