@@ -1474,20 +1474,14 @@ def make_ray_actor_fn(world_size, parallel_dict):
     use_group_process_group = bool(parallel_dict.get("use_group_process_group"))
 
     def _init_ray_actor(world_size=world_size, parallel_dict=parallel_dict):
-        ray_actors = dict()
         gpu_actor = ray.remote(RayWorker)
         gpu_actors = []
+        worker_specs = []
 
         if num_replicas <= 1 or not use_group_process_group:
             # XDiT DP stays in one global group; xFuser derives DP ranks internally.
             for local_rank in range(world_size):
-                gpu_actors.append(
-                    gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
-                        local_rank=local_rank,
-                        device_id=0,
-                        parallel_dict=parallel_dict,
-                    )
-                )
+                worker_specs.append((local_rank, f"RayWorker:{local_rank}", parallel_dict))
         else:
             # FSDP multi-replica DP uses one NCCL group per replica.
             for group_id in range(num_replicas):
@@ -1496,61 +1490,45 @@ def make_ray_actor_fn(world_size, parallel_dict):
                 group_parallel_dict["use_group_process_group"] = True
 
                 for local_rank in range(shard_size):
-                    gpu_actors.append(
-                        gpu_actor.options(
-                            num_gpus=1,
-                            name=f"RayWorker:{group_id}_{local_rank}"
-                        ).remote(
-                            local_rank=local_rank,
-                            device_id=0,
-                            parallel_dict=group_parallel_dict,
-                        )
-                    )
+                    worker_specs.append((local_rank, f"RayWorker:{group_id}_{local_rank}", group_parallel_dict))
 
-        ray_actors["workers"] = gpu_actors
-
-        for actor in ray_actors["workers"]:
-            ray.get(actor.__ray_ready__.remote())
-        return ray_actors
+        try:
+            for local_rank, name, worker_parallel_dict in worker_specs:
+                gpu_actors.append(gpu_actor.options(num_gpus=1, name=name).remote(
+                    local_rank=local_rank, device_id=0, parallel_dict=worker_parallel_dict))
+            ray.get([actor.__ray_ready__.remote() for actor in gpu_actors], timeout=120)
+        except Exception:
+            for actor in gpu_actors:
+                ray.kill(actor, no_restart=True)
+            raise
+        return {"workers": gpu_actors}
 
     return _init_ray_actor
 
 
-# (TODO-Komikndr) Should be removed since FSDP can be unloaded properly
 def ensure_fresh_actors(ray_actors_init):
     ray_actors, ray_actor_fn = ray_actors_init
     gpu_actors = ray_actors["workers"]
 
-    # Only respawn when the actors are gone. A live actor that already holds a
-    # model is the reuse case, handled by check_model_loaded in the loader.
     needs_restart = False
     try:
-        ray.get(gpu_actors[0].get_is_model_loaded.remote())
-    except RayActorError:
-        # Actor already dead or crashed
+        ray.get([actor.get_is_model_loaded.remote() for actor in gpu_actors], timeout=30)
+    except (RayActorError, ray.exceptions.GetTimeoutError):
         needs_restart = True
 
     if needs_restart:
         for actor in gpu_actors:
-            try:
-                ray.get(actor.kill.remote())
-            except Exception:
-                pass  # ignore already dead
-            try:
-                # A graceful kill raises on an actor that is already gone and
-                # leaves its registered name held, which blocks the respawn.
-                ray.kill(actor, no_restart=True)
-            except Exception:
-                pass
+            # A failed NCCL group cannot be reused; graceful teardown can hang.
+            ray.kill(actor, no_restart=True)
 
         # Ray releases actor names asynchronously, so recreating RayWorker:N
         # can still hit ActorAlreadyExistsError for a short window.
         last_exc = None
         for _ in range(40):
             try:
-                ray_actors = ray_actor_fn()
+                replacement = ray_actor_fn()
                 break
-            except Exception as exc:
+            except ValueError as exc:
                 if "already taken" not in str(exc):
                     raise
                 last_exc = exc
@@ -1560,6 +1538,8 @@ def ensure_fresh_actors(ray_actors_init):
                 "Ray worker names were never released, cannot respawn workers. "
                 "Kill the cluster or restart ComfyUI."
             ) from last_exc
+        ray_actors.clear()
+        ray_actors.update(replacement)
         gpu_actors = ray_actors["workers"]
 
     parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
