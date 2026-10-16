@@ -578,7 +578,11 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
                     "loaded completely {} {} {}".format(lowvram_model_memory / (1024 * 1024), mem_counter / (1024 * 1024), full_load)
                 )
                 self.model.model_lowvram = False
-                if full_load:
+                #A CPU-offloaded FSDP model keeps its shards on the host and
+                #gathers them per layer, so a full load must not move it: that
+                #would pull every shard onto the card - and only on the ranks
+                #whose free memory happened to clear the full-load threshold.
+                if full_load and not self.is_cpu_offload:
                     self.model.to(device_to)
                     mem_counter = self.model_size()
 
