@@ -12,6 +12,7 @@ from pathlib import Path
 from copy import deepcopy
 
 import ray
+import psutil
 import torch
 import comfy
 import folder_paths
@@ -188,50 +189,38 @@ def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir:
     }
 
 
-# Workers this process spawned, as (host, pid), so the next shutdown can wait for exactly them.
-_spawned_workers = []
+# The shared bundle is updated in place when failed workers are replaced.
+_spawned_workers = {}
 
 
-def _record_spawned_workers(gpu_actors):
-    """Remember where the workers just spawned are running."""
+def _record_spawned_workers(ray_actors):
     global _spawned_workers
-    try:
-        _spawned_workers = ray.get(
-            [actor.__ray_call__.remote(lambda self: (socket.gethostname(), os.getpid())) for actor in gpu_actors],
-            timeout=30,
-        )
-    except Exception:
-        _spawned_workers = []
+    _spawned_workers = ray_actors
 
 
 def _wait_for_ray_workers_to_exit(timeout=90.0):
-    """Wait for the workers this process spawned to actually go away.
-
-    ray.shutdown() returns before the worker processes have finished tearing down
-    their CUDA contexts. Spawning the next set while the old ones still hold a
-    device leaves two processes creating and destroying contexts on the same GPU at
-    once. Only the workers recorded at spawn on this machine are waited for: other
-    Ray processes here are none of ours, and a worker on another node has its own
-    devices.
-    """
+    """Wait for owned local worker processes, including replacements, to exit."""
     global _spawned_workers
-    import psutil
-
     host = socket.gethostname()
-    pids = [pid for worker_host, pid in _spawned_workers if worker_host == host]
-    _spawned_workers = []
-    deadline = time.time() + timeout
-    remaining = [pid for pid in pids if psutil.pid_exists(pid)]
-    if not remaining:
-        return True
-    logging.info("[Raylight] waiting for %d ray worker(s) to exit", len(remaining))
-    while time.time() < deadline:
-        remaining = [pid for pid in remaining if psutil.pid_exists(pid)]
+    processes = [(pid, created) for worker_host, pid, created in _spawned_workers.get("worker_processes", []) if worker_host == host]
+    _spawned_workers = {}
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = []
+        for pid, created in processes:
+            try:
+                process = psutil.Process(pid)
+                if process.create_time() == created and process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+                    remaining.append((pid, created))
+            except psutil.NoSuchProcess:
+                pass
         if not remaining:
             return True
-        time.sleep(0.5)
-    logging.warning("[Raylight] ray workers %s still present after %.0fs, continuing", remaining, timeout)
-    return False
+        if time.monotonic() >= deadline:
+            logging.warning("[Raylight] workers %s still present after %.0fs", [pid for pid, _ in remaining], timeout)
+            return False
+        processes = remaining
+        time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
 
 def _worker_cli_args_env_json() -> str:
@@ -730,7 +719,7 @@ class RayInitializer:
             print("Skipping NCCL test (skip_comm_test=True)")
         ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
         ray_actors = ray_actor_fn()
-        _record_spawned_workers(ray_actors["workers"])
+        _record_spawned_workers(ray_actors)
         return ([ray_actors, ray_actor_fn],)
 
 

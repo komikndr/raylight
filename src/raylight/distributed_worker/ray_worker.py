@@ -4,9 +4,11 @@ import gc
 import json
 import logging
 import functools
+import socket
 import time
 from datetime import timedelta
 
+import psutil
 import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FSDPModule
@@ -1497,11 +1499,15 @@ def make_ray_actor_fn(world_size, parallel_dict):
                 gpu_actors.append(gpu_actor.options(num_gpus=1, name=name).remote(
                     local_rank=local_rank, device_id=0, parallel_dict=worker_parallel_dict))
             ray.get([actor.__ray_ready__.remote() for actor in gpu_actors], timeout=120)
+            worker_processes = ray.get([
+                actor.__ray_call__.remote(lambda self: (socket.gethostname(), os.getpid(), psutil.Process().create_time()))
+                for actor in gpu_actors
+            ], timeout=30)
         except Exception:
             for actor in gpu_actors:
                 ray.kill(actor, no_restart=True)
             raise
-        return {"workers": gpu_actors}
+        return {"workers": gpu_actors, "worker_processes": worker_processes}
 
     return _init_ray_actor
 
