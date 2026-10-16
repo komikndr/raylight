@@ -2,8 +2,11 @@ import raylight
 import os
 import gc
 import json
+import logging
 import shutil
+import socket
 import tempfile
+import time
 from typing import Any
 from pathlib import Path
 from copy import deepcopy
@@ -183,6 +186,52 @@ def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir:
         "working_dir": str(runtime_workdir),
         "env_vars": env_vars,
     }
+
+
+# Workers this process spawned, as (host, pid), so the next shutdown can wait for exactly them.
+_spawned_workers = []
+
+
+def _record_spawned_workers(gpu_actors):
+    """Remember where the workers just spawned are running."""
+    global _spawned_workers
+    try:
+        _spawned_workers = ray.get(
+            [actor.__ray_call__.remote(lambda self: (socket.gethostname(), os.getpid())) for actor in gpu_actors],
+            timeout=30,
+        )
+    except Exception:
+        _spawned_workers = []
+
+
+def _wait_for_ray_workers_to_exit(timeout=90.0):
+    """Wait for the workers this process spawned to actually go away.
+
+    ray.shutdown() returns before the worker processes have finished tearing down
+    their CUDA contexts. Spawning the next set while the old ones still hold a
+    device leaves two processes creating and destroying contexts on the same GPU at
+    once. Only the workers recorded at spawn on this machine are waited for: other
+    Ray processes here are none of ours, and a worker on another node has its own
+    devices.
+    """
+    global _spawned_workers
+    import psutil
+
+    host = socket.gethostname()
+    pids = [pid for worker_host, pid in _spawned_workers if worker_host == host]
+    _spawned_workers = []
+    deadline = time.time() + timeout
+    remaining = [pid for pid in pids if psutil.pid_exists(pid)]
+    if not remaining:
+        return True
+    logging.info("[Raylight] waiting for %d ray worker(s) to exit", len(remaining))
+    while time.time() < deadline:
+        remaining = [pid for pid in remaining if psutil.pid_exists(pid)]
+        if not remaining:
+            return True
+        time.sleep(0.5)
+    logging.warning("[Raylight] ray workers %s still present after %.0fs, continuing", remaining, timeout)
+    return False
 
 
 def _worker_cli_args_env_json() -> str:
@@ -636,6 +685,7 @@ class RayInitializer:
         try:
             # Shut down so if comfy user try another workflow it will not cause error
             ray.shutdown()
+            _wait_for_ray_workers_to_exit()
             _cleanup_ray_temp()
             RayControlNetLoader._current_controlnet_path = None
             original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -680,6 +730,7 @@ class RayInitializer:
             print("Skipping NCCL test (skip_comm_test=True)")
         ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
         ray_actors = ray_actor_fn()
+        _record_spawned_workers(ray_actors["workers"])
         return ([ray_actors, ray_actor_fn],)
 
 
