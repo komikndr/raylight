@@ -89,24 +89,15 @@ def _clear_ray_worker_vram_after_sampling(ray_actors):
 
 
 def _free_host_models_if_contended(ray_actors):
-    """Drop the host's models only when a worker could want the host's GPU.
-
-    Sampling used to begin by unloading everything the ComfyUI process held,
-    to make room for the shards. When GPU_SELECT pins workers to other cards
-    that frees memory nobody is waiting for, and costs a full text encoder
-    reload on the next render -- which on a short clip is longer than the
-    render itself. Keep the models when the workers cannot reach this card.
-    """
+    """Keep host models when GPU_SELECT excludes the host's CUDA device."""
+    selected = ray.get(ray_actors["workers"][0].get_parallel_dict.remote()).get("selected_gpus")
+    host_device = comfy.model_management.get_torch_device()
+    if selected is not None and host_device.type == "cuda" and host_device.index is not None and host_device.index not in selected:
+        return
     gc.collect()
-    try:
-        selected = ray.get(ray_actors["workers"][0].get_parallel_dict.remote()).get("selected_gpus")
-        host_index = comfy.model_management.get_torch_device().index
-        if selected is not None and host_index is not None and host_index not in selected:
-            return
-    except Exception:
-        pass
     comfy.model_management.unload_all_models()
     comfy.model_management.soft_empty_cache()
+
 
 def _normalized_degree(value):
     if value is None:

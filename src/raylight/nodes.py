@@ -25,6 +25,7 @@ from .distributed_worker.ray_worker import (
     ray_nccl_tester,
 )
 from .distributed_worker.ray_worker_vae import combine_dist_vae_partials, combine_seedvr2_vae_partials
+from .comfy_extra_dist.nodes_custom_sampler import _free_host_models_if_contended
 
 
 class AnyType(str):
@@ -44,22 +45,6 @@ def _clear_ray_worker_vram_after_sampling(ray_actors):
         return
 
     ray.get([actor.clear_sampling_vram.remote() for actor in gpu_actors])
-    gc.collect()
-    comfy.model_management.unload_all_models()
-    comfy.model_management.soft_empty_cache()
-
-
-def _free_host_vram_before_worker_load():
-    """Release host-held models before workers claim their share of the cards.
-
-    The text encoder and VAE live in the ComfyUI process; the UNet shards live
-    in the workers. Nothing frees the former until a sampler node runs, which
-    is after the loader has already tried to place the shards. That is only
-    survivable while the host's models are small or merely staged -- with a
-    14 GiB encoder actually resident, or with every card carrying a shard so
-    none is spare, the worker load hits a card the host has not let go of yet.
-    By then the conditioning has been computed, so the encoder is dead weight.
-    """
     gc.collect()
     comfy.model_management.unload_all_models()
     comfy.model_management.soft_empty_cache()
@@ -865,8 +850,8 @@ class RayPipeFusionConfig:
         pipefusion_stage_splits: str = "",
         pipefusion_debug: bool = False,
     ):
-        _free_host_vram_before_worker_load()
         ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
+        _free_host_models_if_contended(ray_actors)
 
         updated_parallel_dict = dict(parallel_dict)
         _apply_pipefusion_runtime_config(
@@ -914,8 +899,8 @@ class RayUNETLoader:
     CATEGORY = "Raylight"
 
     def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, lora=None):
-        _free_host_vram_before_worker_load()
         ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
+        _free_host_models_if_contended(ray_actors)
 
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
