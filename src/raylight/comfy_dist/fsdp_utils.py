@@ -648,7 +648,11 @@ def _build_quantized_tensor(
     return QuantizedTensor(qdata, layout_name, params)
 
 
-def _release_quant_keys(full_sd: dict[str, Any], param_name: str) -> None:
+def _release_quant_keys(full_sd: dict[str, Any], param_name: str, keep: set[str] | None = None) -> None:
+    #A payload key can also be a parameter in its own right - a quantized
+    #embedding carries weight_scale that way - and it has not necessarily been
+    #loaded yet when the weight it belongs to frees the group. Releasing it
+    #leaves it on meta with its source gone.
     prefix = param_name[: -len("weight")]
     for key in (
         param_name,
@@ -661,7 +665,7 @@ def _release_quant_keys(full_sd: dict[str, Any], param_name: str) -> None:
         f"{prefix}quantized_block_scale",
         f"{prefix}quantized_block_min",
     ):
-        if key in full_sd:
+        if key in full_sd and (keep is None or key not in keep):
             full_sd[key] = None
 
 
@@ -677,6 +681,7 @@ def load_from_full_model_state_dict(
     release_sd=True,
 ):
     meta_sharded_sd = model.state_dict()
+    own_params = set(meta_sharded_sd)
     sharded_sd: dict[str, torch.Tensor] = {}
     unsharded_params = []
     for param_name, sharded_meta_param in meta_sharded_sd.items():
@@ -708,9 +713,14 @@ def load_from_full_model_state_dict(
                 sharded_tensor = quant_tensor
             if cpu_offload:
                 sharded_tensor = sharded_tensor.cpu()
-            sharded_sd[param_name] = torch.nn.Parameter(sharded_tensor)
+            #Parameter defaults requires_grad to True, which undoes the freeze
+            #the wrapper applied and, for a quantized tensor that reports an
+            #integer dtype, raises outright. The meta parameter already carries
+            #the right answer, as it does for the DTensor above.
+            sharded_sd[param_name] = torch.nn.Parameter(
+                sharded_tensor, requires_grad=sharded_meta_param.requires_grad)
             if release_sd:
-                _release_quant_keys(full_sd, param_name)
+                _release_quant_keys(full_sd, param_name, keep=own_params)
             continue
         full_tensor = full_sd.get(param_name)
         if full_tensor is None:
@@ -731,7 +741,8 @@ def load_from_full_model_state_dict(
             )
         if cpu_offload:
             sharded_tensor = sharded_tensor.cpu()
-        sharded_sd[param_name] = sharded_tensor if is_buffer else torch.nn.Parameter(sharded_tensor)
+        sharded_sd[param_name] = sharded_tensor if is_buffer else torch.nn.Parameter(
+            sharded_tensor, requires_grad=sharded_meta_param.requires_grad)
         if release_sd:
             full_sd[param_name] = None
     out = model.load_state_dict(sharded_sd, strict=strict, assign=True)
