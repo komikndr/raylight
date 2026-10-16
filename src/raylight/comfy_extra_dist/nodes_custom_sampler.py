@@ -88,6 +88,26 @@ def _clear_ray_worker_vram_after_sampling(ray_actors):
     comfy.model_management.soft_empty_cache()
 
 
+def _free_host_models_if_contended(ray_actors):
+    """Drop the host's models only when a worker could want the host's GPU.
+
+    Sampling used to begin by unloading everything the ComfyUI process held,
+    to make room for the shards. When GPU_SELECT pins workers to other cards
+    that frees memory nobody is waiting for, and costs a full text encoder
+    reload on the next render -- which on a short clip is longer than the
+    render itself. Keep the models when the workers cannot reach this card.
+    """
+    gc.collect()
+    try:
+        selected = ray.get(ray_actors["workers"][0].get_parallel_dict.remote()).get("selected_gpus")
+        host_index = comfy.model_management.get_torch_device().index
+        if selected is not None and host_index is not None and host_index not in selected:
+            return
+    except Exception:
+        pass
+    comfy.model_management.unload_all_models()
+    comfy.model_management.soft_empty_cache()
+
 def _normalized_degree(value):
     if value is None:
         return 1
@@ -440,10 +460,8 @@ class XFuserSamplerCustomAdvanced:
     CATEGORY = "Raylight/extra/custom_sampling/samplers"
 
     def ray_sample(self, add_noise, noise_seed, guider, sampler, sigmas, latent_image):
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
         ray_actors = _extract_ray_actors_from_guider(guider)
+        _free_host_models_if_contended(ray_actors)
         gpu_actors = ray_actors["workers"]
         futures = [
             actor.custom_sampler_advanced.remote(
@@ -515,9 +533,7 @@ class XFuserSamplerCustom:
         sigmas,
         latent_image,
     ):
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
+        _free_host_models_if_contended(ray_actors)
         gpu_actors = ray_actors["workers"]
         futures = [
             actor.custom_sampler.remote(
@@ -564,11 +580,8 @@ class UnifiedParallelSamplerCustomAdvanced:
         sampler = sampler[0]
         sigmas = sigmas[0]
 
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
-
         initial_ray_actors = _extract_ray_actors_from_guider(guider[0])
+        _free_host_models_if_contended(initial_ray_actors)
         gpu_actors = initial_ray_actors["workers"]
         parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
         group_infos = ray.get([actor.get_exec_group_info.remote() for actor in gpu_actors])
@@ -651,9 +664,7 @@ class UnifiedParallelSamplerCustom:
         sampler = sampler[0]
         sigmas = sigmas[0]
 
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
+        _free_host_models_if_contended(ray_actors)
         gpu_actors = ray_actors["workers"]
         parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
         group_infos = ray.get([actor.get_exec_group_info.remote() for actor in gpu_actors])
@@ -710,11 +721,8 @@ class DPSamplerCustomAdvanced:
         sampler = sampler[0]
         sigmas = sigmas[0]
 
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
-
         initial_ray_actors = _extract_ray_actors_from_guider(guider[0])
+        _free_host_models_if_contended(initial_ray_actors)
         gpu_actors = initial_ray_actors["workers"]
         num_gpus = len(gpu_actors)
 
@@ -790,9 +798,7 @@ class DPSamplerCustom:
         sampler = sampler[0]
         sigmas = sigmas[0]
 
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
+        _free_host_models_if_contended(ray_actors)
         gpu_actors = ray_actors["workers"]
         num_gpus = len(gpu_actors)
         # Replicate last item to fill remaining slots, or truncate if too many

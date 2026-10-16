@@ -589,6 +589,8 @@ class RayInitializer:
         self.parallel_dict["pp_degree"] = 1
         self.parallel_dict["dp_degree"] = dp_degree if dp_degree >= 1 else 1
         self.parallel_dict["clear_vram_after_sampling"] = clear_vram_after_sampling
+        # Lets the sampler tell whether workers can reach the host's card.
+        self.parallel_dict["selected_gpus"] = list(selected_gpus) if selected_gpus else None
         _reset_pipefusion_runtime_config(self.parallel_dict)
 
         if ulysses_degree > 0 or ring_degree > 0 or cfg_degree > 0:
