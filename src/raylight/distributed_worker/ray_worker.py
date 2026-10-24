@@ -1697,7 +1697,7 @@ def make_ray_actor_fn(world_size, parallel_dict):
             for actor in gpu_actors:
                 ray.kill(actor, no_restart=True)
             raise
-        _note_workers_spawned()
+        _note_workers_spawned(name for _, name, _ in worker_specs)
         return {"workers": gpu_actors, "worker_processes": worker_processes}
 
     return _init_ray_actor
@@ -1720,22 +1720,20 @@ def actor_generation():
 
 _WORKER_EPOCH = 0
 _WORKERS_SEEN_ALIVE = False
+_WORKER_NAMES = ()
 
 
 def _workers_alive():
-    if not ray.is_initialized():
-        return False
-    names = [n for n in ray.util.list_named_actors() if str(n).startswith("RayWorker:")]
-    if not names:
+    if not ray.is_initialized() or not _WORKER_NAMES:
         return False
     try:
-        ray.get([ray.get_actor(n).get_is_model_loaded.remote() for n in names], timeout=10)
+        ray.get([ray.get_actor(n).get_is_model_loaded.remote() for n in _WORKER_NAMES], timeout=10)
     except Exception:
         return False
     return True
 
 
-def _note_workers_spawned():
+def _note_workers_spawned(names):
     """Count workers that just came up as seen alive.
 
     worker_epoch only bumps for workers it has seen alive, and it looks only when
@@ -1743,7 +1741,8 @@ def _note_workers_spawned():
     those checks - a render that dies on its first run - would otherwise never be
     noticed, and the next run would be handed their dead handles.
     """
-    global _WORKERS_SEEN_ALIVE
+    global _WORKERS_SEEN_ALIVE, _WORKER_NAMES
+    _WORKER_NAMES = tuple(names)
     _WORKERS_SEEN_ALIVE = True
 
 
