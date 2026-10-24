@@ -1,4 +1,7 @@
+import collections
+import time
 import gc
+import logging
 import ray
 
 import torch
@@ -8,6 +11,7 @@ import comfy.sample
 from comfy.k_diffusion import sa_solver
 from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
 import comfy.utils
+from raylight.distributed_worker.ray_worker import retire_actors
 from .ray_patch_decorator import ray_patch_with_return
 
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise
@@ -74,15 +78,51 @@ def _collect_grouped_results(results: list, expected_length: int, label: str):
     return [grouped_results[dp_rank] for dp_rank in range(expected_length)]
 
 
-def _clear_ray_worker_vram_after_sampling(ray_actors):
+def _retire_actors_after_fatal(ray_actors, exc):
+    """Kill workers whose state a failure has made unusable.
+
+    Freeing VRAM is not enough after an out of memory: aimdo is left unable to
+    allocate and the next sample raises "aimdo memory compile error" from a
+    worker that otherwise looks healthy. Killing them makes ensure_fresh_actors
+    respawn on the next run, which is the existing recovery path for a dead
+    actor.
+
+    Only for failures that indicate broken device state; an ordinary error does
+    not justify paying for a respawn.
+    """
+    blob = str(exc).lower()
+    if not any(k in blob for k in ("out of memory", "outofmemory", "aimdo", "cuda error",
+                                   "illegal memory access")):
+        return
+    retire_actors(ray_actors, "a fatal sampling error")
+
+
+def _clear_ray_worker_vram_after_sampling(ray_actors, force=False):
+    """Release worker VRAM once sampling is done.
+
+    `force` is for the failure path. A sampler that raises, most often on OOM,
+    leaves its allocations behind, and the next run inherits a card that is
+    already full. That is worth clearing whether or not the workflow asked for
+    routine cleanup.
+    """
     gpu_actors = ray_actors["workers"]
     if not gpu_actors:
         return
-    parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
-    if not parallel_dict.get("clear_vram_after_sampling", False):
-        return
+    if not force:
+        parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+        if not parallel_dict.get("clear_vram_after_sampling", False):
+            return
 
-    ray.get([actor.clear_sampling_vram.remote() for actor in gpu_actors])
+    refs = [actor.clear_sampling_vram.remote() for actor in gpu_actors]
+    if force:
+        #After a failure a worker may be dead, retired, or stuck on one that is:
+        #clear whoever answers, and leave the original error to be the one raised.
+        try:
+            ray.get(refs, timeout=CANCEL_DRAIN_DEFAULT_SECONDS)
+        except Exception as error:
+            logging.warning("[Raylight] could not clear every worker after a failure: %s", error)
+    else:
+        ray.get(refs)
     gc.collect()
     comfy.model_management.unload_all_models()
     comfy.model_management.soft_empty_cache()
@@ -423,13 +463,88 @@ class RayDualCFGGuider:
         )
 
 
-def _gather_with_progress(futures):
+#A cancel is noticed at a checkpoint, so the time it should take to arrive is
+#one checkpoint interval - a property of the machine, not a constant, since one
+#block on a slow card can outlast any figure picked here. Measure the widest gap
+#seen between checkpoints during the run, which is what a worker is expected to
+#need, and allow a few times that. A worker is then only ended once it has
+#plainly stopped, not because the hardware was having a slow minute.
+CANCEL_DRAIN_CHECKPOINTS = 3
+#How many recent checkpoints the estimate is taken from. Recent, so a pause
+#early in the run - the first checkpoint follows the model load - does not set
+#the figure for everything after it. Their widest rather than their average: the
+#average understates the tail, and the tail is exactly the checkpoint that would
+#see a healthy worker ended for being slow.
+CANCEL_DRAIN_SAMPLES = 8
+CANCEL_DRAIN_MIN_SECONDS = 15.0
+CANCEL_DRAIN_MAX_SECONDS = 180.0
+#Used where there is no checkpoint signal to measure, such as a decode.
+CANCEL_DRAIN_DEFAULT_SECONDS = 60.0
+#Once one worker has answered, the cancel demonstrably works and the ranks run
+#in lockstep, so a peer that is going to answer will do so about a checkpoint
+#later. Waiting the whole window on it only delays a kill that is already due.
+CANCEL_PEER_MIN_SECONDS = 5.0
+
+
+def _drain(futures, slowest_checkpoint):
+    """Return the futures that never answered the cancel.
+
+    The full wait is only spent while nothing at all has answered. The moment one
+    worker does, the rest are given a short window instead: they are doing the
+    same work at the same time, so one still silent has stopped rather than
+    fallen behind.
+    """
+    grace = _drain_seconds(slowest_checkpoint)
+    answered, pending = ray.wait(futures, num_returns=1, timeout=grace)
+    if not answered:
+        return pending
+    peer = min(max(slowest_checkpoint, CANCEL_PEER_MIN_SECONDS), grace)
+    _more, stuck = ray.wait(pending, num_returns=len(pending), timeout=peer) if pending else ([], [])
+    return stuck
+
+
+def _drain_seconds(slowest_checkpoint):
+    if not slowest_checkpoint:
+        return CANCEL_DRAIN_DEFAULT_SECONDS
+    return min(max(slowest_checkpoint * CANCEL_DRAIN_CHECKPOINTS,
+                   CANCEL_DRAIN_MIN_SECONDS), CANCEL_DRAIN_MAX_SECONDS)
+
+
+def _first_failure(ready):
+    """Return the error of the first finished future that failed, if any."""
+    for ref in ready:
+        try:
+            ray.get(ref, timeout=0)
+        except Exception as error:
+            return error
+    return None
+
+
+def _fail_with_peers(failure, pending, ray_actors, slowest_checkpoint):
+    """Fail the job once a worker has failed, ending any peer it stranded.
+
+    The ranks share every collective, so the rest cannot finish without the one
+    that failed. Those that failed too - an OOM usually reaches every rank - have
+    unwound and stay usable. One still running a checkpoint later is waiting in a
+    collective on a peer that is gone, would hold its device forever, and can only
+    be ended.
+    """
+    if pending:
+        window = min(max(slowest_checkpoint, CANCEL_PEER_MIN_SECONDS), _drain_seconds(slowest_checkpoint))
+        _done, stuck = ray.wait(pending, num_returns=len(pending), timeout=window)
+        if stuck and ray_actors is not None:
+            retire_actors(ray_actors, "a worker failed and %d were left waiting on it" % len(stuck))
+    raise failure
+
+
+def _gather_with_progress(futures, ray_actors=None):
     """Wait on the sampling futures while relaying worker progress to the UI.
 
     ray.get() would block until sampling finished, leaving the node at 0% for
     the whole render. Poll instead, and forward whatever rank 0 published to a
     host-side ProgressBar, which does have the server's hook attached.
     """
+    import comfy.model_management
     import comfy.utils
     from raylight import progress
 
@@ -438,18 +553,49 @@ def _gather_with_progress(futures):
     last = None
     last_preview_seq = -1
     preview = None
-    while pending:
-        _ready, pending = ray.wait(pending, num_returns=len(pending), timeout=0.5)
-        current = progress.read()
-        if current is not None and current != last:
-            last = current
-            value, total, preview_seq = current
-            if preview_seq != last_preview_seq:
-                last_preview_seq = preview_seq
-                image = progress.read_preview()
-                preview = ("JPEG", image, 512) if image is not None else None
-            pbar.update_absolute(min(value, total), total, preview)
-    return ray.get(futures)
+    checkpoints = collections.deque(maxlen=CANCEL_DRAIN_SAMPLES)
+    seen_at = None
+    try:
+        while pending:
+            _ready, pending = ray.wait(pending, num_returns=len(pending), timeout=0.5)
+            failure = _first_failure(_ready)
+            if failure is not None:
+                _fail_with_peers(failure, pending, ray_actors, max(checkpoints) if checkpoints else 0.0)
+            #Checked every pass rather than only when the bar moves: a render that
+            #has stopped publishing progress is exactly the one worth cancelling.
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            current = progress.read()
+            if current is not None and current != last:
+                now = time.monotonic()
+                #The gap before the first checkpoint covers loading the model, so
+                #it says nothing about how quickly one arrives after another.
+                if seen_at is not None:
+                    checkpoints.append(now - seen_at)
+                seen_at = now
+                last = current
+                value, total, preview_seq = current
+                if preview_seq != last_preview_seq:
+                    last_preview_seq = preview_seq
+                    image = progress.read_preview()
+                    preview = ("JPEG", image, 512) if image is not None else None
+                pbar.update_absolute(min(value, total), total, preview)
+        return ray.get(futures)
+    except comfy.model_management.InterruptProcessingException:
+        #Leaving now only stops the host waiting; the workers would sample to the
+        #end on a result nobody reads, holding the devices for the whole render.
+        progress.request_cancel()
+        #A cancel is cooperative: it is noticed at a block boundary, so it only
+        #reaches a worker that is still running. Whoever answers within the drain
+        #unwound properly and stays usable - comfy ends the allocation graph even
+        #when the forward leaves by exception, so the pool is still warm.
+        stuck = _drain(futures, max(checkpoints) if checkpoints else 0.0)
+        if stuck and ray_actors is not None:
+            #Whoever did not answer was not running to begin with. Nothing said
+            #over the side channel will reach it, so end it and let the loader
+            #respawn; otherwise it holds its devices until the server exits.
+            retire_actors(ray_actors, "%d worker(s) that did not answer a cancel"
+                          % len(stuck))
+        raise
 
 
 class XFuserSamplerCustomAdvanced:
@@ -494,7 +640,12 @@ class XFuserSamplerCustomAdvanced:
             )
             for actor in gpu_actors
         ]
-        results = _gather_with_progress(futures)
+        try:
+            results = _gather_with_progress(futures, ray_actors)
+        except Exception as exc:
+            _clear_ray_worker_vram_after_sampling(ray_actors, force=True)
+            _retire_actors_after_fatal(ray_actors, exc)
+            raise
         _clear_ray_worker_vram_after_sampling(ray_actors)
         output, denoised_output = results[0]
         return (output, denoised_output, ray_actors)
@@ -568,7 +719,12 @@ class XFuserSamplerCustom:
             )
             for actor in gpu_actors
         ]
-        results = _gather_with_progress(futures)
+        try:
+            results = _gather_with_progress(futures, ray_actors)
+        except Exception as exc:
+            _clear_ray_worker_vram_after_sampling(ray_actors, force=True)
+            _retire_actors_after_fatal(ray_actors, exc)
+            raise
         _clear_ray_worker_vram_after_sampling(ray_actors)
         out = results[0]
         return (out, ray_actors)
@@ -624,7 +780,12 @@ class UnifiedParallelSamplerCustomAdvanced:
             )
             for actor, group_info in zip(gpu_actors, group_infos)
         ]
-        results = _gather_with_progress(futures)
+        try:
+            results = _gather_with_progress(futures, ray_actors)
+        except Exception as exc:
+            _clear_ray_worker_vram_after_sampling(ray_actors, force=True)
+            _retire_actors_after_fatal(ray_actors, exc)
+            raise
         _clear_ray_worker_vram_after_sampling(ray_actors)
         results = _collect_grouped_results(results, dp_degree, "Unified Parallel SamplerCustomAdvanced")
         outputs, denoised_outputs = _split_advanced_results(results)
@@ -709,7 +870,12 @@ class UnifiedParallelSamplerCustom:
             )
             for actor, group_info in zip(gpu_actors, group_infos)
         ]
-        results = _gather_with_progress(futures)
+        try:
+            results = _gather_with_progress(futures, ray_actors)
+        except Exception as exc:
+            _clear_ray_worker_vram_after_sampling(ray_actors, force=True)
+            _retire_actors_after_fatal(ray_actors, exc)
+            raise
         _clear_ray_worker_vram_after_sampling(ray_actors)
         out = _collect_grouped_results(results, dp_degree, "Unified Parallel SamplerCustom")
         return (out, ray_actors)
@@ -761,7 +927,12 @@ class DPSamplerCustomAdvanced:
             )
             for i, actor in enumerate(gpu_actors)
         ]
-        results = _gather_with_progress(futures)
+        try:
+            results = _gather_with_progress(futures, ray_actors)
+        except Exception as exc:
+            _clear_ray_worker_vram_after_sampling(ray_actors, force=True)
+            _retire_actors_after_fatal(ray_actors, exc)
+            raise
         _clear_ray_worker_vram_after_sampling(ray_actors)
         outputs, denoised_outputs = _split_advanced_results(results)
         return (outputs, denoised_outputs, ray_actors)
@@ -849,7 +1020,12 @@ class DPSamplerCustom:
             )
             for i, actor in enumerate(gpu_actors)
         ]
-        out = _gather_with_progress(futures)
+        try:
+            out = _gather_with_progress(futures, ray_actors)
+        except Exception as exc:
+            _clear_ray_worker_vram_after_sampling(ray_actors, force=True)
+            _retire_actors_after_fatal(ray_actors, exc)
+            raise
         _clear_ray_worker_vram_after_sampling(ray_actors)
         return (out, ray_actors)
 

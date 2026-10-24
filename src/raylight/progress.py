@@ -22,9 +22,12 @@ BOARD_ENV = "RAYLIGHT_PROGRESS_BOARD"
 
 _PROGRESS = "sampler_progress"
 _PREVIEW = "sampler_preview"
+_CANCEL = "sampler_cancel"
 _MIN_INTERVAL = 0.25
+_CANCEL_POLL = 0.2
 
 _last_write = 0.0
+_cancel_seen = (0.0, False)
 _handle = None
 _local = None
 
@@ -114,7 +117,33 @@ def clear_keys(prefix):
 
 
 def clear():
+    global _cancel_seen
+    _cancel_seen = (0.0, False)
     clear_keys("sampler_")
+
+
+def request_cancel():
+    """Ask the workers to stop.
+
+    The same reason progress goes through the board applies in reverse: an actor
+    busy sampling cannot answer a call telling it to stop, so the request waits on
+    the board for the workers to find.
+    """
+    global _cancel_seen
+    _cancel_seen = (time.monotonic(), True)
+    _call("put", _CANCEL, True)
+
+
+def cancel_requested():
+    """Polled by the workers as they run; asks the board at most every 0.2 s."""
+    global _cancel_seen
+    now = time.monotonic()
+    checked, value = _cancel_seen
+    if now - checked < _CANCEL_POLL:
+        return value
+    value = bool(_call("get", _CANCEL))
+    _cancel_seen = (now, value)
+    return value
 
 
 def write(value, total, force=False, preview_seq=0):

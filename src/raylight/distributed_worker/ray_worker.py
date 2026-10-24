@@ -396,10 +396,7 @@ def _progress_reporting(model, local_rank, total_steps=1):
     Blocks are found by walking the diffusion model for ModuleLists, so this
     works for any architecture and degrades to step-only if none are found.
     """
-    if local_rank != 0:
-        yield
-        return
-
+    import comfy.model_management as comfy_model_management
     import comfy.utils as comfy_utils
     from raylight import progress
 
@@ -421,11 +418,40 @@ def _progress_reporting(model, local_rank, total_steps=1):
     root = getattr(getattr(model, "model", model), "diffusion_model", None)
     blocks = _collect_blocks(root) if root is not None else []
     n_blocks = max(len(blocks), 1)
+
+    def _stop_if_cancelled():
+        if progress.cancel_requested():
+            raise comfy_model_management.InterruptProcessingException()
+
+    #Every rank watches, not just the reporting one. A rank that leaves a
+    #collective alone strands its peers waiting on a member that is gone; all
+    #of them checking the same marker at the same block leaves together.
+    if local_rank != 0:
+        def on_block_cancel(_module, _args, _output):
+            _stop_if_cancelled()
+
+        handles = []
+        try:
+            for block in blocks:
+                try:
+                    handles.append(block.register_forward_hook(on_block_cancel))
+                except Exception:
+                    pass
+            yield
+        finally:
+            for handle in handles:
+                try:
+                    handle.remove()
+                except Exception:
+                    pass
+        return
+
     state = {"step": 0, "steps": max(int(total_steps), 1), "seen": 0, "pseq": 0}
     progress.clear()
 
     def on_step(value, total, preview=None, **_kwargs):
         # ComfyUI passes node_id as a keyword; accept whatever it sends.
+        _stop_if_cancelled()
         state["step"] = int(value)
         state["steps"] = max(int(total), 1)
         state["seen"] = 0
@@ -440,6 +466,10 @@ def _progress_reporting(model, local_rank, total_steps=1):
 
     def on_block(_module, _args, _output):
         state["seen"] = min(state["seen"] + 1, n_blocks)
+        #Checked here rather than per step: a step is a whole denoise pass, so a
+        #cancel would not land for tens of seconds. A block is the finest point
+        #the host can be answered from while sampling holds the actor.
+        _stop_if_cancelled()
         progress.write(state["step"] * n_blocks + state["seen"],
                        state["steps"] * n_blocks, preview_seq=state["pseq"])
 
@@ -1667,9 +1697,87 @@ def make_ray_actor_fn(world_size, parallel_dict):
             for actor in gpu_actors:
                 ray.kill(actor, no_restart=True)
             raise
+        _note_workers_spawned()
         return {"workers": gpu_actors, "worker_processes": worker_processes}
 
     return _init_ray_actor
+
+
+_ACTOR_GENERATION = 0
+
+
+def actor_generation():
+    """Bumped whenever the workers are retired.
+
+    ensure_fresh_actors lives in the loader, and the loader is a node: with its
+    inputs unchanged comfy serves a cached result and never calls it, so killing
+    workers on their own leaves the graph holding handles to dead actors. The
+    loader reports this from IS_CHANGED, which puts the respawn back under comfy's
+    own cache rules.
+    """
+    return _ACTOR_GENERATION
+
+
+_WORKER_EPOCH = 0
+_WORKERS_SEEN_ALIVE = False
+
+
+def _workers_alive():
+    if not ray.is_initialized():
+        return False
+    names = [n for n in ray.util.list_named_actors() if str(n).startswith("RayWorker:")]
+    if not names:
+        return False
+    try:
+        ray.get([ray.get_actor(n).get_is_model_loaded.remote() for n in names], timeout=10)
+    except Exception:
+        return False
+    return True
+
+
+def _note_workers_spawned():
+    """Count workers that just came up as seen alive.
+
+    worker_epoch only bumps for workers it has seen alive, and it looks only when
+    comfy asks the initializer IS_CHANGED. Workers spawned and lost between two of
+    those checks - a render that dies on its first run - would otherwise never be
+    noticed, and the next run would be handed their dead handles.
+    """
+    global _WORKERS_SEEN_ALIVE
+    _WORKERS_SEEN_ALIVE = True
+
+
+def worker_epoch():
+    """Bumped once each time workers that were alive are found dead.
+
+    Workers can die outside retire_actors - killed by hand, reaped by the reset
+    workflow's ray.shutdown(), or crashed - and then nothing bumps
+    actor_generation. The initializer reports this from IS_CHANGED so everything
+    below it re-runs on fresh workers instead of meeting dead handles. It stays
+    put once new workers are up, so the next run cache-hits as usual. Never
+    starts a cluster: with ray down there is nothing to ping.
+    """
+    global _WORKER_EPOCH, _WORKERS_SEEN_ALIVE
+    if _workers_alive():
+        _WORKERS_SEEN_ALIVE = True
+    elif _WORKERS_SEEN_ALIVE:
+        _WORKERS_SEEN_ALIVE = False
+        _WORKER_EPOCH += 1
+        logging.warning("[Raylight] workers are gone; the initializer will run again")
+    return _WORKER_EPOCH
+
+
+def retire_actors(ray_actors, reason):
+    """Kill the workers and make the loader run again next time."""
+    global _ACTOR_GENERATION
+    for actor in ray_actors.get("workers", []):
+        try:
+            ray.kill(actor, no_restart=True)
+        except Exception:
+            pass
+    _ACTOR_GENERATION += 1
+    logging.warning("[Raylight] retired workers after %s; they will be respawned "
+                    "on the next run", reason)
 
 
 def ensure_fresh_actors(ray_actors_init):
