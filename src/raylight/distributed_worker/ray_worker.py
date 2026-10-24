@@ -550,6 +550,12 @@ class RayWorker:
         except Exception as e:
             print(f"[Rank {self.local_rank}] unload_all_models failed in clear_sampling_vram: {e}")
 
+        if self.model is not None and hasattr(self.model, "offload_fsdp_vram"):
+            try:
+                self.model.offload_fsdp_vram()
+            except Exception as e:
+                print(f"[Rank {self.local_rank}] offload_fsdp_vram failed in clear_sampling_vram: {e}")
+
         if self.model is not None:
             try:
                 self.model.unpatch_model(device_to=getattr(self.model, "offload_device", None))
@@ -579,6 +585,10 @@ class RayWorker:
                 pass
         comfy_model_management.soft_empty_cache()
         return True
+
+    def _restore_sampling_vram(self):
+        if self.model is not None and hasattr(self.model, "restore_fsdp_vram"):
+            self.model.restore_fsdp_vram()
 
     def check_model_loaded(self, unet_path, model_options):
         """Check if the currently loaded model matches the given parameters.
@@ -1113,6 +1123,8 @@ class RayWorker:
         import comfy.utils as comfy_utils
         import latent_preview
 
+        self._restore_sampling_vram()
+
         for cond_list in _get_guider_conditionings(guider_spec):
             _restore_controlnet_refs(cond_list, self.cached_controlnet, self.vae_model)
             _remap_conditioning_devices(cond_list, None)
@@ -1209,6 +1221,8 @@ class RayWorker:
         import comfy.model_management as comfy_model_management
         import comfy.sample as comfy_sample
         import comfy.utils as comfy_utils
+
+        self._restore_sampling_vram()
 
         # Restore ControlNet refs from local cache (loaded by load_controlnet)
         _restore_controlnet_refs(positive, self.cached_controlnet, self.vae_model)
@@ -1351,6 +1365,8 @@ class RayWorker:
         import comfy.model_management as comfy_model_management
         import comfy.sample as comfy_sample
         import comfy.utils as comfy_utils
+
+        self._restore_sampling_vram()
 
         # Restore ControlNet refs from local cache (loaded by load_controlnet)
         _restore_controlnet_refs(positive, self.cached_controlnet, self.vae_model)

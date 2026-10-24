@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
-from torch.distributed.utils import _free_storage
+from torch.distributed.utils import _alloc_storage, _free_storage
 from torch.distributed.tensor import DTensor
 
 import comfy
@@ -129,6 +129,52 @@ def free_model_vram(model_patcher) -> None:
                 _safe_free_storage(tensor)
             except Exception:
                 continue
+
+
+def _shard_storage_tensors(tensor: torch.Tensor):
+    """Yield the plain tensors that physically hold a parameter's bytes.
+
+    A sharded quantized parameter is a DTensor wrapping a QuantizedTensor, whose
+    bytes live in _qdata plus the scale tensors on _params. Those inner tensors
+    are ordinary tensors and can be moved and resized; the wrappers cannot.
+    """
+    if isinstance(tensor, DTensor):
+        tensor = getattr(tensor, "_local_tensor", None)
+        if tensor is None:
+            return
+
+    if _is_quantized_tensor_like(tensor):
+        qdata = getattr(tensor, "_qdata", None)
+        if isinstance(qdata, torch.Tensor):
+            yield qdata
+        params = getattr(tensor, "_params", None)
+        if params is not None:
+            try:
+                fields = params._tensor_fields()
+            except Exception:
+                fields = ()
+            for name in fields:
+                field = getattr(params, name, None)
+                if isinstance(field, torch.Tensor):
+                    yield field
+        return
+
+    if isinstance(tensor, torch.Tensor):
+        yield tensor
+
+
+def _offloadable_shard_tensors(model):
+    for m in model.modules():
+        for p in m.parameters(recurse=False):
+            data = p.data if isinstance(p.data, torch.Tensor) else None
+            if data is None:
+                continue
+            for tensor in _shard_storage_tensors(data):
+                if tensor.device.type != "cuda":
+                    continue
+                if tensor.storage_offset() != 0:
+                    continue
+                yield tensor
 
 
 def _is_quantized_tensor_like(tensor: torch.Tensor) -> bool:
@@ -396,6 +442,55 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
     def set_fsdp_state_dict(self, sd):
         self.fsdp_state_dict = sd
+
+    def offload_fsdp_vram(self):
+        """Copy sharded weights to host memory and release their GPU storage.
+
+        Restored by restore_fsdp_vram(). Unlike free_fsdp_vram() this keeps the
+        model usable, so a cached workflow can sample again without the loader
+        node rerunning.
+        """
+        model = getattr(self, "model", None)
+        if model is None or getattr(model, "_raylight_offloaded_shards", None):
+            return 0
+
+        saved = []
+        moved = 0
+        for tensor in _offloadable_shard_tensors(model):
+            size = tensor.size()
+            try:
+                host = tensor.to("cpu", copy=True)
+            except Exception:
+                continue
+            try:
+                _free_storage(tensor)
+            except (RuntimeError, AssertionError):
+                continue
+            saved.append((tensor, host, size))
+            moved += host.numel() * host.element_size()
+
+        model._raylight_offloaded_shards = saved
+        return moved
+
+    def restore_fsdp_vram(self):
+        """Bring shards offloaded by offload_fsdp_vram() back onto the GPU."""
+        model = getattr(self, "model", None)
+        saved = getattr(model, "_raylight_offloaded_shards", None) if model is not None else None
+        if not saved:
+            return 0
+
+        restored = 0
+        for tensor, host, size in saved:
+            try:
+                _alloc_storage(tensor, size)
+                tensor.copy_(host)
+            except Exception as e:
+                logging.error(f"[Raylight] Failed to restore offloaded shard: {e}")
+                raise
+            restored += host.numel() * host.element_size()
+
+        model._raylight_offloaded_shards = []
+        return restored
 
     def free_fsdp_vram(self):
         """Eagerly free DTensor shard storage from GPU.
