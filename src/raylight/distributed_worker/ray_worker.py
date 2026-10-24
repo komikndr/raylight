@@ -141,12 +141,12 @@ def _apply_worker_late_comfy_cli_args(worker_cli_args):
     if worker_cli_args.get("disable_pinned_memory", False):
         comfy_model_management.MAX_PINNED_MEMORY = -1
 
-        def _pin_memory_disabled(tensor):
-            del tensor
+        def _pin_memory_disabled(tensor, *args, **kwargs):
+            del tensor, args, kwargs
             return False
 
-        def _unpin_memory_disabled(tensor):
-            del tensor
+        def _unpin_memory_disabled(tensor, *args, **kwargs):
+            del tensor, args, kwargs
             return False
 
         comfy_model_management.pin_memory = _pin_memory_disabled

@@ -230,6 +230,7 @@ def _worker_cli_args_env_json() -> str:
         "disable_smart_memory": bool(comfy_args.disable_smart_memory),
         "disable_async_offload": bool(comfy_args.disable_async_offload),
         "disable_dynamic_vram": bool(comfy_args.disable_dynamic_vram),
+        "disable_comfy_compiler": bool(getattr(comfy_args, "disable_comfy_compiler", False)),
         "enable_dynamic_vram": bool(comfy_args.enable_dynamic_vram),
         "vram_headroom": comfy_args.vram_headroom,
         "force_non_blocking": bool(comfy_args.force_non_blocking),
