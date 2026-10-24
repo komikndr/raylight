@@ -247,6 +247,9 @@ def _worker_cli_args_env_json() -> str:
         "supports_fp8_compute": bool(comfy_args.supports_fp8_compute),
         "enable_triton_backend": bool(comfy_args.enable_triton_backend),
         "fast": sorted(feature.value for feature in comfy_args.fast),
+        # Workers need this to build a previewer; without it they default to
+        # NoPreviews and the sampler never produces preview images to relay.
+        "preview_method": comfy_args.preview_method.value,
     }
     return json.dumps(worker_cli_args, sort_keys=True)
 
@@ -670,6 +673,12 @@ class RayInitializer:
 
         _inject_worker_cli_args(runtime_env_base)
 
+        # the workers find the progress board by this name; each cluster gets its own
+        from raylight import progress
+
+        board_name = progress.new_board_name()
+        runtime_env_base.setdefault("env_vars", {})[progress.BOARD_ENV] = board_name
+
         if ray_cluster_address in _LOCAL_CLUSTER_ADDRESSES:
             _configure_raylight_ray_tmpdir(runtime_env_base)
 
@@ -713,6 +722,8 @@ class RayInitializer:
                     else:
                         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
             raise RuntimeError(f"Ray connection failed: {e}")
+
+        progress.create_board(board_name)
 
         if not skip_comm_test:
             print("Running NCCL communication test...")
