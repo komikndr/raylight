@@ -31,6 +31,7 @@ from .distributed_worker.ray_worker import (
     ray_nccl_tester,
 )
 from .distributed_worker.ray_worker_vae import combine_dist_vae_partials, combine_seedvr2_vae_partials
+from . import progress
 from .comfy_extra_dist.nodes_custom_sampler import (
     _clear_ray_worker_vram_after_sampling,
     _free_host_models_if_contended,
@@ -673,8 +674,6 @@ class RayInitializer:
         _inject_worker_cli_args(runtime_env_base)
 
         # the workers find the progress board by this name; each cluster gets its own
-        from raylight import progress
-
         board_name = progress.new_board_name()
         runtime_env_base.setdefault("env_vars", {})[progress.BOARD_ENV] = board_name
 
@@ -1210,6 +1209,7 @@ class XFuserKSamplerAdvanced:
             disable_noise = True
 
         gpu_actors = ray_actors["workers"]
+        progress.reset_cancel()
         futures = [
             actor.common_ksampler.remote(
                 noise_seed,
@@ -1336,6 +1336,7 @@ class UnifiedParallelSampler:
         positive = _normalize_grouped_inputs(positive, dp_degree, "positive")
         negative = _normalize_grouped_inputs(negative, dp_degree, "negative")
         latent_image = _normalize_grouped_inputs(latent_image, dp_degree, "latent_image")
+        progress.reset_cancel()
         futures = [
             actor.common_ksampler.remote(
                 noise_list[group_info["dp_rank"]],
@@ -1478,6 +1479,7 @@ class DPKSamplerAdvanced:
             disable_noise = True
 
         # Each GPU gets its own noise/conditioning — decoupled from FSDP sharding
+        progress.reset_cancel()
         futures = [
             actor.common_ksampler.remote(
                 noise_list[i],

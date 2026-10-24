@@ -419,9 +419,11 @@ def _progress_reporting(model, local_rank, total_steps=1):
     blocks = _collect_blocks(root) if root is not None else []
     n_blocks = max(len(blocks), 1)
 
-    def _stop_if_cancelled():
-        if progress.cancel_requested():
+    def _stop_if_cancelled(force=False):
+        if progress.cancel_requested(force=force):
             raise comfy_model_management.InterruptProcessingException()
+
+    _stop_if_cancelled(force=True)
 
     #Every rank watches, not just the reporting one. A rank that leaves a
     #collective alone strands its peers waiting on a member that is gone; all

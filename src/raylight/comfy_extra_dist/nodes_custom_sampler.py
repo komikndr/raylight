@@ -12,6 +12,7 @@ from comfy.k_diffusion import sa_solver
 from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
 import comfy.utils
 from raylight.distributed_worker.ray_worker import retire_actors
+from raylight import progress
 from .ray_patch_decorator import ray_patch_with_return
 
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise
@@ -546,8 +547,6 @@ def _gather_with_progress(futures, ray_actors=None):
     """
     import comfy.model_management
     import comfy.utils
-    from raylight import progress
-
     pending = list(futures)
     pbar = comfy.utils.ProgressBar(1)
     last = None
@@ -629,6 +628,7 @@ class XFuserSamplerCustomAdvanced:
         ray_actors = _extract_ray_actors_from_guider(guider)
         _free_host_models_if_contended(ray_actors)
         gpu_actors = ray_actors["workers"]
+        progress.reset_cancel()
         futures = [
             actor.custom_sampler_advanced.remote(
                 add_noise,
@@ -706,6 +706,7 @@ class XFuserSamplerCustom:
     ):
         _free_host_models_if_contended(ray_actors)
         gpu_actors = ray_actors["workers"]
+        progress.reset_cancel()
         futures = [
             actor.custom_sampler.remote(
                 add_noise,
@@ -768,6 +769,7 @@ class UnifiedParallelSamplerCustomAdvanced:
         guider, ray_actors = _normalize_grouped_guiders(guider, dp_degree)
         latent_image = _normalize_grouped_inputs(latent_image, dp_degree, "latent_image")
 
+        progress.reset_cancel()
         futures = [
             actor.custom_sampler_advanced.remote(
                 add_noise,
@@ -856,6 +858,7 @@ class UnifiedParallelSamplerCustom:
         negative = _normalize_grouped_inputs(negative, dp_degree, "negative")
         latent_image = _normalize_grouped_inputs(latent_image, dp_degree, "latent_image")
 
+        progress.reset_cancel()
         futures = [
             actor.custom_sampler.remote(
                 add_noise,
@@ -916,6 +919,7 @@ class DPSamplerCustomAdvanced:
         latent_image = _normalize_grouped_inputs(latent_image, num_gpus, "latent_image")
         noise_list = _normalize_grouped_inputs(noise_list, num_gpus, "noise_list")
 
+        progress.reset_cancel()
         futures = [
             actor.custom_sampler_advanced.remote(
                 add_noise,
@@ -1007,6 +1011,7 @@ class DPSamplerCustom:
             noise_list = noise_list[:num_gpus]
 
         # Each GPU gets its own noise/conditioning/latent — decoupled from FSDP sharding
+        progress.reset_cancel()
         futures = [
             actor.custom_sampler.remote(
                 add_noise,
