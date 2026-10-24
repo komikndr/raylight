@@ -226,8 +226,10 @@ def _wait_for_ray_workers_to_exit(timeout=90.0):
 def _worker_cli_args_env_json() -> str:
     worker_cli_args = {
         # Ray workers hit cudaHostRegister failures on large LTXV loads often enough
-        # that we disable pinned memory there by default.
-        "disable_pinned_memory": True,
+        # that we disable pinned memory there by default. Pinned host memory is
+        # what lets a host to device copy actually run asynchronously, so
+        # RAYLIGHT_WORKER_PIN opts back in where the load is known to succeed.
+        "disable_pinned_memory": os.environ.get("RAYLIGHT_WORKER_PIN") != "1",
         "fast_disk": bool(comfy_args.fast_disk),
         "disable_mmap": bool(comfy_args.disable_mmap),
         "mmap_torch_files": bool(comfy_args.mmap_torch_files),
