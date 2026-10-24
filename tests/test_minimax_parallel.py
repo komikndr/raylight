@@ -95,11 +95,70 @@ def test_minimax_usp_layout_and_mask_parity():
 
 
 def test_minimax_usp_slices_per_row_modulation_with_sequence():
-    source = ast.unparse(_function(RAYLIGHT, "_split_packed_sequence"))
+    source = ast.unparse(_function(RAYLIGHT, "_localize_segments"))
 
     assert "isinstance(row, torch.Tensor)" in source
     assert "segment_start - original_start" in source
     assert "segment_end - original_start" in source
+
+
+def test_minimax_usp_builds_and_gathers_only_local_rows():
+    names = ("_local_range", "_localize_segments", "_embed_pieces", "_gather_stream")
+    module = ast.Module(body=[_function(RAYLIGHT, name) for name in names], type_ignores=[])
+    world, state, gathered = 4, {"rank": 0}, []
+
+    class Group:
+        def all_gather(self, value, dim):
+            gathered.append(value)
+            return value
+
+    namespace = {
+        "torch": torch,
+        "get_sequence_parallel_world_size": lambda: world,
+        "get_sequence_parallel_rank": lambda: state["rank"],
+        "get_sp_group": Group,
+    }
+    exec(compile(module, str(RAYLIGHT), "exec"), namespace)
+
+    # text, then a video stream that lies inside a single rank, then audio
+    segments = [(0, 21, "text"), (21, 23, "cond"), (23, 26, "video"), (26, 41, "audio")]
+    seq_len = 41
+    text = torch.randn(21, 4)
+    video_rows, audio_rows = torch.randn(5, 2), torch.randn(15, 2)
+    video_proj, audio_proj = torch.randn(2, 4), torch.randn(2, 4)
+    expected = torch.cat((text, video_rows @ video_proj, audio_rows @ audio_proj))
+
+    built = []
+    for rank in range(world):
+        state["rank"] = rank
+        start, end = namespace["_local_range"](seq_len)
+        h = torch.zeros(end - start, 4)
+        video_pieces, audio_pieces, voff, aoff = [], [], 0, 0
+        for a, b, kind in segments:
+            lo, hi = max(a, start), min(b, end)
+            if kind == "text":
+                if lo < hi:
+                    h[lo - start:hi - start] = text[lo - a:hi - a]
+            elif kind in ("cond", "video"):
+                if lo < hi:
+                    video_pieces.append((lo - start, hi - start, voff + lo - a))
+                voff += b - a
+            else:
+                if lo < hi:
+                    audio_pieces.append((lo - start, hi - start, aoff + lo - a))
+                aoff += b - a
+        calls = []
+        namespace["_embed_pieces"](h, lambda x: (calls.append(1), x @ video_proj)[1], video_rows, video_pieces, torch.float32)
+        namespace["_embed_pieces"](h, lambda x: (calls.append(1), x @ audio_proj)[1], audio_rows, audio_pieces, torch.float32)
+        # every rank projects each stream exactly once, holding rows or not
+        assert len(calls) == 2
+        built.append(h)
+        local = namespace["_localize_segments"]([(23, 26, None)], start, end)
+        namespace["_gather_stream"](h[local[0][0]:local[0][1]] if local else h[:1], local, end - start)
+
+    assert torch.equal(torch.cat(built)[:seq_len], expected)
+    assert torch.equal(torch.cat(built)[seq_len:], torch.zeros(4 * 11 - seq_len, 4))
+    assert torch.equal(torch.cat(gathered)[23:26], expected[23:26])
 
 
 def test_minimax_usp_attention_matches_core_kernels():

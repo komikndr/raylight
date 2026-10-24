@@ -14,13 +14,16 @@ sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
 
 
-def _split_packed_sequence(h, rope_freqs, mod_segments):
-    world_size = get_sequence_parallel_world_size()
-    local_size = h.shape[0] // world_size
+def _local_range(seq_len):
+    # this rank's [start, end) of the sequence padded to the world size
+    local_size = -(-seq_len // get_sequence_parallel_world_size())
     start = get_sequence_parallel_rank() * local_size
-    end = start + local_size
+    return start, start + local_size
+
+
+def _localize_segments(segments, start, end):
     local_segments = []
-    for segment_start, segment_end, row in mod_segments:
+    for segment_start, segment_end, row in segments:
         original_start = segment_start
         segment_start = max(segment_start, start)
         segment_end = min(segment_end, end)
@@ -28,7 +31,30 @@ def _split_packed_sequence(h, rope_freqs, mod_segments):
             if isinstance(row, torch.Tensor):
                 row = row[segment_start - original_start:segment_end - original_start]
             local_segments.append((segment_start - start, segment_end - start, row))
-    return h[start:end], rope_freqs[:, start:end], local_segments
+    return local_segments
+
+
+def _embed_pieces(h, proj, rows, pieces, dtype):
+    # pieces: [(dst_start, dst_stop, src_start)] of h rows taken from projected rows
+    src = [rows[s:s + b - a] for a, b, s in pieces] or [rows[:1]]
+    out = proj(torch.cat(src)).to(dtype)
+    o = 0
+    for a, b, _ in pieces:
+        h[a:b] = out[o:o + b - a]
+        o += b - a
+
+
+def _first_row(row):
+    return row[:1] if isinstance(row, torch.Tensor) else row
+
+
+def _gather_stream(out, local_segments, local_size):
+    # place this rank's head outputs at their local rows and gather the sequence
+    buf = out.new_zeros(local_size, out.shape[-1])
+    if local_segments:
+        a, b, _ = local_segments[0]
+        buf[a:b] = out
+    return get_sp_group().all_gather(buf, dim=0)
 
 
 def _run_control_patch(patch, args, block_wrap, full_size):
@@ -191,26 +217,38 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
         all_audio_rows[~audio_update] = cond_audio_rows
         all_audio_rows[audio_update] = audio_rows
 
-    video_embed = self.video_patch_proj(all_video_rows).to(dtype)
-    audio_embed = self.audio_patch_proj(all_audio_rows).to(dtype)
     text_states = context[0]
     if text_states.shape[-1] != self.hidden_size:
         text_states = self.token_refiner(self.condition_proj(text_states),
                                          transformer_options=transformer_options)
 
-    # segments are contiguous: assemble by slices, embed rows follow segment order
-    h = torch.empty(layout.seq_len, self.hidden_size, dtype=dtype, device=device)
+    # segments are contiguous: assemble by slices, embed rows follow segment order.
+    # Only this rank's slice is built: the full sequence is several GiB at long clip
+    # lengths and would otherwise sit on every rank before the split. zeros, not
+    # empty: the padding to the world size is covered by no segment.
+    h_orig_size = layout.seq_len
+    start, end = _local_range(h_orig_size)
+    h = torch.zeros(end - start, self.hidden_size, dtype=dtype, device=device)
+    video_pieces, audio_pieces = [], []
     voff = aoff = 0
     for a, b, kind in layout.segments:
         n = b - a
+        lo, hi = max(a, start), min(b, end)
         if kind == "text":
-            h[a:b] = text_states
+            if lo < hi:
+                h[lo - start:hi - start] = text_states[lo - a:hi - a]
         elif kind in ("cond", "ref_img", "video"):
-            h[a:b] = video_embed[voff:voff + n]
+            if lo < hi:
+                video_pieces.append((lo - start, hi - start, voff + lo - a))
             voff += n
         else:  # ref_audio / audio
-            h[a:b] = audio_embed[aoff:aoff + n]
+            if lo < hi:
+                audio_pieces.append((lo - start, hi - start, aoff + lo - a))
             aoff += n
+    # the projections are FSDP modules, so their forward is a collective: every
+    # rank calls each exactly once, on all of its rows, even when it holds none
+    _embed_pieces(h, self.video_patch_proj, all_video_rows, video_pieces, dtype)
+    _embed_pieces(h, self.audio_patch_proj, all_audio_rows, audio_pieces, dtype)
 
     t_vals = torch.tensor(unique_t, dtype=torch.float32, device=device)
     if self.use_adaln_curves:
@@ -225,9 +263,9 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     # rotation table computed once per forward, consumed by the kitchen split-half rope
     rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
     # ===================== SP SPLIT ====================== #
-    h, h_orig_size = pad_to_world_size(h, dim=0)
     rope_freqs, _ = pad_to_world_size(rope_freqs, dim=1)
-    h, rope_freqs, mod_segments = _split_packed_sequence(h, rope_freqs, mod_segments)
+    rope_freqs = rope_freqs[:, start:end]
+    mod_segments = _localize_segments(mod_segments, start, end)
 
     # blocks
     patches_replace = transformer_options.get("patches_replace", {})
@@ -254,10 +292,6 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     if prefetch_queue is not None:
         comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)
 
-    # ===================== SP GATHER ===================== #
-    h = get_sp_group().all_gather(h.contiguous(), dim=0)
-    h = h[:h_orig_size]
-
     va, vb, _ = next(s for s in layout.segments if s[2] == "video")
     aa, ab, _ = next(s for s in layout.segments if s[2] == "audio")
     if video_rows_t is not None:
@@ -268,7 +302,17 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
         audio_seg = (aa, ab, rows_to_mod_index(audio_rows_t, 0) // 3)
     else:
         audio_seg = (aa, ab, t_row[seg_t["audio"]])
-    v, a = self.final_layer(h, t_emb, video_seg, audio_seg, sigma_v, transformer_options.get("sample_sigmas"), (shift_v, shift_a))
+    # ===================== SP GATHER ===================== #
+    # the head is row-local, so it runs on this rank's rows and only its outputs
+    # are gathered, not the full-width residual
+    local_video = _localize_segments([video_seg], start, end)
+    local_audio = _localize_segments([audio_seg], start, end)
+    # a rank holding none of a stream's rows still runs one row of it, and drops it
+    v_seg = local_video[0] if local_video else (0, 1, _first_row(video_seg[2]))
+    a_seg = local_audio[0] if local_audio else (0, 1, _first_row(audio_seg[2]))
+    v, a = self.final_layer(h, t_emb, v_seg, a_seg, sigma_v, transformer_options.get("sample_sigmas"), (shift_v, shift_a))
+    v = _gather_stream(v, local_video, end - start)[va:vb]
+    a = _gather_stream(a, local_audio, end - start)[aa:ab]
 
     video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
     video_out = video_out[:, :, :orig_t, :orig_h, :orig_w]
