@@ -15,7 +15,6 @@ def load_vae_model(vae_path):
     vae_model = comfy_sd.VAE(sd=state_dict, metadata=metadata)
     vae_model.throw_exception_if_invalid()
 
-    vae_model._raylight_comfy_has_chunked_io = getattr(getattr(vae_model, "first_stage_model", None), "comfy_has_chunked_io", False)
 
     return vae_model
 
@@ -132,11 +131,6 @@ def ray_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, temporal
             "Distributed VAE (Ray) cannot decode structured/nested latents. "
             "Use LTXVSeparateAVLatent to prepare latents, then use normal ComfyUI VAE Decode."
         )
-    if getattr(vae, "_raylight_comfy_has_chunked_io", False):
-        raise ValueError(
-            "Distributed VAE (Ray) cannot decode this VAE type. "
-            "Use normal ComfyUI VAE Decode for VAEs with chunked I/O (e.g., LTX 2.x/2.3)."
-        )
     if vae.handles_tiling:
         raise ValueError(
             "Distributed VAE (Ray) cannot externally tile this VAE. "
@@ -192,7 +186,8 @@ def ray_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, temporal
                     tile = partial_latent[:, :, x:x_end]
                     if extra_channels is not None:
                         tile = tile.reshape(tile.shape[0], og_C, extra_channels, -1)
-                    decoded = vae.first_stage_model.decode(tile.to(vae.device, dtype=vae.vae_dtype))
+                    with torch.inference_mode():  # ray workers run outside comfy's inference context; in-place custom ops (RoPE in LTX-2.x/MiniMax causal VAEs) raise under autograd
+                        decoded = vae.first_stage_model.decode(tile.to(vae.device, dtype=vae.vae_dtype))
                     if extra_channels is not None:
                         decoded = decoded.reshape(decoded.shape[0], -1, decoded.shape[-1])
                     x_out = _round_upscale(pos_0, x)
@@ -222,7 +217,8 @@ def ray_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, temporal
                 for y, y_end, x, x_end in tile_ranges:
                     if job_index % job_world_size == job_rank:
                         tile = latent[:, :, y:y_end, x:x_end]
-                        decoded = vae.first_stage_model.decode(tile.to(vae.device, dtype=vae.vae_dtype))
+                        with torch.inference_mode():  # ray workers run outside comfy's inference context; in-place custom ops (RoPE in LTX-2.x/MiniMax causal VAEs) raise under autograd
+                            decoded = vae.first_stage_model.decode(tile.to(vae.device, dtype=vae.vae_dtype))
                         y_out = _round_upscale(pos_0, y)
                         x_out = _round_upscale(pos_1, x)
                         tiles.append((y, x, y_out, x_out, decoded.to(device="cpu", dtype=decode_dtype, copy=True)))
@@ -251,7 +247,8 @@ def ray_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, temporal
             for y, y_end, x, x_end in tile_ranges:
                 if job_index % job_world_size == job_rank:
                     tile = latent[:, :, :, y:y_end, x:x_end]
-                    decoded = vae.first_stage_model.decode(tile.to(vae.device, dtype=vae.vae_dtype))
+                    with torch.inference_mode():  # ray workers run outside comfy's inference context; in-place custom ops (RoPE in LTX-2.x/MiniMax causal VAEs) raise under autograd
+                        decoded = vae.first_stage_model.decode(tile.to(vae.device, dtype=vae.vae_dtype))
                     y_out = _round_upscale(pos_1, y)
                     x_out = _round_upscale(pos_2, x)
                     tiles.append((y, x, y_out, x_out, decoded.to(device="cpu", dtype=decode_dtype, copy=True)))
@@ -535,7 +532,8 @@ def ray_seedvr2_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, 
             for y, y_end, x, x_end in tile_ranges:
                 if job_index % job_world_size == job_rank:
                     tile = latent[batch_index:batch_index + 1, :, :, y:y_end, x:x_end]
-                    decoded = model.decode(tile.to(device=vae.device, dtype=vae.vae_dtype))
+                    with torch.inference_mode():  # ray workers run outside comfy's inference context; in-place custom ops (RoPE in LTX-2.x/MiniMax causal VAEs) raise under autograd
+                        decoded = model.decode(tile.to(device=vae.device, dtype=vae.vae_dtype))
                     tiles.append((batch_index, y, y_end, x, x_end, decoded.to(device="cpu", dtype=torch.float32, copy=True)))
                 job_index += 1
 
