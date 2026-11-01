@@ -13,7 +13,7 @@ from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
 import comfy.utils
 from raylight.distributed_worker.ray_worker import retire_actors
 from raylight import progress
-from .ray_patch_decorator import ray_patch_with_return
+from .ray_patch_decorator import prepare_ray_model, ray_patch_with_return
 
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise
 
@@ -38,8 +38,9 @@ def _normalize_grouped_guiders(guiders: list, expected_length: int):
         if ray_actors is None:
             ray_actors = current_ray_actors
             continue
-        if current_ray_actors is not ray_actors and current_ray_actors != ray_actors:
-            raise ValueError("All RAY_GUIDER inputs must be created from the same ray actor set")
+        if (current_ray_actors["workers"] != ray_actors["workers"]
+                or current_ray_actors.get("model_request") != ray_actors.get("model_request")):
+            raise ValueError("All RAY_GUIDER inputs must use the same ray actor set and loaded model")
     return guiders, ray_actors
 
 
@@ -625,6 +626,7 @@ class XFuserSamplerCustomAdvanced:
 
     def ray_sample(self, add_noise, noise_seed, guider, sampler, sigmas, latent_image):
         ray_actors = _extract_ray_actors_from_guider(guider)
+        ray_actors = prepare_ray_model(ray_actors)
         _free_host_models_if_contended(ray_actors)
         gpu_actors = ray_actors["workers"]
         progress.reset_cancel()
@@ -636,6 +638,7 @@ class XFuserSamplerCustomAdvanced:
                 sampler,
                 sigmas,
                 latent_image,
+                sampling_patches=ray_actors.get("sampling_patches", ()),
             )
             for actor in gpu_actors
         ]
@@ -703,6 +706,7 @@ class XFuserSamplerCustom:
         sigmas,
         latent_image,
     ):
+        ray_actors = prepare_ray_model(ray_actors)
         _free_host_models_if_contended(ray_actors)
         gpu_actors = ray_actors["workers"]
         progress.reset_cancel()
@@ -716,6 +720,7 @@ class XFuserSamplerCustom:
                 sampler,
                 sigmas,
                 latent_image,
+                sampling_patches=ray_actors.get("sampling_patches", ()),
             )
             for actor in gpu_actors
         ]
@@ -756,7 +761,7 @@ class UnifiedParallelSamplerCustomAdvanced:
         sampler = sampler[0]
         sigmas = sigmas[0]
 
-        initial_ray_actors = _extract_ray_actors_from_guider(guider[0])
+        initial_ray_actors = prepare_ray_model(_extract_ray_actors_from_guider(guider[0]))
         _free_host_models_if_contended(initial_ray_actors)
         gpu_actors = initial_ray_actors["workers"]
         parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
@@ -766,6 +771,7 @@ class UnifiedParallelSamplerCustomAdvanced:
 
         noise_list = _normalize_grouped_inputs(noise_list, dp_degree, "noise_list")
         guider, ray_actors = _normalize_grouped_guiders(guider, dp_degree)
+        ray_actors = initial_ray_actors
         latent_image = _normalize_grouped_inputs(latent_image, dp_degree, "latent_image")
 
         progress.reset_cancel()
@@ -778,6 +784,7 @@ class UnifiedParallelSamplerCustomAdvanced:
                 sigmas,
                 latent_image[group_info["dp_rank"]],
                 grouped_output=True,
+                sampling_patches=_extract_ray_actors_from_guider(guider[group_info["dp_rank"]]).get("sampling_patches", ()),
             )
             for actor, group_info in zip(gpu_actors, group_infos)
         ]
@@ -841,6 +848,7 @@ class UnifiedParallelSamplerCustom:
         latent_image,
     ):
         ray_actors = ray_actors[0]
+        ray_actors = prepare_ray_model(ray_actors)
         add_noise = add_noise[0]
         cfg = cfg[0]
         sampler = sampler[0]
@@ -869,6 +877,7 @@ class UnifiedParallelSamplerCustom:
                 sigmas,
                 latent_image[group_info["dp_rank"]],
                 grouped_output=True,
+                sampling_patches=ray_actors.get("sampling_patches", ()),
             )
             for actor, group_info in zip(gpu_actors, group_infos)
         ]
@@ -909,12 +918,13 @@ class DPSamplerCustomAdvanced:
         sampler = sampler[0]
         sigmas = sigmas[0]
 
-        initial_ray_actors = _extract_ray_actors_from_guider(guider[0])
+        initial_ray_actors = prepare_ray_model(_extract_ray_actors_from_guider(guider[0]))
         _free_host_models_if_contended(initial_ray_actors)
         gpu_actors = initial_ray_actors["workers"]
         num_gpus = len(gpu_actors)
 
         guider, ray_actors = _normalize_grouped_guiders(guider, num_gpus)
+        ray_actors = initial_ray_actors
         latent_image = _normalize_grouped_inputs(latent_image, num_gpus, "latent_image")
         noise_list = _normalize_grouped_inputs(noise_list, num_gpus, "noise_list")
 
@@ -927,6 +937,7 @@ class DPSamplerCustomAdvanced:
                 sampler,
                 sigmas,
                 latent_image[i],
+                sampling_patches=_extract_ray_actors_from_guider(guider[i]).get("sampling_patches", ()),
             )
             for i, actor in enumerate(gpu_actors)
         ]
@@ -987,6 +998,7 @@ class DPSamplerCustom:
         latent_image,
     ):
         ray_actors = ray_actors[0]
+        ray_actors = prepare_ray_model(ray_actors)
         add_noise = add_noise[0]
         cfg = cfg[0]
         sampler = sampler[0]
@@ -1021,6 +1033,7 @@ class DPSamplerCustom:
                 sampler,
                 sigmas,
                 latent_image[i],
+                sampling_patches=ray_actors.get("sampling_patches", ()),
             )
             for i, actor in enumerate(gpu_actors)
         ]

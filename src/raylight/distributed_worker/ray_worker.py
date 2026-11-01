@@ -18,8 +18,6 @@ import ray
 
 import comfy.patcher_extension as pe
 from comfy import model_base, model_management
-from comfy_extras.nodes_model_patch import ModelPatchLoader
-from comfy_extras.nodes_minimax_h3 import MiniMaxH3FunControlPatch
 
 from raylight.distributed_modules.usp import USPInjectRegistry
 from raylight.diffusion_models.minimax.fp16_support import minimax_precision_loading
@@ -536,6 +534,25 @@ def report_progress(fn):
     return wrapper
 
 
+def _with_sampling_patches(fn):
+    @functools.wraps(fn)
+    def wrapper(self, *args, sampling_patches=(), **kwargs):
+        if not sampling_patches:
+            return fn(self, *args, **kwargs)
+        original = self.model
+        try:
+            for patch in sampling_patches:
+                self.model = patch(self.model)
+            return fn(self, *args, **kwargs)
+        finally:
+            try:
+                if self.model is not original:
+                    self.model.unpatch_model(device_to=None, unpatch_weights=False)
+            finally:
+                self.model = original
+    return wrapper
+
+
 class RayWorker:
     def __init__(self, local_rank, device_id, config: RayWorkerConfig, world_size, group_id=0):
         worker_cli_args = _apply_worker_comfy_cli_args_from_env()
@@ -632,7 +649,7 @@ class RayWorker:
         else:
             raise ValueError("Model recieved is not meta, can cause OOM in large model")
 
-    def set_meta_model(self, model):
+    def set_meta_model(self, model, unet_path, model_options):
         base_model = getattr(model, "model", model)
         first_param_device = next(base_model.parameters()).device
         if first_param_device == torch.device("meta"):
@@ -643,6 +660,9 @@ class RayWorker:
             self.state_dict = None
             self.model = model
             self.model.config_fsdp(self.local_rank, self.device_mesh)
+            self.active_request_key = self._active_model_key(unet_path, model_options)
+            self.overwrite_cast_dtype = getattr(base_model, "manual_cast_dtype", None)
+            self.is_model_loaded = True
         else:
             raise ValueError("Model being set is not meta, can cause OOM in large model")
 
@@ -915,10 +935,8 @@ class RayWorker:
     def set_quantized(self, is_quant):
         self.is_quant = is_quant
 
-    def model_function_runner(self, fn, *args, **kwargs):
-        self.model = fn(self.model, *args, **kwargs)
-
-    def model_function_runner_get_values(self, fn, *args, **kwargs):
+    @_with_sampling_patches
+    def model_function_runner_get_values(self, fn, *args, sampling_patches=(), **kwargs):
         return fn(self.model, *args, **kwargs)
 
     def get_local_rank(self):
@@ -1084,11 +1102,15 @@ class RayWorker:
             return
 
     def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype, use_mmap=None):
+        if use_mmap is None:
+            use_mmap = self.config.use_mmap
+        model_options = {"loader": "gguf", "dequant_dtype": dequant_dtype, "patch_dtype": patch_dtype, "use_mmap": use_mmap}
+        active_key = self._active_model_key(unet_path, model_options)
+        if self.check_model_loaded(unet_path, model_options):
+            return
         self._reset_active_model()
         self._invalidate_non_fsdp_cache()
         self._free_cached_aux_models()
-        if use_mmap is None:
-            use_mmap = self.config.use_mmap
         if self.config.fsdp_enabled:
             # GGUF FSDP stays disabled for now.
             raise RuntimeError("FSDP on GGUF is not supported")
@@ -1112,6 +1134,8 @@ class RayWorker:
             self.load_lora()
 
         self.is_model_loaded = True
+        self.active_request_key = active_key
+        self.overwrite_cast_dtype = self.model.model.manual_cast_dtype
 
     def set_lora_list(self, lora):
         self.lora_list = lora
@@ -1184,25 +1208,6 @@ class RayWorker:
         self.vae_model = vae_model
         self._cached_vae_path = vae_path
 
-    def ray_minimax_h3_fun_control_apply(self, patch_name, vae_path, strength, start_percent, end_percent,
-                                       control_video=None, mask=None, source_video=None):
-        self.ray_vae_loader(vae_path)
-        model_patch = ModelPatchLoader().load_model_patch(patch_name)[0]
-        diffusion_model = self.model.get_model_object("diffusion_model")
-        expected = diffusion_model.blocks[0].adaln_proj.linear.in_features
-        adaln_in = model_patch.model.control_blocks[0].adaln_proj.linear.in_features
-        if adaln_in != expected:
-            raise ValueError(f"ControlNet '{patch_name}' has adaln width {adaln_in}; this H3 model requires {expected}.")
-        model_sampling = self.model.get_model_object("model_sampling")
-        patch = MiniMaxH3FunControlPatch(
-            model_patch, self.vae_model, control_video, mask, source_video, strength,
-            float(model_sampling.percent_to_sigma(start_percent)),
-            float(model_sampling.percent_to_sigma(end_percent)),
-        )
-        patched = self.model.clone()
-        patch.register(patched)
-        self.model = patched
-
     @patch_ray_tqdm
     def ray_vae_decode_partial(self, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8, job_rank=0, job_world_size=1):
         return ray_vae_decode_partial_impl(self, samples, tile_size, overlap, temporal_size, temporal_overlap, job_rank, job_world_size)
@@ -1218,6 +1223,7 @@ class RayWorker:
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
     @patch_enable_comfy_kitchen_fsdp
+    @_with_sampling_patches
     def custom_sampler_advanced(
         self,
         add_noise,
@@ -1227,6 +1233,8 @@ class RayWorker:
         sigmas,
         latent_image,
         grouped_output=False,
+        *,
+        sampling_patches=(),
     ):
         import comfy.model_management as comfy_model_management
         import comfy.nested_tensor as comfy_nested_tensor
@@ -1237,7 +1245,7 @@ class RayWorker:
         self._restore_sampling_vram()
 
         for cond_list in _get_guider_conditionings(guider_spec):
-            _restore_controlnet_refs(cond_list, self.cached_controlnet, self.vae_model)
+            _restore_controlnet_refs(cond_list, self._load_controlnet_ref)
             _remap_conditioning_devices(cond_list, None)
             _prepare_control_models(cond_list, None)
 
@@ -1318,6 +1326,7 @@ class RayWorker:
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
     @patch_enable_comfy_kitchen_fsdp
+    @_with_sampling_patches
     def custom_sampler(
         self,
         add_noise,
@@ -1329,6 +1338,8 @@ class RayWorker:
         sigmas,
         latent_image,
         grouped_output=False,
+        *,
+        sampling_patches=(),
     ):
         import comfy.model_management as comfy_model_management
         import comfy.sample as comfy_sample
@@ -1337,8 +1348,8 @@ class RayWorker:
         self._restore_sampling_vram()
 
         # Restore ControlNet refs from local cache (loaded by load_controlnet)
-        _restore_controlnet_refs(positive, self.cached_controlnet, self.vae_model)
-        _restore_controlnet_refs(negative, self.cached_controlnet, self.vae_model)
+        _restore_controlnet_refs(positive, self._load_controlnet_ref)
+        _restore_controlnet_refs(negative, self._load_controlnet_ref)
 
         latent = latent_image
         latent_image = latent["samples"]
@@ -1397,6 +1408,14 @@ class RayWorker:
         if grouped_output:
             return self._grouped_sampling_result(out)
         return out
+
+    def _load_controlnet_ref(self, control):
+        self.load_controlnet(control.controlnet_path)
+        vae = None
+        if control.needs_vae:
+            self.ray_vae_loader(control.vae_path)
+            vae = self.vae_model
+        return self.cached_controlnet[1], vae
 
     def load_controlnet(self, controlnet_path):
         """Load a ControlNet model from disk into the worker.
@@ -1460,6 +1479,7 @@ class RayWorker:
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
     @patch_enable_comfy_kitchen_fsdp
+    @_with_sampling_patches
     def common_ksampler(
         self,
         seed,
@@ -1476,6 +1496,8 @@ class RayWorker:
         last_step=None,
         force_full_denoise=False,
         grouped_output=False,
+        *,
+        sampling_patches=(),
     ):
         import comfy.model_management as comfy_model_management
         import comfy.sample as comfy_sample
@@ -1484,8 +1506,8 @@ class RayWorker:
         self._restore_sampling_vram()
 
         # Restore ControlNet refs from local cache (loaded by load_controlnet)
-        _restore_controlnet_refs(positive, self.cached_controlnet, self.vae_model)
-        _restore_controlnet_refs(negative, self.cached_controlnet, self.vae_model)
+        _restore_controlnet_refs(positive, self._load_controlnet_ref)
+        _restore_controlnet_refs(negative, self._load_controlnet_ref)
 
         latent_image = latent["samples"]
         latent_image = comfy_sample.fix_empty_latent_channels(self.model, latent_image)

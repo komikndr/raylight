@@ -33,6 +33,7 @@ from .distributed_worker.ray_worker import (
 from .distributed_worker.ray_worker_vae import combine_dist_vae_partials, combine_seedvr2_vae_partials
 from .distributed_worker.raylightworker_config_schema import LoadingOptions, ModelOptions, RaylightConfig, RayWorkerConfig, XFuserParallelConfig
 from . import progress
+from .comfy_extra_dist.ray_patch_decorator import prepare_ray_model, ray_model_loader
 from .comfy_extra_dist.nodes_custom_sampler import (
     _clear_ray_worker_vram_after_sampling,
     _free_host_models_if_contended,
@@ -616,7 +617,6 @@ class RayInitializer:
             ray.shutdown()
             _wait_for_ray_workers_to_exit()
             _cleanup_ray_temp()
-            RayControlNetLoader._current_controlnet_path = None
             original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
             restricted_cuda_visible_devices = runtime_env_base.get("env_vars", {}).get("CUDA_VISIBLE_DEVICES")
             if restricted_cuda_visible_devices is not None:
@@ -824,6 +824,7 @@ class RayUNETLoader:
         #the chance to respawn them instead of the graph reusing dead handles.
         return actor_generation()
 
+    @ray_model_loader
     def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, lora=None):
         ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
         _free_host_models_if_contended(ray_actors)
@@ -846,6 +847,8 @@ class RayUNETLoader:
         except:
             unet_path = folder_paths.get_full_path_or_raise("checkpoints", unet_name)
 
+        ray_actors = {**ray_actors, "model_request": ("unet", unet_path, model_options, lora)}
+
         loaded_futures = []
         patched_futures = []
 
@@ -860,18 +863,12 @@ class RayUNETLoader:
         ray.get(loaded_futures)
         loaded_futures = []
 
+        if all(ray.get([actor.check_model_loaded.remote(unet_path, model_options) for actor in gpu_actors])):
+            return (ray_actors,)
+
         if parallel_dict["is_fsdp"] is True:
             num_replicas = parallel_dict.get("dp_degree", 1)
             shard_size = parallel_dict.get("shard_size", len(gpu_actors))
-
-            # Reuse detection for FSDP non-quant: if the first worker already
-            # has this exact model + lora combo, all workers do (loaded together).
-            # Skip the expensive reload — handles MCP re-creating the same
-            # workflow and ComfyUI re-executing RayUNETLoader with identical inputs.
-            if parallel_dict["is_quant"] is False:
-                already_loaded = ray.get(gpu_actors[0].check_model_loaded.remote(unet_path, model_options))
-                if already_loaded:
-                    return (ray_actors,)
 
             if num_replicas <= 1:
                 # Single replica — all GPUs share one FSDP-sharded model
@@ -882,7 +879,7 @@ class RayUNETLoader:
 
                     for actor in gpu_actors:
                         if actor != worker0:
-                            loaded_futures.append(actor.set_meta_model.remote(meta_model))
+                            loaded_futures.append(actor.set_meta_model.remote(meta_model, unet_path, model_options))
 
                     ray.get(loaded_futures)
                     loaded_futures = []
@@ -911,7 +908,7 @@ class RayUNETLoader:
 
                         for actor in group_actors:
                             if actor != worker0:
-                                loaded_futures.append(actor.set_meta_model.remote(meta_model))
+                                loaded_futures.append(actor.set_meta_model.remote(meta_model, unet_path, model_options))
 
                         ray.get(loaded_futures)
                         loaded_futures = []
@@ -1065,6 +1062,7 @@ class XFuserKSamplerAdvanced:
         return_with_leftover_noise,
         denoise=1.0,
     ):
+        ray_actors = prepare_ray_model(ray_actors)
         # Clean VRAM for preparation to load model
         gc.collect()
         comfy.model_management.unload_all_models()
@@ -1093,6 +1091,7 @@ class XFuserKSamplerAdvanced:
                 start_step=start_at_step,
                 last_step=end_at_step,
                 force_full_denoise=force_full_denoise,
+                sampling_patches=ray_actors.get("sampling_patches", ()),
             )
             for actor in gpu_actors
         ]
@@ -1175,6 +1174,7 @@ class UnifiedParallelSampler:
         denoise=1.0,
     ):
         ray_actors = ray_actors[0]
+        ray_actors = prepare_ray_model(ray_actors)
         add_noise = add_noise[0]
         steps = steps[0]
         cfg = cfg[0]
@@ -1221,6 +1221,7 @@ class UnifiedParallelSampler:
                 last_step=end_at_step,
                 force_full_denoise=force_full_denoise,
                 grouped_output=True,
+                sampling_patches=ray_actors.get("sampling_patches", ()),
             )
             for actor, group_info in zip(gpu_actors, group_infos)
         ]
@@ -1299,6 +1300,7 @@ class DPKSamplerAdvanced:
         denoise=1.0,
     ):
         ray_actors = ray_actors[0]
+        ray_actors = prepare_ray_model(ray_actors)
         add_noise = add_noise[0]
         steps = steps[0]
         cfg = cfg[0]
@@ -1363,6 +1365,7 @@ class DPKSamplerAdvanced:
                 start_step=start_at_step,
                 last_step=end_at_step,
                 force_full_denoise=force_full_denoise,
+                sampling_patches=ray_actors.get("sampling_patches", ()),
             )
             for i, actor in enumerate(gpu_actors)
         ]
@@ -1409,7 +1412,6 @@ class RayKill:
         if kill_mode == "Kill Entire Cluster":
             ray.shutdown()
             _cleanup_ray_temp()
-            RayControlNetLoader._current_controlnet_path = None
 
         return ()
 
@@ -1463,12 +1465,9 @@ class RayControlNetLoader:
     worker's GPU from disk, avoiding Ray serialization of multi-GB weights.
     Returns a lightweight reference that RayControlNetApply uses.
 
-    Only one ControlNet model per workflow is supported. To apply the same
-    model with different images/strengths, use multiple RayControlNetApply
-    nodes connected to a single RayControlNetLoader.
+    Conditioning retains the selected model path so cached branches restore
+    the correct ControlNet and VAE before sampling.
     """
-
-    _current_controlnet_path = None
 
     @classmethod
     def INPUT_TYPES(s):
@@ -1486,16 +1485,6 @@ class RayControlNetLoader:
 
     def load_controlnet(self, ray_actors, control_net_name):
         controlnet_path = folder_paths.get_full_path_or_raise("controlnet", control_net_name)
-
-        if (RayControlNetLoader._current_controlnet_path is not None
-                and RayControlNetLoader._current_controlnet_path != controlnet_path):
-            raise RuntimeError(
-                f"Only one ControlNet model per workflow is supported. "
-                f"Already loaded '{RayControlNetLoader._current_controlnet_path}', "
-                f"attempted '{controlnet_path}'. Use multiple RayControlNetApply nodes "
-                f"to apply the same model with different images."
-            )
-        RayControlNetLoader._current_controlnet_path = controlnet_path
 
         # Validate the ControlNet loads in the main process first
         import comfy.controlnet as comfy_controlnet
@@ -1575,6 +1564,8 @@ class RayControlNetApply:
                         cond_hint_original=control_hint,
                         extra_concat_orig=extra_concat,
                         needs_vae=(ray_vae is not None),
+                        controlnet_path=ray_control_net,
+                        vae_path=ray_vae,
                     )
                     if prev_cnet is not None:
                         c_net.set_previous_controlnet(prev_cnet)

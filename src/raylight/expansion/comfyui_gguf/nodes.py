@@ -17,6 +17,7 @@ from .ops import move_patch_to_device
 from .dequant import is_quantized, is_torch_compatible
 
 from raylight.distributed_worker.ray_worker import ensure_fresh_actors
+from raylight.comfy_extra_dist.ray_patch_decorator import ray_model_loader
 
 
 def update_folder_names_and_paths(key, targets=[]):
@@ -194,6 +195,7 @@ class RayGGUFLoader:
 
     CATEGORY = "Raylight"
 
+    @ray_model_loader
     def load_ray_unet(
         self,
         ray_actors_init,
@@ -205,53 +207,36 @@ class RayGGUFLoader:
         ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
 
         unet_path = folder_paths.get_full_path_or_raise("unet", unet_name)
+        model_options = {
+            "loader": "gguf", "dequant_dtype": dequant_dtype, "patch_dtype": patch_dtype,
+            "use_mmap": parallel_dict.get("use_mmap", True),
+        }
+        ray_actors = {**ray_actors, "model_request": ("gguf", unet_path, model_options, lora)}
 
         loaded_futures = []
         patched_futures = []
 
         for actor in gpu_actors:
             loaded_futures.append(actor.set_lora_list.remote(lora))
+            loaded_futures.append(actor.set_quantized.remote(False))
         ray.get(loaded_futures)
         loaded_futures = []
 
         if parallel_dict["is_fsdp"] is True:
             # GGUF FSDP stays disabled for now.
             raise RuntimeError("FSDP on GGUF is not supported")
-            worker0 = ray.get_actor("RayWorker:0")
-            ray.get(
-                worker0.load_gguf_unet.remote(
+        if all(ray.get([actor.check_model_loaded.remote(unet_path, model_options) for actor in gpu_actors])):
+            return (ray_actors,)
+        for actor in gpu_actors:
+            loaded_futures.append(
+                actor.load_gguf_unet.remote(
                     unet_path,
                     dequant_dtype=dequant_dtype,
                     patch_dtype=patch_dtype,
                     use_mmap=parallel_dict.get("use_mmap", True),
                 )
             )
-            meta_model = ray.get(worker0.get_meta_model.remote())
-
-            for actor in gpu_actors:
-                if actor != worker0:
-                    loaded_futures.append(actor.set_meta_model.remote(meta_model))
-
-            ray.get(loaded_futures)
-            loaded_futures = []
-
-            for actor in gpu_actors:
-                loaded_futures.append(actor.set_state_dict.remote())
-
-            ray.get(loaded_futures)
-            loaded_futures = []
-        else:
-            for actor in gpu_actors:
-                loaded_futures.append(
-                    actor.load_gguf_unet.remote(
-                        unet_path,
-                        dequant_dtype=dequant_dtype,
-                        patch_dtype=patch_dtype,
-                        use_mmap=parallel_dict.get("use_mmap", True),
-                    )
-                )
-            ray.get(loaded_futures)
-            loaded_futures = []
+        ray.get(loaded_futures)
 
         for actor in gpu_actors:
             patched_futures.append(actor.patch_model_options.remote())

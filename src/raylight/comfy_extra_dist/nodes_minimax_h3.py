@@ -1,8 +1,10 @@
 import folder_paths
-import ray
 
 from .ray_patch_decorator import ray_patch
 from comfy.patcher_extension import WrappersMP
+from comfy_extras.nodes_model_patch import ModelPatchLoader
+from comfy_extras.nodes_minimax_h3 import MiniMaxH3FunControlPatch
+from raylight.distributed_worker.ray_worker_vae import load_vae_model
 from raylight.distributed_worker.raylightworker_config_schema import MiniMaxOptions, ModelOptions
 from raylight.distributed_modules.inner_attention import (
     H3_SLA_PREPARED_KEY, INNER_ATTENTION_KEY, MiniMaxH3SLA, clear_inner_attention, create_inner_attention, set_inner_attention,
@@ -154,19 +156,28 @@ class RayMiniMaxH3FunControlNetApply:
     FUNCTION = "apply"
     CATEGORY = "Raylight/extra"
 
-    def apply(self, ray_actors, ray_vae, model_patch_name, strength, start_percent, end_percent,
+    @ray_patch
+    def apply(self, model, ray_vae, model_patch_name, strength, start_percent, end_percent,
               control_video=None, mask=None, source_video=None):
         if strength == 0 or (control_video is None and mask is None):
-            return (ray_actors,)
-        folder_paths.get_full_path_or_raise("model_patches", model_patch_name)
+            return model
         control = control_video[..., :3].movedim(-1, 1) if control_video is not None else None
         source = source_video[..., :3].movedim(-1, 1) if mask is not None and source_video is not None else None
-        ray.get([
-            actor.ray_minimax_h3_fun_control_apply.remote(
-                model_patch_name, ray_vae, strength, start_percent, end_percent, control, mask, source)
-            for actor in ray_actors["workers"]
-        ])
-        return (ray_actors,)
+        vae = load_vae_model(ray_vae)
+        model_patch = ModelPatchLoader().load_model_patch(model_patch_name)[0]
+        expected = model.get_model_object("diffusion_model").blocks[0].adaln_proj.linear.in_features
+        adaln_in = model_patch.model.control_blocks[0].adaln_proj.linear.in_features
+        if adaln_in != expected:
+            raise ValueError(f"ControlNet '{model_patch_name}' has adaln width {adaln_in}; this H3 model requires {expected}.")
+        model_sampling = model.get_model_object("model_sampling")
+        patch = MiniMaxH3FunControlPatch(
+            model_patch, vae, control, mask, source, strength,
+            float(model_sampling.percent_to_sigma(start_percent)),
+            float(model_sampling.percent_to_sigma(end_percent)),
+        )
+        patched = model.clone()
+        patch.register(patched)
+        return patched
 
 
 NODE_CLASS_MAPPINGS = {

@@ -57,6 +57,13 @@ concurrency, and collective timeout. MiniMax precision/chunking comes from
 **RayWorker Minimax Option**. **COMFY_KITCHEN_INT8** is selected through the existing
 attention backend input and currently requires `ring_degree=1`.
 
+Model patches travel with the graph's actor bundle and are applied to a temporary
+model patcher for each sampler or model-dependent getter call. Cached branches can
+change, bypass, or revert patches without retaining another branch's settings or
+restarting Ray Init. Consumers reselect the requested model, loader options, and
+LoRAs before use; matching workers reuse their loaded model. ControlNet conditioning
+also retains its ControlNet and VAE paths for worker-side restoration.
+
 ### GPU Requirements
 
 ```mermaid

@@ -10,13 +10,15 @@ class _RayControlNetRef:
     """
 
     def __init__(self, strength, timestep_percent_range, cond_hint_original,
-                 extra_concat_orig=None, previous_controlnet=None, needs_vae=False):
+                 extra_concat_orig=None, previous_controlnet=None, needs_vae=False, *, controlnet_path, vae_path=None):
         self.strength = strength
         self.timestep_percent_range = timestep_percent_range
         self.cond_hint_original = cond_hint_original
         self.extra_concat_orig = list(extra_concat_orig or [])
         self.previous_controlnet = previous_controlnet
         self.needs_vae = needs_vae
+        self.controlnet_path = controlnet_path
+        self.vae_path = vae_path
 
         # ControlBase interface stubs needed by ComfyUI internals
         self.cond_hint = None
@@ -47,6 +49,8 @@ class _RayControlNetRef:
             self.extra_concat_orig,
             self.previous_controlnet,
             self.needs_vae,
+            controlnet_path=self.controlnet_path,
+            vae_path=self.vae_path,
         )
         return c
 
@@ -69,10 +73,11 @@ class _RayControlNetRef:
         return 0
 
 
-def _materialize_controlnet_ref(control, cnet_template, worker_vae=None):
+def _materialize_controlnet_ref(control, load_controlnet_ref):
     if not isinstance(control, _RayControlNetRef):
         return control
 
+    cnet_template, worker_vae = load_controlnet_ref(control)
     cnet = cnet_template.copy()
     cnet.cond_hint_original = control.cond_hint_original
     cnet.strength = control.strength
@@ -83,17 +88,16 @@ def _materialize_controlnet_ref(control, cnet_template, worker_vae=None):
         cnet.vae = worker_vae
     if control.previous_controlnet is not None:
         cnet.set_previous_controlnet(
-            _materialize_controlnet_ref(control.previous_controlnet, cnet_template, worker_vae)
+            _materialize_controlnet_ref(control.previous_controlnet, load_controlnet_ref)
         )
     return cnet
 
 
-def _restore_controlnet_refs(cond_list, cached_controlnet, worker_vae=None):
+def _restore_controlnet_refs(cond_list, load_controlnet_ref):
     """Replace _RayControlNetRef placeholders with real ControlNet objects."""
-    if cond_list is None or cached_controlnet is None:
+    if cond_list is None:
         return
 
-    _, cnet_template = cached_controlnet
     for item in cond_list:
         if isinstance(item, (list, tuple)) and len(item) >= 2:
             d = item[1]
@@ -108,7 +112,7 @@ def _restore_controlnet_refs(cond_list, cached_controlnet, worker_vae=None):
         if not isinstance(control, _RayControlNetRef):
             continue
 
-        d["control"] = _materialize_controlnet_ref(control, cnet_template, worker_vae)
+        d["control"] = _materialize_controlnet_ref(control, load_controlnet_ref)
 
 
 def _remap_conditioning_devices(positive, negative):

@@ -1,9 +1,9 @@
 import math
+from functools import partial
 
 import comfy.model_sampling
 import comfy.samplers
 import node_helpers
-import ray
 import torchaudio
 
 from xfuser.core.distributed import get_classifier_free_guidance_world_size
@@ -162,18 +162,9 @@ class RayLTXVReferenceAudio:
         positive = node_helpers.conditioning_set_values(positive, {"ref_audio": ref_audio})
         negative = node_helpers.conditioning_set_values(negative, {"ref_audio": ref_audio})
 
-        gpu_workers = ray_actors["workers"]
-        futures = [
-            actor.model_function_runner.remote(
-                _patch_ltx_reference_audio_guidance,
-                identity_guidance_scale,
-                start_percent,
-                end_percent,
-            )
-            for actor in gpu_workers
-        ]
-        ray.get(futures)
-
+        patch = partial(_patch_ltx_reference_audio_guidance, identity_guidance_scale=identity_guidance_scale,
+                        start_percent=start_percent, end_percent=end_percent)
+        ray_actors = {**ray_actors, "sampling_patches": (*ray_actors.get("sampling_patches", ()), patch)}
         return (ray_actors, positive, negative)
 
 
