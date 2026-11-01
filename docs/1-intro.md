@@ -29,31 +29,33 @@ graph TB
     style D fill:#e8f5e9
 ```
 
-**Note**: PipeFusion code exists in the WAN implementation but is not used in Raylight.
-
 ## Quick Start
 
 ### Basic Configuration
 
 ```python
-parallel_dict = {
-    # FSDP (optional)
-    "is_fsdp": False,
-    "fsdp_cpu_offload": False,
+from raylight.distributed_worker.raylightworker_config_schema import (
+    RaylightConfig, RayWorkerConfig, XFuserParallelConfig,
+)
 
-    # USP/CFG (optional)
-    "is_xdit": True,
-    "ulysses_degree": 4,
-    "ring_degree": 1,
-    "cfg_degree": 2,
-
-    # PipeFusion (optional, currently soft disabled)
-    "pipefusion_enabled": False,
-
-    # Other
-    "use_mmap": True,
-}
+config = RaylightConfig(worker=RayWorkerConfig(
+    parallel=XFuserParallelConfig(
+        enabled=True, ulysses_degree=4, ring_degree=1, cfg_degree=2,
+    ),
+    fsdp_enabled=False,
+    use_mmap=True,
+))
 ```
+
+Ray Init builds an immutable configuration and passes its worker section to actors.
+Model-family settings live under `config.worker.model_options`; loaded-model facts
+and resolved ranks remain worker state. The legacy parallel dictionary returned to
+sampler nodes is a derived view, not a second configuration store.
+
+Advanced Ray Init exposes worker VRAM headroom/reserve, pinned memory, quantized-load
+concurrency, and collective timeout. MiniMax precision/chunking comes from
+**RayWorker Minimax Option**. **COMFY_KITCHEN_INT8** is selected through the existing
+attention backend input and currently requires `ring_degree=1`.
 
 ### GPU Requirements
 
@@ -97,7 +99,8 @@ custom_nodes/raylight/
 │   │   ├── cfg.py              # CFG registry
 │   │   └── attention.py        # xfuser attention factory
 │   ├── distributed_worker/
-│   │   └── ray_worker.py       # Ray worker implementation
+│   │   ├── ray_worker.py       # Ray worker implementation
+│   │   └── raylightworker_config_schema.py # Immutable configuration
 │   └── diffusion_models/
 │       ├── utils.py            # Padding utilities
 │       ├── flux/               # Flux model parallelism

@@ -173,7 +173,7 @@ def test_minimax_usp_attention_matches_core_kernels():
 
 
 def test_minimax_lora_mlp_uses_module_forward():
-    function = _function(RAYLIGHT, "usp_mlp_forward")
+    function = _function(RAYLIGHT, "_mlp_branch")
     calls = {_call_name(node) for node in ast.walk(function) if isinstance(node, ast.Call)}
 
     assert "self.fc1" in calls
@@ -225,10 +225,12 @@ def test_minimax_control_patch_uses_full_sequence_and_returns_local_shard():
         "get_sp_group": lambda: group,
         "get_sequence_parallel_world_size": lambda: 2,
         "get_sequence_parallel_rank": lambda: 1,
+        "MiniMaxH3FunControlBlockPatch": SimpleNamespace,
     }
     exec(compile(module, str(RAYLIGHT), "exec"), scope)
 
     control = SimpleNamespace(
+        active=True,
         before_block=lambda index, args: control_inputs.append((index, args["img"].clone(), args["layout"])),
         after_block=lambda index, args, out: (control_outputs.append((index, out["img"].clone())) or {"img": out["img"] + 3}),
     )
@@ -236,7 +238,7 @@ def test_minimax_control_patch_uses_full_sequence_and_returns_local_shard():
     layout = object()
     local_input = torch.tensor([[6., 7.], [8., 9.], [0., 0.]])
     args = {"img": local_input, "layout": layout}
-    result = scope["_run_control_patch"](patch, args, lambda data: {"img": data["img"] + 10}, 5)
+    result = scope["_run_control_patch"](patch, args, lambda data: {"img": data["img"] + 10}, 5, None, [])
 
     assert group.calls == 2
     assert control_inputs[0][0] == control_outputs[0][0] == 0

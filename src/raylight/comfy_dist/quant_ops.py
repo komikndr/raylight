@@ -35,10 +35,9 @@ def patch_temp_fix_ck_ops(func):
     def wrapper(*args, **kwargs):
         global _PATCH_INSTALL_LOGGED
         self = args[0]
-        parallel_dict = getattr(self, "parallel_dict", {}) or {}
-        overwrite_cast_dtype = getattr(self, "overwrite_cast_dtype", None)
-        layouts = parallel_dict.get("comfy_kitchen_layouts", ("fp8", "nvfp4", "int8", "mxfp8"))
-        install_ck_patches = bool(parallel_dict.get("is_quant", False))
+        overwrite_cast_dtype = self.overwrite_cast_dtype
+        layouts = ("fp8", "nvfp4", "int8", "mxfp8")
+        install_ck_patches = self.is_quant
         ck_patched = False
         restore_sitepkg_ck_patches = None
         original_fp8 = None
@@ -53,7 +52,7 @@ def patch_temp_fix_ck_ops(func):
                 if not _PATCH_INSTALL_LOGGED:
                     print(
                         "[Raylight][comfy_kitchen] installing quant patches "
-                        f"layouts={layouts} is_fsdp={parallel_dict.get('is_fsdp', False)} is_quant={parallel_dict.get('is_quant', False)}"
+                        f"layouts={layouts} is_fsdp={self.config.fsdp_enabled} is_quant={self.is_quant}"
                     )
                     _PATCH_INSTALL_LOGGED = True
 

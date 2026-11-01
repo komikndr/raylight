@@ -115,8 +115,8 @@ def patch_enable_comfy_kitchen_fsdp(fn):
     @wraps(fn)
     def wrapper(self, *args, **kwargs):
         patched = False
-        layouts = self.parallel_dict.get("comfy_kitchen_layouts", ("fp8", "nvfp4", "int8", "mxfp8"))
-        if self.parallel_dict.get("is_fsdp", False):
+        layouts = ("fp8", "nvfp4", "int8", "mxfp8")
+        if self.config.fsdp_enabled:
             install_sitepkg_ck_patches(layouts=layouts)
             patched = True
         try:

@@ -1,5 +1,9 @@
+import folder_paths
+import ray
+
 from .ray_patch_decorator import ray_patch
 from comfy.patcher_extension import WrappersMP
+from raylight.distributed_worker.raylightworker_config_schema import MiniMaxOptions, ModelOptions
 from raylight.distributed_modules.inner_attention import (
     H3_SLA_PREPARED_KEY, INNER_ATTENTION_KEY, MiniMaxH3SLA, clear_inner_attention, create_inner_attention, set_inner_attention,
 )
@@ -9,6 +13,29 @@ try:
 except ImportError as import_error:
     MiniMaxH3SigmaShift = None
     _MINIMAX_H3_IMPORT_ERROR = import_error
+
+
+class RayWorkerMinimaxOptions:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "attention_fp16": ("BOOLEAN", {"default": False, "tooltip": "Use fp16 attention projections with fp32 output rescaling."}),
+            "mlp_fp16": ("BOOLEAN", {"default": False, "tooltip": "Use fp16 MLP projections with overflow-safe rescaling."}),
+            "fp32_residual": ("BOOLEAN", {"default": False, "tooltip": "Keep residual accumulation in fp32. Together with fp16 MLP, allows H3 fp16 model loading."}),
+            "mlp_chunk_tokens": ("INT", {"default": 0, "min": 0, "max": 65536, "step": 512,
+                                       "tooltip": "Token chunk size for the H3 MLP. 0 disables chunking. Chunking can change quantized seed results."}),
+        }}
+
+    RETURN_TYPES = ("RAY_MODEL_OPTIONS",)
+    RETURN_NAMES = ("worker_options",)
+    FUNCTION = "build"
+    CATEGORY = "Raylight"
+
+    def build(self, attention_fp16, mlp_fp16, fp32_residual, mlp_chunk_tokens):
+        return (ModelOptions(minimax=MiniMaxOptions(
+            attention_fp16=attention_fp16, mlp_fp16=mlp_fp16,
+            fp32_residual=fp32_residual, mlp_chunk_tokens=mlp_chunk_tokens,
+        )),)
 
 
 class RayMiniMaxH3SigmaShift:
@@ -103,12 +130,55 @@ class RayMiniMaxH3SLA:
         return model
 
 
+class RayMiniMaxH3FunControlNetApply:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "ray_vae": ("RAY_VAE",),
+                "model_patch_name": (folder_paths.get_filename_list("model_patches"),),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+            },
+            "optional": {
+                "control_video": ("IMAGE",),
+                "mask": ("MASK", {"tooltip": "1 marks the regions to regenerate."}),
+                "source_video": ("IMAGE", {"tooltip": "Video behind the mask; only read when a mask is given."}),
+            },
+        }
+
+    RETURN_TYPES = ("RAY_ACTORS",)
+    RETURN_NAMES = ("ray_actors",)
+    FUNCTION = "apply"
+    CATEGORY = "Raylight/extra"
+
+    def apply(self, ray_actors, ray_vae, model_patch_name, strength, start_percent, end_percent,
+              control_video=None, mask=None, source_video=None):
+        if strength == 0 or (control_video is None and mask is None):
+            return (ray_actors,)
+        folder_paths.get_full_path_or_raise("model_patches", model_patch_name)
+        control = control_video[..., :3].movedim(-1, 1) if control_video is not None else None
+        source = source_video[..., :3].movedim(-1, 1) if mask is not None and source_video is not None else None
+        ray.get([
+            actor.ray_minimax_h3_fun_control_apply.remote(
+                model_patch_name, ray_vae, strength, start_percent, end_percent, control, mask, source)
+            for actor in ray_actors["workers"]
+        ])
+        return (ray_actors,)
+
+
 NODE_CLASS_MAPPINGS = {
+    "RayWorkerMinimaxOptions": RayWorkerMinimaxOptions,
     "RayMiniMaxH3SigmaShift": RayMiniMaxH3SigmaShift,
     "RayMiniMaxH3SLA": RayMiniMaxH3SLA,
+    "RayMiniMaxH3FunControlNetApply": RayMiniMaxH3FunControlNetApply,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "RayWorkerMinimaxOptions": "RayWorker Minimax Option",
     "RayMiniMaxH3SigmaShift": "MiniMax H3 Sigma Shift (Ray)",
     "RayMiniMaxH3SLA": "MiniMax H3 SLA Attention (Ray)",
+    "RayMiniMaxH3FunControlNetApply": "Apply MiniMax H3 Fun ControlNet (Ray)",
 }

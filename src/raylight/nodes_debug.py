@@ -8,6 +8,8 @@ import torch
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
 from .distributed_worker.ray_worker import make_ray_actor_fn, ensure_fresh_actors, ray_nccl_tester
+from .distributed_worker.raylightworker_config_schema import RaylightConfig, RayWorkerConfig, XFuserParallelConfig
+from yunchang.kernels import AttnType
 
 
 class RayInitializerDebug:
@@ -25,17 +27,8 @@ class RayInitializerDebug:
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
                 "XFuser_attention": (
-                    [
-                        "TORCH",
-                        "FLASH_ATTN",
-                        "FLASH_ATTN_3",
-                        "SAGE_AUTO_DETECT",
-                        "SAGE_FP16_TRITON",
-                        "SAGE_FP16_CUDA",
-                        "SAGE_FP8_CUDA",
-                        "SAGE_FP8_SM90",
-                    ],
-                    {"default": "TORCH"},
+                    [member.name for member in AttnType] + ["COMFY_KITCHEN_INT8"],
+                    {"default": "TORCH_FLASH"},
                 ),
             }
         }
@@ -69,7 +62,6 @@ class RayInitializerDebug:
 
         # HF Tokenizer warning when forking
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        self.parallel_dict = dict()
 
         world_size = GPU
         max_world_size = torch.cuda.device_count()
@@ -82,32 +74,17 @@ class RayInitializerDebug:
         if cfg_degree > 2:
             raise ValueError("CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2")
 
-        self.parallel_dict["is_xdit"] = False
-        self.parallel_dict["is_fsdp"] = False
-        self.parallel_dict["sync_ulysses"] = False
-        self.parallel_dict["global_world_size"] = world_size
-        self.parallel_dict["pp_degree"] = 1
-        self.parallel_dict["pipefusion_enabled"] = False
-        self.parallel_dict["num_pipeline_patch"] = 1
-        self.parallel_dict["warmup_steps"] = 0
-        self.parallel_dict["pipefusion_stage_splits"] = None
-        self.parallel_dict["pipefusion_debug"] = False
+        parallel = XFuserParallelConfig()
 
         if ulysses_degree > 0 or ring_degree > 0 or cfg_degree > 0:
             if ulysses_degree * ring_degree * cfg_degree == 0:
                 raise ValueError(f"""ERROR, parallel product of {ulysses_degree=} mul {ring_degree=} mul {cfg_degree=} is 0.
                  Please make sure to set any parallel degree to be greater than 0.
                  Or switch into DPKSampler and set 0 to all parallel degree""")
-            self.parallel_dict["attention"] = XFuser_attention
-            self.parallel_dict["is_xdit"] = True
-            self.parallel_dict["ulysses_degree"] = ulysses_degree
-            self.parallel_dict["ring_degree"] = ring_degree
-            self.parallel_dict["cfg_degree"] = cfg_degree
-            self.parallel_dict["sync_ulysses"] = sync_ulysses
-
-        if FSDP:
-            self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
-            self.parallel_dict["is_fsdp"] = True
+            parallel = XFuserParallelConfig(
+                enabled=True, ulysses_degree=ulysses_degree, ring_degree=ring_degree,
+                cfg_degree=cfg_degree, data_parallel_degree=world_size // (ulysses_degree * ring_degree * cfg_degree),
+            )
 
         try:
             # Shut down so if comfy user try another workflow it will not cause error
@@ -129,7 +106,11 @@ class RayInitializerDebug:
             raise RuntimeError(f"Ray connection failed: {e}")
 
         ray_nccl_tester(world_size)
-        ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
+        config = RaylightConfig(worker=RayWorkerConfig(
+            parallel=parallel, attention_backend=XFuser_attention, sync_ulysses=sync_ulysses,
+            fsdp_enabled=FSDP, fsdp_cpu_offload=FSDP_CPU_OFFLOAD,
+        ))
+        ray_actor_fn = make_ray_actor_fn(world_size, config)
         ray_actors = ray_actor_fn()
         return ([ray_actors, ray_actor_fn],)
 

@@ -17,27 +17,17 @@ from torch.distributed.fsdp import FSDPModule
 import ray
 
 import comfy.patcher_extension as pe
+from comfy import model_base, model_management
+from comfy_extras.nodes_model_patch import ModelPatchLoader
+from comfy_extras.nodes_minimax_h3 import MiniMaxH3FunControlPatch
 
-from raylight.distributed_modules.pipefusion import (
-    PipeFusionInjectRegistry,
-    pipefusion_diffusion_model_wrapper,
-    pipefusion_outer_sample_wrapper,
-    pipefusion_predict_noise_wrapper,
-)
 from raylight.distributed_modules.usp import USPInjectRegistry
+from raylight.diffusion_models.minimax.fp16_support import minimax_precision_loading
 from raylight.distributed_modules.cfg import CFGParallelInjectRegistry
-from raylight.distributed_worker.pipefusion_schema import (
-    PipeFusionConfig,
-    build_stage_plan,
-)
-from raylight.distributed_worker.pipefusion_state import (
-    PIPEFUSION_RUNTIME_ATTACHMENT,
-    PIPEFUSION_WRAPPER_KEY,
-    PipeFusionRuntime,
-)
+from raylight.distributed_worker.raylightworker_config_schema import RayWorkerConfig
 from raylight.distributed_worker.parallel_group_manager import (
+    collective_group_timeout,
     initialize_xfuser_parallel,
-    requires_xfuser_parallel,
 )
 from raylight.distributed_worker.ray_worker_controlnet import (
     _prepare_control_models,
@@ -64,9 +54,6 @@ _WORKER_AIMDO_INIT_ATTEMPTED = False
 
 # If ray actor function being called from outside, ray.get([task in actor task]) will become sync between rank
 # If called from ray actor within. dist.barrier() become the sync.
-
-# PIPEFUSION STUFF IS ONLY TESTING, IT IS BREAKING DOWN ALLLL THE TIME
-
 
 # Comfy cli args, does not get pass through into ray actor
 def patch_enable_comfy_kitchen_fsdp(fn):
@@ -550,7 +537,7 @@ def report_progress(fn):
 
 
 class RayWorker:
-    def __init__(self, local_rank, device_id, parallel_dict):
+    def __init__(self, local_rank, device_id, config: RayWorkerConfig, world_size, group_id=0):
         worker_cli_args = _apply_worker_comfy_cli_args_from_env()
         self.model = None
         self.vae_model = None
@@ -558,28 +545,26 @@ class RayWorker:
         self.state_dict = None
         self.cached_controlnet = None  # (path, controlnet_object) cache
         self.lora_list = None
-        self.parallel_dict = parallel_dict
+        self.config = config
+        self.is_quant = False
         self.overwrite_cast_dtype = None
         self.cached_base_model = None
         self.cached_base_key = None
         self.active_request_key = None
 
         self.local_rank = local_rank
-        self.global_world_size = self.parallel_dict["global_world_size"]
-        self.shard_size = self.parallel_dict["shard_size"]
-        self.group_id = self.parallel_dict.get("group_id", 0)
+        self.global_world_size = world_size
+        self.shard_size = world_size // config.parallel.data_parallel_degree if config.fsdp_enabled else world_size
+        self.group_id = group_id
 
         self.device_id = device_id
-        self.parallel_dict = parallel_dict
         self.device = torch.device(f"cuda:{self.device_id}")
         self.device_mesh = None
         self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
-        self.pipefusion_config = PipeFusionConfig.from_parallel_dict(self.parallel_dict)
-        self.pipefusion_stage = None
         self.xfuser_parallel = None
 
         self.is_model_loaded = False
-        self.is_cpu_offload = self.parallel_dict.get("fsdp_cpu_offload", False)
+        self.is_cpu_offload = config.fsdp_cpu_offload
 
         os.environ["XDIT_LOGGING_LEVEL"] = "WARN"
         os.environ["NCCL_DEBUG"] = "WARN"
@@ -592,10 +577,10 @@ class RayWorker:
 
         patch_base_getattr()
 
-        if self.parallel_dict.get("use_group_process_group") and self.parallel_dict.get("shard_size") is not None:
-            nccl_world_size = self.parallel_dict["shard_size"]
+        if config.fsdp_enabled and config.parallel.data_parallel_degree > 1:
+            nccl_world_size = self.shard_size
         else:
-            nccl_world_size = self.parallel_dict["global_world_size"]
+            nccl_world_size = world_size
         nccl_rank = local_rank
 
         # Each group gets its own port for NCCL isolation
@@ -607,35 +592,37 @@ class RayWorker:
             "nccl",
             rank=nccl_rank,
             world_size=nccl_world_size,
-            timeout=timedelta(minutes=1),
+            timeout=timedelta(minutes=config.collective_timeout_minutes),
             init_method=f"tcp://{master_addr}:{group_port}",
         )
 
-        if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
-            self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(nccl_world_size,))
+        if config.parallel.enabled or config.fsdp_enabled:
+            with collective_group_timeout(timedelta(minutes=config.collective_timeout_minutes)):
+                self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(nccl_world_size,))
 
         # Just experimenting, user can't trigger this
-        elif not self.parallel_dict.get("pipefusion_enabled"):
+        else:
             print(f"Running Ray in normal seperate sampler with: {self.global_world_size} number of workers")
 
-        if requires_xfuser_parallel(self.parallel_dict):
+        if config.parallel.enabled or config.model_options.minimax.enabled:
             self.xfuser_parallel = initialize_xfuser_parallel(
                 local_rank=self.local_rank,
                 world_size=nccl_world_size,
-                parallel_dict=self.parallel_dict,
+                config=config,
             )
-            if self.parallel_dict["is_xdit"]:
+            if config.parallel.enabled:
                 print("XDiT is enable")
-            if self.parallel_dict.get("pipefusion_enabled"):
-                print("PipeFusion xFuser topology is enable")
             print(
                 "Parallel Degree: "
                 f"Ulysses={self.xfuser_parallel.config.ulysses_degree}, "
                 f"Ring={self.xfuser_parallel.config.ring_degree}, "
                 f"CFG={self.xfuser_parallel.config.cfg_degree}, "
-                f"PP={self.xfuser_parallel.config.pp_degree}, "
                 f"DP={self.xfuser_parallel.config.data_parallel_degree}"
             )
+
+    @property
+    def parallel_dict(self):
+        return self.config.as_parallel_dict(self.global_world_size, self.group_id, self.is_quant)
 
     def get_meta_model(self):
         base_model = getattr(self.model, "model", self.model)
@@ -695,6 +682,7 @@ class RayWorker:
 
     def _free_cached_aux_models(self):
         """Free cached ControlNet and VAE GPU memory."""
+        model_management.reset_cast_buffers()
         if self.cached_controlnet is not None:
             _, old_cnet = self.cached_controlnet
             old_model = getattr(old_cnet, "control_model", None)
@@ -722,6 +710,7 @@ class RayWorker:
             comfy_model_management.unload_all_models()
         except Exception as e:
             print(f"[Rank {self.local_rank}] unload_all_models failed in clear_sampling_vram: {e}")
+        model_management.reset_cast_buffers()
 
         if self.model is not None and hasattr(self.model, "offload_fsdp_vram"):
             try:
@@ -867,7 +856,7 @@ class RayWorker:
 
     def set_state_dict(self):
         if self.state_dict is None:
-            if self.parallel_dict.get("is_fsdp") is True and self.parallel_dict.get("is_quant") is False:
+            if self.config.fsdp_enabled and not self.is_quant:
                 self.model.set_fsdp_state_dict({})
                 return
             raise ValueError("Worker state_dict is None before set_state_dict")
@@ -882,9 +871,9 @@ class RayWorker:
 
     def get_exec_group_info(self):
         if self.xfuser_parallel is None:
-            if self.parallel_dict.get("use_group_process_group"):
+            if self.config.fsdp_enabled and self.config.parallel.data_parallel_degree > 1:
                 dp_rank = self.group_id
-                dp_degree = self.parallel_dict.get("dp_degree", 1)
+                dp_degree = self.config.parallel.data_parallel_degree
             else:
                 dp_rank = self.local_rank
                 dp_degree = self.global_world_size
@@ -897,8 +886,15 @@ class RayWorker:
             }
 
         is_group_leader = (
-            self.xfuser_parallel.sequence_rank == 0 and self.xfuser_parallel.pipeline_rank == 0 and self.xfuser_parallel.cfg_rank == 0
+            self.xfuser_parallel.sequence_rank == 0 and self.xfuser_parallel.cfg_rank == 0
         )
+        if self.config.fsdp_enabled and self.config.parallel.data_parallel_degree > 1:
+            return {
+                "global_rank": self.group_id * self.shard_size + self.local_rank,
+                "dp_rank": self.group_id,
+                "dp_degree": self.config.parallel.data_parallel_degree,
+                "is_group_leader": is_group_leader,
+            }
         return {
             "global_rank": self.xfuser_parallel.global_rank,
             "dp_rank": self.xfuser_parallel.data_parallel_rank,
@@ -916,9 +912,8 @@ class RayWorker:
             "result": result,
         }
 
-    def set_parallel_dict(self, parallel_dict):
-        self.parallel_dict = parallel_dict
-        self.pipefusion_config = PipeFusionConfig.from_parallel_dict(self.parallel_dict)
+    def set_quantized(self, is_quant):
+        self.is_quant = is_quant
 
     def model_function_runner(self, fn, *args, **kwargs):
         self.model = fn(self.model, *args, **kwargs)
@@ -939,85 +934,21 @@ class RayWorker:
             self.model.add_wrapper(pe.WrappersMP.DIFFUSION_MODEL, CFGParallelInjectRegistry.inject(self.model))
 
     def patch_usp(self):
-        self.model.add_callback(
+        self.model.set_attachments("raylight_model_options", self.config.model_options)
+        self.model.remove_callbacks_with_key(pe.CallbacksMP.ON_LOAD, "raylight_usp")
+        self.model.add_callback_with_key(
             pe.CallbacksMP.ON_LOAD,
+            "raylight_usp",
             USPInjectRegistry.inject,
         )
 
-    def patch_pipefusion(self):
-        if not self.pipefusion_config.enabled:
-            return
-        if self.parallel_dict.get("is_fsdp"):
-            raise ValueError("PipeFusion v1 cannot be enabled together with FSDP")
-        if self.xfuser_parallel is None:
-            raise RuntimeError("PipeFusion requires xFuser model parallel state to be initialized")
-        if self.xfuser_parallel.config.cfg_degree != 1:
-            raise NotImplementedError("PipeFusion currently ignores CFG parallel execution; keep cfg_degree at 1")
-        if self.xfuser_parallel.sequence_world_size != 1:
-            raise NotImplementedError(
-                "PipeFusion topology is now initialized through xFuser, but the Wan execution path does not yet combine PP with USP"
-            )
+    def patch_model_options(self):
+        if self.config.model_options.minimax.enabled and isinstance(self.model.model, model_base.MiniMaxH3):
+            self.patch_usp()
 
-        base_model = getattr(self.model, "model", self.model)
-        if not hasattr(base_model, "diffusion_model") or not hasattr(base_model.diffusion_model, "blocks"):
-            raise ValueError(f"PipeFusion requires a Wan diffusion model with blocks, got {type(base_model).__name__}")
-
-        self.pipefusion_stage = getattr(self.model, "pipefusion_stage", None)
-        if self.pipefusion_stage is None:
-            self.pipefusion_stage = build_stage_plan(
-                total_blocks=getattr(
-                    base_model.diffusion_model, "_raylight_pipefusion_total_blocks", len(base_model.diffusion_model.blocks)
-                ),
-                rank=self.xfuser_parallel.pipeline_rank,
-                world_size=self.xfuser_parallel.pipeline_world_size,
-                config=self.pipefusion_config,
-                group_ranks=tuple(self.xfuser_parallel.pp_group().ranks),
-            )
-
-        runtime = PipeFusionRuntime(
-            config=self.pipefusion_config,
-            stage=self.pipefusion_stage,
-            model_name=type(base_model).__name__,
-            parallel=self.xfuser_parallel,
-        )
-        if runtime.debug:
-            print(
-                "[PipeFusion] "
-                f"global_rank={self.xfuser_parallel.global_rank} "
-                f"pp_group={self.pipefusion_stage.group_ranks} "
-                f"stage={self.pipefusion_stage.stage_start}:{self.pipefusion_stage.stage_end} "
-                f"patches={self.pipefusion_stage.num_pipeline_patch}"
-            )
-        self.model.set_attachments(PIPEFUSION_RUNTIME_ATTACHMENT, runtime)
-
-        self.model.remove_callbacks_with_key(pe.CallbacksMP.ON_LOAD, PIPEFUSION_WRAPPER_KEY)
-        self.model.remove_wrappers_with_key(pe.WrappersMP.OUTER_SAMPLE, PIPEFUSION_WRAPPER_KEY)
-        self.model.remove_wrappers_with_key(pe.WrappersMP.PREDICT_NOISE, PIPEFUSION_WRAPPER_KEY)
-        self.model.remove_wrappers_with_key(pe.WrappersMP.DIFFUSION_MODEL, PIPEFUSION_WRAPPER_KEY)
-
-        self.model.add_callback_with_key(
-            pe.CallbacksMP.ON_LOAD,
-            PIPEFUSION_WRAPPER_KEY,
-            PipeFusionInjectRegistry.inject,
-        )
-        self.model.add_wrapper_with_key(
-            pe.WrappersMP.OUTER_SAMPLE,
-            PIPEFUSION_WRAPPER_KEY,
-            pipefusion_outer_sample_wrapper,
-        )
-        self.model.add_wrapper_with_key(
-            pe.WrappersMP.PREDICT_NOISE,
-            PIPEFUSION_WRAPPER_KEY,
-            pipefusion_predict_noise_wrapper,
-        )
-        self.model.add_wrapper_with_key(
-            pe.WrappersMP.DIFFUSION_MODEL,
-            PIPEFUSION_WRAPPER_KEY,
-            pipefusion_diffusion_model_wrapper,
-        )
-
+    @minimax_precision_loading
     def load_unet(self, unet_path, model_options):
-        if self.parallel_dict["is_fsdp"] is True:
+        if self.config.fsdp_enabled:
             active_key = self._active_model_key(unet_path, model_options)
 
             # Fast path: same base model + same LoRA — reuse FSDP-wrapped model
@@ -1045,7 +976,7 @@ class RayWorker:
             from raylight.comfy_dist.sd import fsdp_load_diffusion_model
 
             fsdp_model_options = dict(model_options)
-            fsdp_model_options["use_mmap"] = self.parallel_dict.get("use_mmap", True)
+            fsdp_model_options["use_mmap"] = self.config.use_mmap
 
             model_patcher.LowVramPatch = LowVramPatch
             model_management.cleanup_models_gc = cleanup_models_gc
@@ -1069,13 +1000,13 @@ class RayWorker:
             model_management.soft_empty_cache()
             gc.collect()
 
-            if self.parallel_dict.get("is_quant", False):
+            if self.is_quant:
                 self.set_state_dict()
 
             if self.lora_list is not None:
                 self.load_lora()
 
-            if self.parallel_dict.get("is_quant", False):
+            if self.is_quant:
                 self._patch_fsdp_for_sampling()
 
             base_model = getattr(self.model, "model", self.model)
@@ -1089,8 +1020,8 @@ class RayWorker:
             base_key = self._base_model_key(unet_path, model_options)
             active_key = self._active_model_key(unet_path, model_options)
             use_mmap = (
-                self.parallel_dict.get("use_mmap", True)
-                and not self.parallel_dict.get("is_quant", False)
+                self.config.use_mmap
+                and not self.is_quant
                 and unet_path.lower().endswith(".safetensors")
             )
 
@@ -1128,21 +1059,7 @@ class RayWorker:
             self._reset_active_model()
             self._invalidate_non_fsdp_cache()
             self._free_cached_aux_models()
-            if self.parallel_dict.get("pipefusion_enabled"):
-                from raylight.comfy_dist.sd import pipefusion_load_diffusion_model
-
-                if self.xfuser_parallel is None:
-                    raise RuntimeError("PipeFusion model loading requires xFuser parallel context")
-
-                pipefusion_model_options = dict(model_options)
-                pipefusion_model_options["use_mmap"] = use_mmap
-                loaded_model = pipefusion_load_diffusion_model(
-                    unet_path,
-                    pipefusion_config=self.pipefusion_config,
-                    parallel_context=self.xfuser_parallel,
-                    model_options=pipefusion_model_options,
-                )
-            elif use_mmap:
+            if use_mmap:
                 from raylight.comfy_dist.sd import lazy_load_diffusion_model
 
                 try:
@@ -1171,8 +1088,8 @@ class RayWorker:
         self._invalidate_non_fsdp_cache()
         self._free_cached_aux_models()
         if use_mmap is None:
-            use_mmap = self.parallel_dict.get("use_mmap", True)
-        if self.parallel_dict["is_fsdp"] is True:
+            use_mmap = self.config.use_mmap
+        if self.config.fsdp_enabled:
             # GGUF FSDP stays disabled for now.
             raise RuntimeError("FSDP on GGUF is not supported")
         else:
@@ -1216,20 +1133,20 @@ class RayWorker:
             strength_model = lora["strength_model"]
             lora_model = comfy_utils.load_torch_file(lora_path, safe_load=True)
 
-            if self.parallel_dict["is_fsdp"] is True:
+            if self.config.fsdp_enabled:
                 from raylight.comfy_dist.sd import (
                     load_lora_for_models as ray_load_lora_for_models,
                     load_lora_for_models_quantized as ray_load_lora_for_models_quantized,
                 )
 
                 dynamic_sidecar = comfy_memory_management.aimdo_enabled
-                if self.parallel_dict["is_quant"] is True or dynamic_sidecar:
+                if self.is_quant or dynamic_sidecar:
                     self.model = ray_load_lora_for_models_quantized(
                         self.model,
                         lora_model,
                         strength_model,
                         dynamic_sidecar=dynamic_sidecar,
-                        fallback_to_patches=not self.parallel_dict["is_quant"],
+                        fallback_to_patches=not self.is_quant,
                     )
                 else:
                     self.model = ray_load_lora_for_models(
@@ -1254,6 +1171,7 @@ class RayWorker:
 
         # Free old VAE before loading new one
         if self.vae_model is not None:
+            model_management.reset_cast_buffers()
             del self.vae_model
             self.vae_model = None
             self._cached_vae_path = None
@@ -1265,6 +1183,25 @@ class RayWorker:
             print(f"VAE loaded in {self.global_world_size} GPUs")
         self.vae_model = vae_model
         self._cached_vae_path = vae_path
+
+    def ray_minimax_h3_fun_control_apply(self, patch_name, vae_path, strength, start_percent, end_percent,
+                                       control_video=None, mask=None, source_video=None):
+        self.ray_vae_loader(vae_path)
+        model_patch = ModelPatchLoader().load_model_patch(patch_name)[0]
+        diffusion_model = self.model.get_model_object("diffusion_model")
+        expected = diffusion_model.blocks[0].adaln_proj.linear.in_features
+        adaln_in = model_patch.model.control_blocks[0].adaln_proj.linear.in_features
+        if adaln_in != expected:
+            raise ValueError(f"ControlNet '{patch_name}' has adaln width {adaln_in}; this H3 model requires {expected}.")
+        model_sampling = self.model.get_model_object("model_sampling")
+        patch = MiniMaxH3FunControlPatch(
+            model_patch, self.vae_model, control_video, mask, source_video, strength,
+            float(model_sampling.percent_to_sigma(start_percent)),
+            float(model_sampling.percent_to_sigma(end_percent)),
+        )
+        patched = self.model.clone()
+        patch.register(patched)
+        self.model = patched
 
     @patch_ray_tqdm
     def ray_vae_decode_partial(self, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8, job_rank=0, job_world_size=1):
@@ -1321,7 +1258,7 @@ class RayWorker:
         if "noise_mask" in latent:
             noise_mask = latent["noise_mask"]
 
-        if self.parallel_dict["is_fsdp"] is True:
+        if self.config.fsdp_enabled:
             self._patch_fsdp_for_sampling()
             del self.state_dict
             self.state_dict = None
@@ -1421,7 +1358,7 @@ class RayWorker:
         _remap_conditioning_devices(positive, negative)
         _prepare_control_models(positive, negative)
 
-        if self.parallel_dict["is_fsdp"] is True:
+        if self.config.fsdp_enabled:
             self._patch_fsdp_for_sampling()
             del self.state_dict
             self.state_dict = None
@@ -1496,6 +1433,7 @@ class RayWorker:
     def free_cached_controlnet(self):
         """Explicitly free the cached ControlNet (e.g. when switching workflows)."""
         if self.cached_controlnet is not None:
+            model_management.reset_cast_buffers()
             _, old_cnet = self.cached_controlnet
             old_model = getattr(old_cnet, "control_model", None)
             if old_model is not None:
@@ -1509,6 +1447,7 @@ class RayWorker:
     def free_cached_vae(self):
         """Explicitly free the cached VAE (e.g. when switching workflows)."""
         if self.vae_model is not None:
+            model_management.reset_cast_buffers()
             del self.vae_model
             self.vae_model = None
             self._cached_vae_path = None
@@ -1551,7 +1490,7 @@ class RayWorker:
         latent_image = latent["samples"]
         latent_image = comfy_sample.fix_empty_latent_channels(self.model, latent_image)
 
-        if self.parallel_dict["is_fsdp"] is True:
+        if self.config.fsdp_enabled:
             self._patch_fsdp_for_sampling()
 
         if disable_noise:
@@ -1612,7 +1551,7 @@ class RayWorker:
 
 
 class RayCOMMTester:
-    def __init__(self, local_rank, world_size, device_id):
+    def __init__(self, local_rank, world_size, device_id, collective_timeout_minutes=1.0):
         device = torch.device(f"cuda:{device_id}")
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
 
@@ -1620,7 +1559,7 @@ class RayCOMMTester:
             "nccl",
             rank=local_rank,
             world_size=world_size,
-            timeout=timedelta(minutes=1),
+            timeout=timedelta(minutes=collective_timeout_minutes),
             # device_id=self.device
         )
         print("Running COMM pre-run")
@@ -1643,7 +1582,7 @@ class RayCOMMTester:
         ray.actor.exit_actor()
 
 
-def ray_nccl_tester(world_size):
+def ray_nccl_tester(world_size, collective_timeout_minutes=1.0):
     gpu_actor = ray.remote(RayCOMMTester)
     gpu_actors = []
 
@@ -1653,6 +1592,7 @@ def ray_nccl_tester(world_size):
                 local_rank=local_rank,
                 world_size=world_size,
                 device_id=0,
+                collective_timeout_minutes=collective_timeout_minutes,
             )
         )
     for actor in gpu_actors:
@@ -1662,12 +1602,12 @@ def ray_nccl_tester(world_size):
         actor.kill.remote()
 
 
-def make_ray_actor_fn(world_size, parallel_dict):
-    num_replicas = parallel_dict.get("dp_degree", 1)
-    shard_size = parallel_dict.get("shard_size", world_size)
-    use_group_process_group = bool(parallel_dict.get("use_group_process_group"))
+def make_ray_actor_fn(world_size, config):
+    num_replicas = config.worker.parallel.data_parallel_degree
+    shard_size = world_size // num_replicas
+    use_group_process_group = config.worker.fsdp_enabled and num_replicas > 1
 
-    def _init_ray_actor(world_size=world_size, parallel_dict=parallel_dict):
+    def _init_ray_actor():
         gpu_actor = ray.remote(RayWorker)
         gpu_actors = []
         worker_specs = []
@@ -1675,21 +1615,17 @@ def make_ray_actor_fn(world_size, parallel_dict):
         if num_replicas <= 1 or not use_group_process_group:
             # XDiT DP stays in one global group; xFuser derives DP ranks internally.
             for local_rank in range(world_size):
-                worker_specs.append((local_rank, f"RayWorker:{local_rank}", parallel_dict))
+                worker_specs.append((local_rank, f"RayWorker:{local_rank}", 0))
         else:
             # FSDP multi-replica DP uses one NCCL group per replica.
             for group_id in range(num_replicas):
-                group_parallel_dict = dict(parallel_dict)
-                group_parallel_dict["group_id"] = group_id
-                group_parallel_dict["use_group_process_group"] = True
-
                 for local_rank in range(shard_size):
-                    worker_specs.append((local_rank, f"RayWorker:{group_id}_{local_rank}", group_parallel_dict))
+                    worker_specs.append((local_rank, f"RayWorker:{group_id}_{local_rank}", group_id))
 
         try:
-            for local_rank, name, worker_parallel_dict in worker_specs:
+            for local_rank, name, group_id in worker_specs:
                 gpu_actors.append(gpu_actor.options(num_gpus=1, name=name).remote(
-                    local_rank=local_rank, device_id=0, parallel_dict=worker_parallel_dict))
+                    local_rank=local_rank, device_id=0, config=config.worker, world_size=world_size, group_id=group_id))
             ray.get([actor.__ray_ready__.remote() for actor in gpu_actors], timeout=120)
             worker_processes = ray.get([
                 actor.__ray_call__.remote(lambda self: (socket.gethostname(), os.getpid(), psutil.Process().create_time()))
@@ -1700,7 +1636,7 @@ def make_ray_actor_fn(world_size, parallel_dict):
                 ray.kill(actor, no_restart=True)
             raise
         _note_workers_spawned(name for _, name, _ in worker_specs)
-        return {"workers": gpu_actors, "worker_processes": worker_processes}
+        return {"workers": gpu_actors, "worker_processes": worker_processes, "config": config}
 
     return _init_ray_actor
 

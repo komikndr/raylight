@@ -410,21 +410,37 @@ if hasattr(model_base, "MiniMaxH3"):
 
     @USPInjectRegistry.register(model_base.MiniMaxH3)
     def _inject_minimax_h3(model_patcher, base_model, *args):
+        from ..comfy_dist.model_patcher import FSDPModelPatcher
         from ..comfy_dist.sd import FSDP_LORA_SIDECAR_ATTACHMENT
-        from ..diffusion_models.minimax.xdit_context_parallel import usp_attn_forward, usp_dit_forward, usp_mlp_forward
+        from ..diffusion_models.minimax.xdit_context_parallel import usp_attn_forward, usp_block_forward, usp_dit_forward, usp_mlp_forward
 
         model = base_model.diffusion_model
         sidecar_groups = model_patcher.get_attachment(FSDP_LORA_SIDECAR_ATTACHMENT) or {}
+        options = model_patcher.get_attachment("raylight_model_options").minimax
+        attention_fp16 = options.attention_fp16
+        mlp_fp16 = options.mlp_fp16
+        fp32_residual = options.fp32_residual
+        chunk = options.mlp_chunk_tokens
+        model.raylight_fp32_residual = fp32_residual
         for block in model.blocks:
             for attention in block.attn.modules():
                 if isinstance(attention, ComfyAttention) and attention.function is not None:
                     raise ValueError("Checkpoint-selected MiniMax H3 attention is not supported by Raylight USP")
         for i, block in enumerate(model.blocks):
             block.attn.forward = types.MethodType(usp_attn_forward, block.attn)
-            if f"diffusion_model.blocks.{i}.mlp.fc2" in sidecar_groups:
+            if attention_fp16 or mlp_fp16 or fp32_residual:
+                block.raylight_attention_fp16 = attention_fp16
+                block.raylight_mlp_fp16 = mlp_fp16
+                block.forward = types.MethodType(usp_block_forward, block)
+            sidecar = f"diffusion_model.blocks.{i}.mlp.fc2" in sidecar_groups
+            if mlp_fp16 or chunk > 0 or sidecar:
+                block.mlp.raylight_chunk_tokens = chunk
+                block.mlp.raylight_unfused_mlp = sidecar or isinstance(model_patcher, FSDPModelPatcher)
                 block.mlp.forward = types.MethodType(usp_mlp_forward, block.mlp)
         for i, block in enumerate(model.token_refiner.blocks):
             if f"diffusion_model.token_refiner.blocks.{i}.mlp.fc2" in sidecar_groups:
+                block.mlp.raylight_chunk_tokens = 0
+                block.mlp.raylight_unfused_mlp = True
                 block.mlp.forward = types.MethodType(usp_mlp_forward, block.mlp)
         model._forward = types.MethodType(usp_dit_forward, model)
 

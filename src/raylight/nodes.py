@@ -31,6 +31,7 @@ from .distributed_worker.ray_worker import (
     ray_nccl_tester,
 )
 from .distributed_worker.ray_worker_vae import combine_dist_vae_partials, combine_seedvr2_vae_partials
+from .distributed_worker.raylightworker_config_schema import LoadingOptions, ModelOptions, RaylightConfig, RayWorkerConfig, XFuserParallelConfig
 from . import progress
 from .comfy_extra_dist.nodes_custom_sampler import (
     _clear_ray_worker_vram_after_sampling,
@@ -217,13 +218,9 @@ def _wait_for_ray_workers_to_exit(timeout=90.0):
         time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
 
-def _worker_cli_args_env_json() -> str:
+def _worker_cli_args_env_json(config: RayWorkerConfig) -> str:
     worker_cli_args = {
-        # Ray workers hit cudaHostRegister failures on large LTXV loads often enough
-        # that we disable pinned memory there by default. Pinned host memory is
-        # what lets a host to device copy actually run asynchronously, so
-        # RAYLIGHT_WORKER_PIN opts back in where the load is known to succeed.
-        "disable_pinned_memory": os.environ.get("RAYLIGHT_WORKER_PIN") != "1",
+        "disable_pinned_memory": not config.pinned_memory,
         "fast_disk": bool(comfy_args.fast_disk),
         "disable_mmap": bool(comfy_args.disable_mmap),
         "mmap_torch_files": bool(comfy_args.mmap_torch_files),
@@ -231,11 +228,11 @@ def _worker_cli_args_env_json() -> str:
         "disable_async_offload": bool(comfy_args.disable_async_offload),
         "disable_dynamic_vram": bool(comfy_args.disable_dynamic_vram),
         "enable_dynamic_vram": bool(comfy_args.enable_dynamic_vram),
-        "vram_headroom": comfy_args.vram_headroom,
+        "vram_headroom": config.vram_headroom,
         "force_non_blocking": bool(comfy_args.force_non_blocking),
         "deterministic": bool(comfy_args.deterministic),
         "verbose": comfy_args.verbose,
-        "reserve_vram": comfy_args.reserve_vram,
+        "reserve_vram": config.reserve_vram,
         "fp16_intermediates": bool(comfy_args.fp16_intermediates),
         "force_channels_last": bool(comfy_args.force_channels_last),
         "supports_fp8_compute": bool(comfy_args.supports_fp8_compute),
@@ -248,8 +245,8 @@ def _worker_cli_args_env_json() -> str:
     return json.dumps(worker_cli_args, sort_keys=True)
 
 
-def _inject_worker_cli_args(runtime_env: dict[str, Any]):
-    runtime_env.setdefault("env_vars", {})["RAYLIGHT_COMFY_CLI_ARGS_JSON"] = _worker_cli_args_env_json()
+def _inject_worker_cli_args(runtime_env: dict[str, Any], config: RayWorkerConfig):
+    runtime_env.setdefault("env_vars", {})["RAYLIGHT_COMFY_CLI_ARGS_JSON"] = _worker_cli_args_env_json(config)
 
 
 def _parse_gpu_select(gpu_select: str | None) -> tuple[int, ...] | None:
@@ -324,18 +321,6 @@ def _quant_metadata_checker(unet_path: str) -> bool:
         return False
 
 
-def _parse_pipefusion_stage_splits(stage_splits: str | None) -> tuple[int, ...] | None:
-    if stage_splits is None:
-        return None
-    stage_splits = stage_splits.strip()
-    if not stage_splits:
-        return None
-    splits = tuple(int(part.strip()) for part in stage_splits.split(",") if part.strip())
-    if not splits:
-        return None
-    return splits
-
-
 def _effective_parallel_degree(value: int | None) -> int:
     if value is None:
         return 1
@@ -374,74 +359,23 @@ def _validate_unified_parallel_setup(parallel_dict: dict[str, Any], group_infos:
     ulysses_degree = _effective_parallel_degree(parallel_dict.get("ulysses_degree"))
     ring_degree = _effective_parallel_degree(parallel_dict.get("ring_degree"))
     cfg_degree = _effective_parallel_degree(parallel_dict.get("cfg_degree"))
-    pp_degree = _effective_parallel_degree(parallel_dict.get("pp_degree"))
     dp_degree = max(int(info.get("dp_degree", 1)) for info in group_infos) if group_infos else 1
-    effective_parallel_size = ulysses_degree * ring_degree * cfg_degree * pp_degree * dp_degree
+    effective_parallel_size = ulysses_degree * ring_degree * cfg_degree * dp_degree
 
     if effective_parallel_size <= 1:
         raise ValueError(
             f"{label} requires an active unified parallel topology with effective degree > 1. "
-            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, pp={pp_degree}, dp={dp_degree}. "
+            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, dp={dp_degree}. "
             "Use DPKSampler for pure DP or single-worker execution."
         )
 
-    if not parallel_dict.get("is_xdit") and not parallel_dict.get("pipefusion_enabled"):
+    if not parallel_dict.get("is_xdit"):
         raise ValueError(
             f"{label} requires xFuser unified topology to be active. "
-            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, pp={pp_degree}, dp={dp_degree}, "
-            f"is_xdit={parallel_dict.get('is_xdit')}, pipefusion_enabled={parallel_dict.get('pipefusion_enabled')}. "
+            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, dp={dp_degree}, "
+            f"is_xdit={parallel_dict.get('is_xdit')}. "
             "DP-only execution should use DPKSampler."
         )
-
-
-def _reset_pipefusion_runtime_config(parallel_dict: dict[str, Any]):
-    parallel_dict["pipefusion_enabled"] = False
-    parallel_dict["num_pipeline_patch"] = 1
-    parallel_dict["warmup_steps"] = 0
-    parallel_dict["pipefusion_stage_splits"] = None
-    parallel_dict["pipefusion_debug"] = False
-
-
-def _apply_pipefusion_runtime_config(
-    parallel_dict: dict[str, Any],
-    *,
-    world_size: int,
-    num_pipeline_patch: int,
-    warmup_steps: int,
-    stage_splits: str | None,
-    debug: bool,
-):
-    _reset_pipefusion_runtime_config(parallel_dict)
-
-    pp_degree = _effective_parallel_degree(parallel_dict.get("pp_degree"))
-
-    if parallel_dict.get("is_fsdp"):
-        raise ValueError("PipeFusion v1 is exclusive with FSDP")
-    if world_size < 1:
-        raise ValueError("PipeFusion requires at least 1 GPU")
-    if pp_degree < 1:
-        raise ValueError("PipeFusion pp_degree must be at least 1")
-    if num_pipeline_patch <= 0:
-        raise ValueError("PipeFusion num_pipeline_patch must be positive")
-    if warmup_steps < 0:
-        raise ValueError("PipeFusion warmup_steps cannot be negative")
-
-    effective_ulysses = _effective_parallel_degree(parallel_dict.get("ulysses_degree"))
-    effective_ring = _effective_parallel_degree(parallel_dict.get("ring_degree"))
-    effective_cfg = _effective_parallel_degree(parallel_dict.get("cfg_degree"))
-    model_parallel_size = pp_degree * effective_ulysses * effective_ring * effective_cfg
-    if world_size % model_parallel_size != 0:
-        raise ValueError(
-            "PipeFusion requires the Ray worker count to be divisible by "
-            "pp_degree * ulysses_degree * ring_degree * cfg_degree: "
-            f"{world_size} is not divisible by {pp_degree} * {effective_ulysses} * {effective_ring} * {effective_cfg}"
-        )
-
-    parallel_dict["pipefusion_enabled"] = True
-    parallel_dict["num_pipeline_patch"] = num_pipeline_patch
-    parallel_dict["warmup_steps"] = warmup_steps
-    parallel_dict["pipefusion_stage_splits"] = _parse_pipefusion_stage_splits(stage_splits)
-    parallel_dict["pipefusion_debug"] = debug
 
 
 class RayInitializer:
@@ -504,7 +438,7 @@ class RayInitializer:
                     {"default": False, "tooltip": "When FSDP is on, offload inactive model shards to CPU RAM."},
                 ),
                 "XFuser_attention": (
-                    [member.name for member in AttnType],
+                    [member.name for member in AttnType] + ["COMFY_KITCHEN_INT8"],
                     {"default": "TORCH_FLASH", "tooltip": "Attention backend used by xFuser-enabled execution."},
                 ),
                 "skip_comm_test": (
@@ -556,6 +490,12 @@ class RayInitializer:
         ray_object_store_gb: float = 2.0,
         ray_dashboard_address: str = "None",
         torch_dist_address: str = "None",
+        worker_options=None,
+        worker_vram_headroom: float = -1.0,
+        worker_reserve_vram: float = -1.0,
+        worker_pinned_memory: bool = False,
+        parallel_quant_load: bool = False,
+        collective_timeout_minutes: float = 1.0,
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
@@ -571,7 +511,6 @@ class RayInitializer:
 
         # HF Tokenizer warning when forking
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        self.parallel_dict: dict[str, Any] = dict()
         _monkey()
 
         world_size = GPU
@@ -605,21 +544,7 @@ class RayInitializer:
                 raise ValueError("dp_degree must be >= 1 when FSDP is enabled")
             if GPU % dp_degree != 0:
                 raise ValueError(f"GPU count ({GPU}) must be evenly divisible by dp_degree ({dp_degree})")
-        shard_size = GPU // dp_degree if dp_degree >= 1 else GPU
-
-        self.parallel_dict["is_xdit"] = False
-        self.parallel_dict["is_fsdp"] = False
-        self.parallel_dict["sync_ulysses"] = False
-        self.parallel_dict["global_world_size"] = world_size
-        self.parallel_dict["shard_size"] = shard_size
-        self.parallel_dict["use_group_process_group"] = False
-        self.parallel_dict["use_mmap"] = use_mmap
-        self.parallel_dict["pp_degree"] = 1
-        self.parallel_dict["dp_degree"] = dp_degree if dp_degree >= 1 else 1
-        self.parallel_dict["clear_vram_after_sampling"] = clear_vram_after_sampling
-        # Lets the sampler tell whether workers can reach the host's card.
-        self.parallel_dict["selected_gpus"] = list(selected_gpus) if selected_gpus else None
-        _reset_pipefusion_runtime_config(self.parallel_dict)
+        parallel = XFuserParallelConfig(data_parallel_degree=max(dp_degree, 1))
 
         if ulysses_degree > 0 or ring_degree > 0 or cfg_degree > 0:
             model_parallel_size = effective_ulysses_degree * effective_ring_degree * cfg_degree
@@ -639,20 +564,26 @@ class RayInitializer:
                     "GPU count must equal dp_degree x ulysses_degree x ring_degree x cfg_degree: "
                     f"{world_size} != {effective_dp_degree} x {effective_ulysses_degree} x {effective_ring_degree} x {cfg_degree}"
                 )
-            self.parallel_dict["attention"] = XFuser_attention
-            self.parallel_dict["is_xdit"] = True
-            self.parallel_dict["ulysses_degree"] = effective_ulysses_degree
-            self.parallel_dict["ring_degree"] = effective_ring_degree
-            self.parallel_dict["cfg_degree"] = cfg_degree
-            self.parallel_dict["sync_ulysses"] = sync_ulysses
-            self.parallel_dict["dp_degree"] = effective_dp_degree
+            parallel = XFuserParallelConfig(
+                enabled=True, ulysses_degree=effective_ulysses_degree,
+                ring_degree=effective_ring_degree, cfg_degree=cfg_degree,
+                data_parallel_degree=effective_dp_degree,
+            )
 
-        if FSDP:
-            self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
-            self.parallel_dict["is_fsdp"] = True
-            final_dp = self.parallel_dict["dp_degree"]
-            self.parallel_dict["shard_size"] = world_size // final_dp
-            self.parallel_dict["use_group_process_group"] = final_dp > 1
+        worker_config = RayWorkerConfig(
+            parallel=parallel, attention_backend=XFuser_attention,
+            sync_ulysses=sync_ulysses, fsdp_enabled=FSDP, fsdp_cpu_offload=FSDP_CPU_OFFLOAD,
+            use_mmap=use_mmap, clear_vram_after_sampling=clear_vram_after_sampling,
+            selected_gpus=selected_gpus,
+            model_options=worker_options or ModelOptions(),
+            pinned_memory=worker_pinned_memory,
+            vram_headroom=comfy_args.vram_headroom if worker_vram_headroom < 0 else worker_vram_headroom,
+            reserve_vram=comfy_args.reserve_vram if worker_reserve_vram < 0 else worker_reserve_vram,
+            collective_timeout_minutes=collective_timeout_minutes,
+        )
+        config = RaylightConfig(loading=LoadingOptions(parallel_quant_load=parallel_quant_load), worker=worker_config)
+        if worker_config.attention_backend == "COMFY_KITCHEN_INT8" and worker_config.parallel.ring_degree != 1:
+            raise ValueError("Comfy Kitchen INT8 requires ring_degree=1.")
 
         if ray_dashboard_address != "None":
             dashboard_host, dashboard_port = ray_dashboard_address.rsplit(":", 1)
@@ -671,7 +602,7 @@ class RayInitializer:
             # Adapted from avtc's Ray GPU visibility restriction idea.
             runtime_env_base.setdefault("env_vars", {})["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_idx) for gpu_idx in selected_gpus)
 
-        _inject_worker_cli_args(runtime_env_base)
+        _inject_worker_cli_args(runtime_env_base, config.worker)
 
         # the workers find the progress board by this name; each cluster gets its own
         board_name = progress.new_board_name()
@@ -725,10 +656,10 @@ class RayInitializer:
 
         if not skip_comm_test:
             print("Running NCCL communication test...")
-            ray_nccl_tester(world_size)
+            ray_nccl_tester(world_size, config.worker.collective_timeout_minutes)
         else:
             print("Skipping NCCL test (skip_comm_test=True)")
-        ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
+        ray_actor_fn = make_ray_actor_fn(world_size, config)
         ray_actors = ray_actor_fn()
         _record_spawned_workers(ray_actors)
         return ([ray_actors, ray_actor_fn],)
@@ -801,7 +732,7 @@ class RayInitializerAdvanced(RayInitializer):
                     {"default": False, "tooltip": "When FSDP is on, offload inactive model shards to CPU RAM."},
                 ),
                 "XFuser_attention": (
-                    [member.name for member in AttnType],
+                    [member.name for member in AttnType] + ["COMFY_KITCHEN_INT8"],
                     {"default": "TORCH_FLASH", "tooltip": "Attention backend used by xFuser-enabled execution."},
                 ),
                 "skip_comm_test": (
@@ -838,6 +769,15 @@ class RayInitializerAdvanced(RayInitializer):
                         "tooltip": "Torch distributed master address used by worker-side NCCL init. Restart ComfyUI if you change it.",
                     },
                 ),
+                "worker_options": (
+                    "RAY_MODEL_OPTIONS",
+                    {"tooltip": "Optional RayWorker Minimax Option settings for H3 precision and MLP chunking."},
+                ),
+                "worker_vram_headroom": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 64.0, "step": 0.5, "tooltip": "Worker VRAM headroom in GB. -1 inherits the server setting."}),
+                "worker_reserve_vram": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 64.0, "step": 0.5, "tooltip": "Worker reserved VRAM in GB. -1 inherits the server setting."}),
+                "worker_pinned_memory": ("BOOLEAN", {"default": False}),
+                "parallel_quant_load": ("BOOLEAN", {"default": False, "tooltip": "Load quantized worker models concurrently. Increases peak host RAM."}),
+                "collective_timeout_minutes": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 60.0, "step": 0.5}),
             },
         }
 
@@ -846,77 +786,6 @@ class RayInitializerAdvanced(RayInitializer):
 
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
-
-
-class RayPipeFusionConfig:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "ray_actors_init": ("RAY_ACTORS_INIT", {"tooltip": "Ray actor initialization payload to decorate with PipeFusion config."}),
-                "num_pipeline_patch": (
-                    "INT",
-                    {
-                        "default": 4,
-                        "min": 1,
-                        "tooltip": "How many smaller sequence chunks to split the sequence into after patch embedding. Higher values can reduce pipeline bubbles, but too high adds overhead.",
-                    },
-                ),
-                "warmup_steps": (
-                    "INT",
-                    {
-                        "default": 1,
-                        "min": 0,
-                        "tooltip": "How many denoising steps to run in simple synchronous mode before switching to steady-state PipeFusion scheduling. Since t0 usually required fresh KV (just like teacache warm up step)",
-                    },
-                ),
-                "pipefusion_stage_splits": (
-                    "STRING",
-                    {
-                        "default": "",
-                        "tooltip": "Optional manual block split per stage, for example for wan 14b `20,20`. Leave empty to split transformer blocks evenly across PP stages.",
-                    },
-                ),
-                "pipefusion_debug": (
-                    "BOOLEAN",
-                    {
-                        "default": False,
-                        "tooltip": "Print extra PipeFusion logs such as stage ownership, chunk flow, and warmup/pipeline mode decisions.",
-                    },
-                ),
-            },
-        }
-
-    RETURN_TYPES = ("RAY_ACTORS_INIT",)
-    RETURN_NAMES = ("ray_actors_init",)
-
-    FUNCTION = "configure_pipefusion"
-    CATEGORY = "Raylight"
-
-    def configure_pipefusion(
-        self,
-        ray_actors_init,
-        num_pipeline_patch: int,
-        warmup_steps: int,
-        pipefusion_stage_splits: str = "",
-        pipefusion_debug: bool = False,
-    ):
-        ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
-        _free_host_models_if_contended(ray_actors)
-
-        updated_parallel_dict = dict(parallel_dict)
-        _apply_pipefusion_runtime_config(
-            updated_parallel_dict,
-            world_size=int(updated_parallel_dict.get("global_world_size", len(gpu_actors))),
-            num_pipeline_patch=num_pipeline_patch,
-            warmup_steps=warmup_steps,
-            stage_splits=pipefusion_stage_splits,
-            debug=pipefusion_debug,
-        )
-
-        updated_actor_fn = make_ray_actor_fn(int(updated_parallel_dict.get("global_world_size", len(gpu_actors))), updated_parallel_dict)
-        ray.get([actor.set_parallel_dict.remote(updated_parallel_dict) for actor in gpu_actors])
-        return ([ray_actors, updated_actor_fn],)
 
 
 class RayUNETLoader:
@@ -987,7 +856,7 @@ class RayUNETLoader:
 
         parallel_dict["is_quant"] = _quant_metadata_checker(unet_path)
         for actor in gpu_actors:
-            loaded_futures.append(actor.set_parallel_dict.remote(parallel_dict))
+            loaded_futures.append(actor.set_quantized.remote(parallel_dict["is_quant"]))
         ray.get(loaded_futures)
         loaded_futures = []
 
@@ -1024,7 +893,7 @@ class RayUNETLoader:
                 else:
                     for actor in gpu_actors:
                         future = actor.load_unet.remote(unet_path, model_options=model_options)
-                        if os.environ.get("RAYLIGHT_PARALLEL_QUANT_LOAD") == "1":
+                        if ray_actors["config"].loading.parallel_quant_load:
                             loaded_futures.append(future)
                         else:
                             ray.get(future)
@@ -1053,7 +922,7 @@ class RayUNETLoader:
                     else:
                         for actor in group_actors:
                             future = actor.load_unet.remote(unet_path, model_options=model_options)
-                            if os.environ.get("RAYLIGHT_PARALLEL_QUANT_LOAD") == "1":
+                            if ray_actors["config"].loading.parallel_quant_load:
                                 loaded_futures.append(future)
                             else:
                                 ray.get(future)
@@ -1067,13 +936,12 @@ class RayUNETLoader:
             loaded_futures = []
 
         for actor in gpu_actors:
-            if parallel_dict["is_xdit"] and not parallel_dict.get("pipefusion_enabled"):
+            patched_futures.append(actor.patch_model_options.remote())
+            if parallel_dict["is_xdit"]:
                 if (parallel_dict["ulysses_degree"]) > 1 or (parallel_dict["ring_degree"] > 1):
                     patched_futures.append(actor.patch_usp.remote())
                 if parallel_dict["cfg_degree"] > 1:
                     patched_futures.append(actor.patch_cfg.remote())
-            if parallel_dict.get("pipefusion_enabled"):
-                patched_futures.append(actor.patch_pipefusion.remote())
 
         ray.get(patched_futures)
 
@@ -1546,6 +1414,24 @@ class RayKill:
         return ()
 
 
+class RayKillInit:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "ray_actors_init": ("RAY_ACTORS_INIT",),
+            "kill_mode": (["Kill Workers Only", "Kill Entire Cluster"],),
+        }}
+
+    RETURN_TYPES = ()
+    FUNCTION = "kill_ray"
+    OUTPUT_NODE = True
+    CATEGORY = "Raylight"
+
+    def kill_ray(self, ray_actors_init, kill_mode):
+        ray_actors, _ = ray_actors_init
+        return RayKill().kill_ray(ray_actors, kill_mode)
+
+
 # Credit to : https://github.com/yolain/ComfyUI-Easy-Use
 # I copied this for packaging sake.
 class RayCleanVRAMUsed:
@@ -1964,6 +1850,7 @@ NODE_CLASS_MAPPINGS = {
     "UnifiedParallelSampler": UnifiedParallelSampler,
     "DPKSamplerAdvanced": DPKSamplerAdvanced,
     "RayKill": RayKill,
+    "RayKillInit": RayKillInit,
     "RayUNETLoader": RayUNETLoader,
     "RayLoraLoader": RayLoraLoader,
     "RayControlNetLoader": RayControlNetLoader,
@@ -1984,6 +1871,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "UnifiedParallelSampler": "Unified Parallel Sampler (Advance)",
     "DPKSamplerAdvanced": "Data Parallel KSampler (Advanced)",
     "RayKill": "Kill Ray",
+    "RayKillInit": "Kill Ray (from Init)",
     "RayUNETLoader": "Load Diffusion Model (Ray)",
     "RayLoraLoader": "Load Lora Model (Ray)",
     "RayControlNetLoader": "Load ControlNet (Ray)",

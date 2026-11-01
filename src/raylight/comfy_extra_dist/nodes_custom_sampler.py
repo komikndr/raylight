@@ -151,22 +151,21 @@ def _validate_unified_parallel_setup(parallel_dict: dict, group_infos: list[dict
     ulysses_degree = _normalized_degree(parallel_dict.get("ulysses_degree"))
     ring_degree = _normalized_degree(parallel_dict.get("ring_degree"))
     cfg_degree = _normalized_degree(parallel_dict.get("cfg_degree"))
-    pp_degree = _normalized_degree(parallel_dict.get("pp_degree"))
     dp_degree = max(int(info.get("dp_degree", 1)) for info in group_infos) if group_infos else 1
-    effective_parallel_size = ulysses_degree * ring_degree * cfg_degree * pp_degree * dp_degree
+    effective_parallel_size = ulysses_degree * ring_degree * cfg_degree * dp_degree
 
     if effective_parallel_size <= 1:
         raise ValueError(
             f"{label} requires an active unified parallel topology with effective degree > 1. "
-            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, pp={pp_degree}, dp={dp_degree}. "
+            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, dp={dp_degree}. "
             "Use DPSamplerCustom for pure DP or single-worker execution."
         )
 
-    if not parallel_dict.get("is_xdit") and not parallel_dict.get("pipefusion_enabled"):
+    if not parallel_dict.get("is_xdit"):
         raise ValueError(
             f"{label} requires xFuser unified topology to be active. "
-            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, pp={pp_degree}, dp={dp_degree}, "
-            f"is_xdit={parallel_dict.get('is_xdit')}, pipefusion_enabled={parallel_dict.get('pipefusion_enabled')}. "
+            f"Got ulysses={ulysses_degree}, ring={ring_degree}, cfg={cfg_degree}, dp={dp_degree}, "
+            f"is_xdit={parallel_dict.get('is_xdit')}. "
             "DP-only execution should use DPSamplerCustom."
         )
 

@@ -19,7 +19,7 @@ def test_quant_fsdp_workers_load_sequentially_and_materialize_locally():
     loader_source = ast.unparse(_function(NODES, "load_ray_unet"))
     worker_source = ast.unparse(_function(WORKER, "load_unet"))
 
-    assert loader_source.count("if os.environ.get('RAYLIGHT_PARALLEL_QUANT_LOAD') == '1':") == 2
+    assert loader_source.count("if ray_actors['config'].loading.parallel_quant_load:") == 2
     assert loader_source.count("ray.get(future)") == 2
     assert worker_source.index("self.set_state_dict()") < worker_source.index("self._patch_fsdp_for_sampling()")
 

@@ -254,10 +254,9 @@ class RayGGUFLoader:
             loaded_futures = []
 
         for actor in gpu_actors:
-            if parallel_dict["is_xdit"] and not parallel_dict.get("pipefusion_enabled"):
+            patched_futures.append(actor.patch_model_options.remote())
+            if parallel_dict["is_xdit"]:
                 patched_futures.append(actor.patch_usp.remote())
-            if parallel_dict.get("pipefusion_enabled"):
-                patched_futures.append(actor.patch_pipefusion.remote())
 
         ray.get(patched_futures)
 

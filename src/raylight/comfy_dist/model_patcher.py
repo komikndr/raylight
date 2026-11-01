@@ -4,7 +4,6 @@ import collections
 import logging
 import gc
 from contextlib import nullcontext
-from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -20,10 +19,6 @@ from comfy.model_patcher import get_key_weight, string_to_seed, move_weight_func
 from raylight import comfy_dist
 from .fsdp_utils import freeze_and_detect_qt, fully_shard_bottom_up, load_from_full_model_state_dict, materialize_excluded_params
 from .kitchen_distributed import temporary_sitepkg_ck_patches
-
-if TYPE_CHECKING:
-    from raylight.distributed_worker.parallel_group_manager import XFuserParallelContext
-    from raylight.distributed_worker.pipefusion_schema import PipeFusionConfig, StagePlan
 
 try:
     from comfy_kitchen.tensor.base import QuantizedTensor as _CKQuantizedTensor
@@ -421,9 +416,6 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         self._has_quantized_dtensor_shards: bool | None = None
         self.patch_fsdp = patch_fsdp.__get__(self, FSDPModelPatcher)
 
-    def is_dynamic(self):
-        return True
-
     def model_size(self):
         if self.size > 0:
             return self.size
@@ -772,39 +764,3 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
             gc.collect()
         except Exception:
             pass
-
-
-class PipefusionModelPatcher(comfy.model_patcher.ModelPatcher):
-    def __init__(
-        self,
-        model,
-        load_device,
-        offload_device,
-        size=0,
-        weight_inplace_update=False,
-        pipefusion_config: "PipeFusionConfig | None" = None,
-        stage_plan: "StagePlan | None" = None,
-        parallel_context: "XFuserParallelContext | None" = None,
-        fast_disk=False,
-    ):
-        super().__init__(
-            model=model,
-            load_device=load_device,
-            offload_device=offload_device,
-            size=size,
-            weight_inplace_update=weight_inplace_update,
-            fast_disk=fast_disk,
-        )
-        self.pipefusion_config = pipefusion_config
-        self.pipefusion_stage = stage_plan
-        self.parallel_context = parallel_context
-
-    def clone(self, *args, **kwargs):
-        n = super(PipefusionModelPatcher, self).clone(*args, **kwargs)
-
-        n.__class__ = PipefusionModelPatcher
-        n.pipefusion_config = self.pipefusion_config
-        n.pipefusion_stage = self.pipefusion_stage
-        n.parallel_context = self.parallel_context
-
-        return n

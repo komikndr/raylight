@@ -150,7 +150,7 @@ Its job is to split the model weights among GPUs.
   ```
   Other allocator options, such as `expandable_segments:True`, are preserved.
 - Quantized FSDP models load one worker at a time by default to limit peak host RAM.
-  Set `RAYLIGHT_PARALLEL_QUANT_LOAD=1` before starting ComfyUI to load workers
+  Enable `parallel_quant_load` on Ray Initializer Advanced to load workers
   concurrently. This can reduce loading time but increase peak host RAM usage.
 - Example WF just open from your comfyui menu and browse templates
 - **GPU Topology** is very important, not all PCIe in your motherboard is equal.

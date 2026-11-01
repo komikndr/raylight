@@ -1,4 +1,5 @@
 import functools
+import torch
 
 from xfuser.core.long_ctx_attention import (
     xFuserLongContextAttention,
@@ -7,6 +8,7 @@ from xfuser.core.long_ctx_attention import (
 from yunchang.kernels import AttnType
 from .sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_kernel
 from .inner_attention import INNER_ATTENTION_KEY, InnerAttentionDispatcher
+from .kitchen_attention import kitchen_attention
 
 _ATTN_TYPE = None
 _SYNC_ULYSSES = None
@@ -71,13 +73,20 @@ def _patch_ring_lse_padding():
 def make_xfuser_attention(attn_type, sync_ulysses):
     print(f"Using XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}")
     _patch_ring_lse_padding()
-    attn = AttnType[attn_type]
+    kitchen = attn_type == "COMFY_KITCHEN_INT8"
+    attn = AttnType.TORCH_EFFICIENT if kitchen else AttnType[attn_type]
     if attn_type == "SAGE_FP8_CUDA":
         ensure_hf_fp8_cuda_kernel()
     elif attn_type == "SAGE_FP8_SM90":
         ensure_hf_sm90_kernel
 
     xfuser_attn = xFuserLongContextAttention(use_sync=sync_ulysses, attn_type=attn)
+    if kitchen:
+        if torch.distributed.get_world_size(xfuser_attn.ring_pg) != 1:
+            raise ValueError("Comfy Kitchen INT8 requires ring_degree=1; its kernel does not return ring LSE.")
+        # Preserve Ulysses exchanges, replacing only the local computation. The
+        # model-specific dispatcher below uses Kitchen as its dense fallback.
+        xfuser_attn.ring_attn_fn = kitchen_attention
     inner_dispatcher = InnerAttentionDispatcher(xfuser_attn)
 
     def _attention_xfuser_unmask(

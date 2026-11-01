@@ -2,7 +2,7 @@ import torch
 
 import comfy
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3FunControlBlockPatch
-from comfy.ldm.minimax.model import AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP, PackedLayout, mask_row_values, pack_audio, patchify_video, rope_rotation_table, time_shift_sigma, unpack_audio, unpatchify_video
+from comfy.ldm.minimax.model import _mod_gate, _mod_scale_shift, AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP, PackedLayout, mask_row_values, pack_audio, patchify_video, rope_rotation_table, time_shift_sigma, unpack_audio, unpatchify_video
 from xfuser.core.distributed import get_sequence_parallel_rank, get_sequence_parallel_world_size, get_sp_group
 
 import raylight.distributed_modules.attention as xfuser_attn
@@ -57,23 +57,31 @@ def _gather_stream(out, local_segments, local_size):
     return get_sp_group().all_gather(buf, dim=0)
 
 
-def _run_control_patch(patch, args, block_wrap, full_size):
+def _run_control_patch(patch, args, block_wrap, full_size, full_rope_freqs, full_mod_segments):
     local_size = args["img"].shape[0]
-    with comfy.model_prefetch.pause_malloc_graph():
-        full_h = get_sp_group().all_gather(args["img"].contiguous(), dim=0)[:full_size]
-        full_args = {**args, "img": full_h}
-        patch.control_patch.before_block(patch.block_index, full_args)
-    out = patch.previous(args, {"original_block": block_wrap}) if patch.previous is not None else block_wrap(args)
+    if patch.control_patch.active:
+        with comfy.model_prefetch.pause_malloc_graph():
+            full_h = get_sp_group().all_gather(args["img"].contiguous(), dim=0)[:full_size]
+            full_args = {**args, "img": full_h,
+                         "rope_freqs": full_rope_freqs, "mod_segments": full_mod_segments}
+            patch.control_patch.before_block(patch.block_index, full_args)
+    if isinstance(patch.previous, MiniMaxH3FunControlBlockPatch):
+        out = _run_control_patch(patch.previous, args, block_wrap, full_size, full_rope_freqs, full_mod_segments)
+    else:
+        out = patch.previous(args, {"original_block": block_wrap}) if patch.previous is not None else block_wrap(args)
+    if not patch.control_patch.active:
+        return out
     with comfy.model_prefetch.pause_malloc_graph():
         full_out = {"img": get_sp_group().all_gather(out["img"].contiguous(), dim=0)[:full_size]}
         result = patch.control_patch.after_block(patch.block_index, full_args, full_out)["img"]
         padded_size = get_sequence_parallel_world_size() * local_size
         result = torch.nn.functional.pad(result, (0, 0, 0, padded_size - full_size))
         start = get_sequence_parallel_rank() * local_size
-        return result[start:start + local_size]
+        return result[start:start + local_size].clone()
 
 
 def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}, **kwargs):
+    fp16 = x.dtype == torch.float16
     s = x.shape[0]
     q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
     v = v.view(s, self.heads, self.head_dim)
@@ -99,12 +107,49 @@ def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}, **kwargs)
     k = k.transpose(0, 1).unsqueeze(0)
     v = v.transpose(0, 1).unsqueeze(0)
     out = xfuser_optimized_attention(q, k, v, self.heads, skip_reshape=True, transformer_options=transformer_options)
-    return self.out_proj(out.squeeze(0))
+    out = out.squeeze(0)
+    if fp16:
+        # Both projections are bias-free. Keep the projected result out of fp16 overflow.
+        return self.out_proj(out.div_(64.0)).to(torch.float32).mul_(64.0)
+    return self.out_proj(out)
+
+
+def usp_block_forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}, attention=None):
+    attention = self.attn if attention is None else attention
+    sh_a, sc_a, g_a, sh_m, sc_m, g_m = self.adaln_proj(t_emb)
+    h = _mod_scale_shift(self.norm1(x), sh_a, sc_a, mod_segments)
+    if self.raylight_attention_fp16:
+        h = h.to(torch.float16)
+    att = attention(h, rope_freqs=rope_freqs, transformer_options=transformer_options)
+    x = _mod_gate(x, g_a, att.to(x.dtype), mod_segments)
+    h = _mod_scale_shift(self.norm2(x), sh_m, sc_m, mod_segments)
+    if self.raylight_mlp_fp16:
+        h = h.to(torch.float16)
+    return _mod_gate(x, g_m, self.mlp(h).to(x.dtype), mod_segments)
+
+
+def _mlp_branch(self, x):
+    if x.dtype != torch.float16 and not self.raylight_unfused_mlp:
+        return comfy.ops.linear_input_act(self.fc2, self.fc1(x), "swiglu")
+    gate, up = self.fc1(x).chunk(2, dim=-1)
+    if x.dtype == torch.float16:
+        # SwiGLU and fc2 exceed fp16's range before rescaling.
+        h = torch.nn.functional.silu(gate.to(torch.float32)).mul_(up.to(torch.float32))
+        return self.fc2(h.div_(256.0).to(torch.float16)).to(torch.float32).mul_(256.0)
+    return self.fc2(torch.nn.functional.silu(gate).mul_(up))
 
 
 def usp_mlp_forward(self, x, **kwargs):
-    gate, up = self.fc1(x).chunk(2, dim=-1)
-    return self.fc2(torch.nn.functional.silu(gate).mul_(up))
+    chunk = self.raylight_chunk_tokens
+    if chunk <= 0 or x.shape[0] <= chunk:
+        return _mlp_branch(self, x)
+    out = None
+    for start in range(0, x.shape[0], chunk):
+        piece = _mlp_branch(self, x[start:start + chunk])
+        if out is None:
+            out = piece.new_empty((x.shape[0], piece.shape[-1]))
+        out[start:start + chunk] = piece
+    return out
 
 
 def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_payload=None, denoise_mask=None, audio_denoise_mask=None, **kwargs):
@@ -228,7 +273,8 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     # empty: the padding to the world size is covered by no segment.
     h_orig_size = layout.seq_len
     start, end = _local_range(h_orig_size)
-    h = torch.zeros(end - start, self.hidden_size, dtype=dtype, device=device)
+    residual_dtype = torch.float32 if self.raylight_fp32_residual else dtype
+    h = torch.zeros(end - start, self.hidden_size, dtype=residual_dtype, device=device)
     video_pieces, audio_pieces = [], []
     voff = aoff = 0
     for a, b, kind in layout.segments:
@@ -264,6 +310,9 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
     # ===================== SP SPLIT ====================== #
     rope_freqs, _ = pad_to_world_size(rope_freqs, dim=1)
+    # Control blocks are dense and consume the gathered stream, not the local shard.
+    full_rope_freqs = rope_freqs[:, :h_orig_size]
+    full_mod_segments = mod_segments
     rope_freqs = rope_freqs[:, start:end]
     mod_segments = _localize_segments(mod_segments, start, end)
 
@@ -283,8 +332,8 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
             args = {"img": h, "t_emb": t_emb, "mod_segments": mod_segments, "rope_freqs": rope_freqs,
                     "layout": layout, "transformer_options": transformer_options}
             patch = blocks_replace[("double_block", i)]
-            if isinstance(patch, MiniMaxH3FunControlBlockPatch) and patch.control_patch.active:
-                h = _run_control_patch(patch, args, block_wrap, h_orig_size)
+            if isinstance(patch, MiniMaxH3FunControlBlockPatch):
+                h = _run_control_patch(patch, args, block_wrap, h_orig_size, full_rope_freqs, full_mod_segments)
             else:
                 h = patch(args, {"original_block": block_wrap})["img"]
         else:
