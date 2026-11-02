@@ -68,6 +68,16 @@ restarting Ray Init. Consumers reselect the requested model, loader options, and
 LoRAs before use; matching workers reuse their loaded model. ControlNet conditioning
 also retains its ControlNet and VAE paths for worker-side restoration.
 
+### Distributed VAE decoding
+
+**Distributed VAE (Ray)** automatically spreads stock MiniMax H3 video decoding
+across workers using the VAE's native temporal chunks and overlap. Only assigned
+latent chunks move to each GPU, and worker 0 combines decoded chunks. H3 stills
+and Sol-H3-VAE use native decoding on worker 0. Other supported VAEs retain spatial
+tiling. H3 ignores the node's tile controls; `temporal_size` and `temporal_overlap`
+remain unused compatibility inputs. The existing clear-VRAM setting also releases
+cached worker VAEs after decoding.
+
 ### GPU Requirements
 
 ```mermaid

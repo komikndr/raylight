@@ -50,6 +50,16 @@ class AnyType(str):
 any_type = AnyType("*")
 
 
+def _free_ray_worker_vram_after_decode(ray_actors):
+    gpu_actors = ray_actors["workers"]
+    if not gpu_actors:
+        return
+    parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+    if parallel_dict.get("clear_vram_after_sampling", False):
+        ray.get([actor.free_cached_vae.remote() for actor in gpu_actors])
+        ray.get([actor.clear_sampling_vram.remote() for actor in gpu_actors])
+
+
 def _raylight_ray_tmpdir() -> Path:
     return Path(os.environ.get("RAYLIGHT_RAY_TMPDIR", Path(tempfile.gettempdir()) / "raylight-ray")).resolve()
 
@@ -1729,12 +1739,12 @@ class RayVAEDecodeDistributed:
                         "min": 64,
                         "max": 4096,
                         "step": 32,
-                        "tooltip": "Tile size for spatial decoding. Larger tiles use more memory.",
+                        "tooltip": "Tile size for spatial decoding. Larger tiles use more memory. H3 uses its native decode settings instead.",
                     },
                 ),
                 "overlap": (
                     "INT",
-                    {"default": 64, "min": 0, "max": 4096, "step": 32, "tooltip": "Pixel overlap between tiles to prevent artifacts."},
+                    {"default": 64, "min": 0, "max": 4096, "step": 32, "tooltip": "Pixel overlap between spatial tiles. H3 uses its native decode settings instead."},
                 ),
                 "temporal_size": (
                     "INT",
@@ -1743,7 +1753,7 @@ class RayVAEDecodeDistributed:
                         "min": 8,
                         "max": 4096,
                         "step": 4,
-                        "tooltip": "Retained for workflow compatibility. Distributed video decoding always keeps the complete temporal sequence on one worker; this value is not used for tiling.",
+                        "tooltip": "Retained for workflow compatibility; unused. Stock H3 videos use native temporal chunks; other supported VAEs use spatial tiling.",
                     },
                 ),
                 "temporal_overlap": (
@@ -1753,7 +1763,7 @@ class RayVAEDecodeDistributed:
                         "min": 4,
                         "max": 4096,
                         "step": 4,
-                        "tooltip": "Retained for workflow compatibility. Distributed video decoding always keeps the complete temporal sequence on one worker; this value is not used for tiling.",
+                        "tooltip": "Retained for workflow compatibility; unused. Stock H3 temporal overlap is set by the VAE.",
                     },
                 ),
             }
@@ -1775,6 +1785,21 @@ class RayVAEDecodeDistributed:
         for actor in gpu_actors:
             ray.get(actor.ray_vae_loader.remote(vae_path))
 
+        decode_mode = ray.get(gpu_actors[0].ray_vae_decode_mode.remote())
+        if decode_mode == "native" or (decode_mode == "temporal" and samples["samples"].shape[2] == 1):
+            image = ray.get(gpu_actors[0].ray_vae_decode_native.remote(samples))
+            _free_ray_worker_vram_after_decode(ray_actors)
+            return (image,)
+        if decode_mode == "temporal":
+            futures = [
+                actor.ray_vae_decode_temporal_partial.remote(samples, job_rank=i, job_world_size=len(gpu_actors))
+                for i, actor in enumerate(gpu_actors)
+            ]
+            # Top-level refs let Ray resolve chunks on the combining worker, not the driver.
+            image = ray.get(gpu_actors[0].ray_vae_decode_temporal_combine.remote(*futures))
+            _free_ray_worker_vram_after_decode(ray_actors)
+            return (image,)
+
         futures = [
             actor.ray_vae_decode_partial.remote(
                 samples,
@@ -1791,6 +1816,7 @@ class RayVAEDecodeDistributed:
         worker_partials = ray.get(futures)
         decoded = combine_dist_vae_partials(worker_partials)
         image = ray.get(gpu_actors[0].ray_vae_decode_finalize.remote(decoded.cpu()))
+        _free_ray_worker_vram_after_decode(ray_actors)
         return (image,)
 
 
@@ -1842,6 +1868,7 @@ class RaySeedVR2VAEDecodeDistributed:
         ])
         decoded = combine_seedvr2_vae_partials(worker_partials)
         image = ray.get(gpu_actors[0].ray_vae_decode_finalize.remote(decoded))
+        _free_ray_worker_vram_after_decode(ray_actors)
         return (image,)
 
 

@@ -35,8 +35,12 @@ from raylight.distributed_worker.ray_worker_controlnet import (
 from raylight.distributed_worker.ray_worker_vae import (
     load_vae_model,
     ray_vae_decode_finalize_impl,
+    ray_vae_decode_native_impl,
     ray_vae_decode_partial_impl,
+    ray_vae_decode_temporal_combine_impl,
+    ray_vae_decode_temporal_partial_impl,
     ray_seedvr2_vae_decode_partial_impl,
+    vae_decode_mode,
 )
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
@@ -1217,6 +1221,20 @@ class RayWorker:
     @patch_ray_tqdm
     def ray_vae_decode_partial(self, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8, job_rank=0, job_world_size=1):
         return ray_vae_decode_partial_impl(self, samples, tile_size, overlap, temporal_size, temporal_overlap, job_rank, job_world_size)
+
+    def ray_vae_decode_mode(self):
+        return vae_decode_mode(self.vae_model)
+
+    @patch_ray_tqdm
+    def ray_vae_decode_native(self, samples):
+        return ray_vae_decode_native_impl(self, samples)
+
+    @patch_ray_tqdm
+    def ray_vae_decode_temporal_partial(self, samples, job_rank=0, job_world_size=1):
+        return ray_vae_decode_temporal_partial_impl(self, samples, job_rank, job_world_size)
+
+    def ray_vae_decode_temporal_combine(self, *worker_partials):
+        return ray_vae_decode_temporal_combine_impl(self, worker_partials)
 
     def ray_vae_decode_finalize(self, decoded):
         return ray_vae_decode_finalize_impl(self, decoded)
