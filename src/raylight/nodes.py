@@ -497,6 +497,7 @@ class RayInitializer:
         worker_pinned_memory: bool = False,
         parallel_quant_load: bool = False,
         collective_timeout_minutes: float = 1.0,
+        numa_bind: bool = False,
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
@@ -581,6 +582,7 @@ class RayInitializer:
             vram_headroom=comfy_args.vram_headroom if worker_vram_headroom < 0 else worker_vram_headroom,
             reserve_vram=comfy_args.reserve_vram if worker_reserve_vram < 0 else worker_reserve_vram,
             collective_timeout_minutes=collective_timeout_minutes,
+            numa_bind=numa_bind,
         )
         config = RaylightConfig(loading=LoadingOptions(parallel_quant_load=parallel_quant_load), worker=worker_config)
         if worker_config.attention_backend == "COMFY_KITCHEN_INT8" and worker_config.parallel.ring_degree != 1:
@@ -778,6 +780,13 @@ class RayInitializerAdvanced(RayInitializer):
                 "worker_pinned_memory": ("BOOLEAN", {"default": False}),
                 "parallel_quant_load": ("BOOLEAN", {"default": False, "tooltip": "Load quantized worker models concurrently. Increases peak host RAM."}),
                 "collective_timeout_minutes": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 60.0, "step": 0.5}),
+                "numa_bind": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Bind each worker to the NUMA node its GPU is attached to. CPU affinity is intersected with the inherited affinity and host memory placement is preferred, not strict. Linux only, best effort.",
+                    },
+                ),
             },
         }
 

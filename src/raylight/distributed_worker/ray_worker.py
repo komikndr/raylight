@@ -40,6 +40,7 @@ from raylight.distributed_worker.ray_worker_vae import (
 )
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
+from raylight.numa import bind_to_gpu_node
 from ray.exceptions import RayActorError
 
 
@@ -576,6 +577,11 @@ class RayWorker:
 
         self.device_id = device_id
         self.device = torch.device(f"cuda:{self.device_id}")
+        if config.numa_bind:
+            # Place subsequent allocations and process-group threads near this GPU.
+            placement = bind_to_gpu_node(self.device_id)
+            if placement is not None:
+                print(f"[Raylight][NUMA] rank {self.local_rank} pinned to {placement}", flush=True)
         self.device_mesh = None
         self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
         self.xfuser_parallel = None

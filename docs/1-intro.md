@@ -53,7 +53,11 @@ and resolved ranks remain worker state. The legacy parallel dictionary returned 
 sampler nodes is a derived view, not a second configuration store.
 
 Advanced Ray Init exposes worker VRAM headroom/reserve, pinned memory, quantized-load
-concurrency, and collective timeout. MiniMax precision/chunking comes from
+concurrency, collective timeout, and `numa_bind` (off by default). When enabled on a
+supported Linux host, each worker pins its CPU affinity to the NUMA node its GPU is
+attached to, intersected with any inherited affinity restriction, and requests
+preferred host-memory placement when libnuma is available, without strict binding.
+MiniMax precision/chunking comes from
 **RayWorker Minimax Option**. **COMFY_KITCHEN_INT8** is selected through the existing
 attention backend input and currently requires `ring_degree=1`.
 
