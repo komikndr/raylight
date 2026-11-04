@@ -68,6 +68,15 @@ restarting Ray Init. Consumers reselect the requested model, loader options, and
 LoRAs before use; matching workers reuse their loaded model. ControlNet conditioning
 also retains its ControlNet and VAE paths for worker-side restoration.
 
+### FLUX.3 parallelism
+
+FLUX.3 USP distributes the image-only and joint block sequences, preserving native
+reference/text preprocessing, modulation spans, RoPE, and fused block operations.
+Sequences divisible by the worker count use xFuser attention; other lengths gather
+valid keys/values for native attention without including padding in the softmax.
+Checkpoint-selected or externally overridden attention retains native execution.
+CFG parallelism splits raw references as well as preprocessed conditioning.
+
 ### Distributed VAE decoding
 
 **Distributed VAE (Ray)** automatically spreads stock MiniMax H3 video decoding

@@ -333,6 +333,20 @@ if hasattr(model_base, "ChromaRadiance"):
         model.forward_orig = types.MethodType(usp_dit_forward, model)
 
 
+if hasattr(model_base, "Flux3"):
+
+    @USPInjectRegistry.register(model_base.Flux3)
+    def _inject_flux3(model_patcher, base_model, *args):
+        from ..diffusion_models.flux3.xdit_context_parallel import usp_block_forward, usp_flux3_forward
+
+        model = base_model.diffusion_model
+        blocks = list(model.content_mode_blocks["image"]) + list(model.single_blocks)
+        model.raylight_native_attention = any(block.comfy_attention.function is not None for block in blocks)
+        for block in blocks:
+            block.forward = types.MethodType(usp_block_forward, block)
+        model._forward = types.MethodType(usp_flux3_forward, model)
+
+
 if hasattr(model_base, "Flux"):
 
     @USPInjectRegistry.register(model_base.Flux)

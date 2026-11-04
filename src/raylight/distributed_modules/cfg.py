@@ -153,6 +153,15 @@ if hasattr(model_base, "Chroma"):
         return cfg_parallel_forward_wrapper
 
 
+if hasattr(model_base, "Flux3"):
+
+    @CFGParallelInjectRegistry.register(model_base.Flux3)
+    def _inject_flux3():
+        from ..diffusion_models.flux.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
 if hasattr(model_base, "Flux"):
 
     @CFGParallelInjectRegistry.register(model_base.Flux)
