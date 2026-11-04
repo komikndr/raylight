@@ -1,6 +1,7 @@
 import raylight
 import os
 import gc
+import contextlib
 import json
 import logging
 import shutil
@@ -30,15 +31,15 @@ from .distributed_worker.ray_worker import (
     ensure_fresh_actors,
     ray_nccl_tester,
 )
-from .distributed_worker.ray_worker_vae import combine_dist_vae_partials, combine_seedvr2_vae_partials
 from .distributed_worker.raylightworker_config_schema import LoadingOptions, ModelOptions, RaylightConfig, RayWorkerConfig, XFuserParallelConfig
-from . import progress
+from . import decode_progress, progress
 from .comfy_extra_dist.ray_patch_decorator import prepare_ray_model, ray_model_loader
 from .comfy_extra_dist.nodes_custom_sampler import (
     _clear_ray_worker_vram_after_sampling,
     _free_host_models_if_contended,
     _gather_with_progress,
     _retire_actors_after_fatal,
+    CANCEL_DRAIN_DEFAULT_SECONDS,
 )
 
 
@@ -50,14 +51,41 @@ class AnyType(str):
 any_type = AnyType("*")
 
 
-def _free_ray_worker_vram_after_decode(ray_actors):
+def _free_ray_worker_vram_after_decode(ray_actors, force=False):
     gpu_actors = ray_actors["workers"]
     if not gpu_actors:
         return
-    parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
-    if parallel_dict.get("clear_vram_after_sampling", False):
-        ray.get([actor.free_cached_vae.remote() for actor in gpu_actors])
-        ray.get([actor.clear_sampling_vram.remote() for actor in gpu_actors])
+    if not force:
+        parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+        if not parallel_dict.get("clear_vram_after_sampling", False):
+            return
+    try:
+        refs = [actor.free_cached_vae.remote() for actor in gpu_actors]
+        refs += [actor.clear_sampling_vram.remote() for actor in gpu_actors]
+        if force:
+            ray.get(refs, timeout=CANCEL_DRAIN_DEFAULT_SECONDS)
+        else:
+            ray.get(refs)
+    except ray.exceptions.RayError:
+        if not force:
+            raise
+        logging.warning("[Raylight] could not clean up every decode worker")
+
+
+@contextlib.contextmanager
+def _decode_session(ray_actors):
+    progress.reset_cancel()
+    decode_progress.clear()
+    try:
+        yield
+        _free_ray_worker_vram_after_decode(ray_actors)
+    except Exception as error:
+        _retire_actors_after_fatal(ray_actors, error)
+        _free_ray_worker_vram_after_decode(ray_actors, force=True)
+        raise
+    finally:
+        progress.reset_cancel()
+        decode_progress.clear()
 
 
 def _raylight_ray_tmpdir() -> Path:
@@ -1782,42 +1810,42 @@ class RayVAEDecodeDistributed:
             raise ValueError("Distributed VAE (Ray) requires at least one Ray worker.")
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
 
-        for actor in gpu_actors:
-            ray.get(actor.ray_vae_loader.remote(vae_path))
+        with _decode_session(ray_actors):
+            for actor in gpu_actors:
+                _gather_with_progress([actor.ray_vae_decode_load.remote(vae_path)], ray_actors, independent=True, progress_reader=lambda: None)
+            decode_mode = _gather_with_progress(
+                [gpu_actors[0].ray_vae_decode_mode.remote()], ray_actors, independent=True, progress_reader=lambda: None
+            )[0]
+            if decode_mode == "native" or (decode_mode == "temporal" and samples["samples"].shape[2] == 1):
+                image = _gather_with_progress(
+                    [gpu_actors[0].ray_vae_decode_native.remote(samples)], ray_actors,
+                    independent=True, progress_reader=lambda: decode_progress.read(["native"]),
+                )[0]
+                return (image,)
 
-        decode_mode = ray.get(gpu_actors[0].ray_vae_decode_mode.remote())
-        if decode_mode == "native" or (decode_mode == "temporal" and samples["samples"].shape[2] == 1):
-            image = ray.get(gpu_actors[0].ray_vae_decode_native.remote(samples))
-            _free_ray_worker_vram_after_decode(ray_actors)
+            parts = [f"rank{i}" for i in range(len(gpu_actors))] + ["combine", "finalize"]
+            if decode_mode == "temporal":
+                futures = [
+                    actor.ray_vae_decode_temporal_partial.remote(samples, job_rank=i, job_world_size=len(gpu_actors))
+                    for i, actor in enumerate(gpu_actors)
+                ]
+                partials, statuses = zip(*futures)
+                combined = gpu_actors[0].ray_vae_decode_temporal_combine.remote(*partials)
+            else:
+                futures = [
+                    actor.ray_vae_decode_partial.remote(
+                        samples, tile_size, overlap=overlap, temporal_size=temporal_size,
+                        temporal_overlap=temporal_overlap, job_rank=i, job_world_size=len(gpu_actors),
+                    )
+                    for i, actor in enumerate(gpu_actors)
+                ]
+                partials, statuses = zip(*futures)
+                combined = gpu_actors[0].ray_vae_decode_spatial_combine.remote(*partials)
+            # Watch small status refs as well as the result, without fetching raw tiles.
+            image = _gather_with_progress(
+                [*statuses, combined], ray_actors, independent=True, progress_reader=lambda: decode_progress.read(parts)
+            )[-1]
             return (image,)
-        if decode_mode == "temporal":
-            futures = [
-                actor.ray_vae_decode_temporal_partial.remote(samples, job_rank=i, job_world_size=len(gpu_actors))
-                for i, actor in enumerate(gpu_actors)
-            ]
-            # Top-level refs let Ray resolve chunks on the combining worker, not the driver.
-            image = ray.get(gpu_actors[0].ray_vae_decode_temporal_combine.remote(*futures))
-            _free_ray_worker_vram_after_decode(ray_actors)
-            return (image,)
-
-        futures = [
-            actor.ray_vae_decode_partial.remote(
-                samples,
-                tile_size,
-                overlap=overlap,
-                temporal_size=temporal_size,
-                temporal_overlap=temporal_overlap,
-                job_rank=i,
-                job_world_size=len(gpu_actors),
-            )
-            for i, actor in enumerate(gpu_actors)
-        ]
-
-        worker_partials = ray.get(futures)
-        decoded = combine_dist_vae_partials(worker_partials)
-        image = ray.get(gpu_actors[0].ray_vae_decode_finalize.remote(decoded.cpu()))
-        _free_ray_worker_vram_after_decode(ray_actors)
-        return (image,)
 
 
 class RaySeedVR2VAEDecodeDistributed:
@@ -1854,22 +1882,24 @@ class RaySeedVR2VAEDecodeDistributed:
         if not gpu_actors:
             raise ValueError("SeedVR2 distributed decode requires at least one Ray worker.")
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
-        ray.get([actor.ray_vae_loader.remote(vae_path) for actor in gpu_actors])
-
-        worker_partials = ray.get([
-            actor.ray_seedvr2_vae_decode_partial.remote(
-                samples,
-                tile_size,
-                overlap=overlap,
-                job_rank=i,
-                job_world_size=len(gpu_actors),
+        with _decode_session(ray_actors):
+            _gather_with_progress(
+                [actor.ray_vae_decode_load.remote(vae_path) for actor in gpu_actors], ray_actors,
+                independent=True, progress_reader=lambda: None,
             )
-            for i, actor in enumerate(gpu_actors)
-        ])
-        decoded = combine_seedvr2_vae_partials(worker_partials)
-        image = ray.get(gpu_actors[0].ray_vae_decode_finalize.remote(decoded))
-        _free_ray_worker_vram_after_decode(ray_actors)
-        return (image,)
+            futures = [
+                actor.ray_seedvr2_vae_decode_partial.remote(
+                    samples, tile_size, overlap=overlap, job_rank=i, job_world_size=len(gpu_actors),
+                )
+                for i, actor in enumerate(gpu_actors)
+            ]
+            partials, statuses = zip(*futures)
+            combined = gpu_actors[0].ray_seedvr2_vae_decode_combine.remote(*partials)
+            parts = [f"rank{i}" for i in range(len(gpu_actors))] + ["combine", "finalize"]
+            image = _gather_with_progress(
+                [*statuses, combined], ray_actors, independent=True, progress_reader=lambda: decode_progress.read(parts)
+            )[-1]
+            return (image,)
 
 
 NODE_CLASS_MAPPINGS = {

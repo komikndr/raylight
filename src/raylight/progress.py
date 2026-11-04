@@ -80,7 +80,7 @@ def use_local_board(board):
     _local = board
 
 
-def _call(method, *args, wait=True):
+def _call(method, *args, wait=True, timeout=5):
     if _local is not None:
         return getattr(_local, method)(*args)
     name = os.environ.get(BOARD_ENV)
@@ -93,7 +93,7 @@ def _call(method, *args, wait=True):
         if _handle is None or _handle[0] != name:
             _handle = (name, ray.get_actor(name))
         ref = getattr(_handle[1], method).remote(*args)
-        return ray.get(ref, timeout=5) if wait else None
+        return ray.get(ref, timeout=timeout) if wait else None
     except Exception:
         _handle = None
         return None
@@ -108,8 +108,8 @@ def get(key):
     return _call("get", key)
 
 
-def items(prefix):
-    return _call("items", prefix) or {}
+def items(prefix, timeout=5):
+    return _call("items", prefix, timeout=timeout) or {}
 
 
 def clear_keys(prefix):

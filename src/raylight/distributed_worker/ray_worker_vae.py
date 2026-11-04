@@ -2,6 +2,7 @@ import torch
 
 import comfy.model_management as model_management
 from comfy.ldm.minimax.vae import MiniMaxH3VideoVAE
+from raylight import decode_progress
 
 
 def load_vae_model(vae_path):
@@ -130,13 +131,19 @@ def vae_decode_mode(vae):
 
 
 def ray_vae_decode_native_impl(worker, samples):
+    decode_progress.check_cancel(force=True)
+    decode_progress.write("native", 0, 1)
     images = worker.vae_model.decode(samples["samples"])
     if images.ndim == 5:
         images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
-    return images.cpu()
+    images = images.cpu()
+    decode_progress.check_cancel()
+    decode_progress.write("native", 1, 1)
+    return images
 
 
 def ray_vae_decode_temporal_partial_impl(worker, samples, job_rank=0, job_world_size=1):
+    decode_progress.check_cancel(force=True)
     _validate_job_rank(job_rank, job_world_size)
 
     vae = worker.vae_model
@@ -153,12 +160,15 @@ def ray_vae_decode_temporal_partial_impl(worker, samples, job_rank=0, job_world_
     pad_tokens, num_chunks = model._decode_temporal_chunks(latent.shape[2])
     chunks = []
     chunk_indices = range(job_rank, num_chunks, job_world_size)
+    part = f"rank{job_rank}"
+    decode_progress.write(part, 0, len(chunk_indices))
     if chunk_indices:
         memory_used = vae.memory_used_decode(latent.shape, vae.vae_dtype)
         model_management.load_models_gpu([vae.patcher], memory_required=memory_used, force_full_load=vae.disable_offload)
 
         with model_management.cuda_device_context(vae.device):
             for chunk_index in chunk_indices:
+                decode_progress.check_cancel()
                 start = chunk_index * model.tokens_chunk_size
                 end = min(start + model.tokens_chunk_size + model.token_overlap, latent.shape[2] + pad_tokens)
                 clip_z = latent[:, :, start:min(end, latent.shape[2])].to(device=vae.device, dtype=vae.vae_dtype)
@@ -172,6 +182,8 @@ def ray_vae_decode_temporal_partial_impl(worker, samples, job_rank=0, job_world_
                 clip_dec = model._adaptive_decode(clip_z)
                 chunks.append((chunk_index, clip_dec.to(device="cpu", copy=True)))
                 del clip_dec, clip_z
+                decode_progress.check_cancel()
+                decode_progress.write(part, len(chunks), len(chunk_indices))
 
     return {
         "num_chunks": num_chunks,
@@ -202,6 +214,8 @@ def _collect_temporal_chunks(worker_partials):
 
 
 def combine_temporal_vae_chunks(model, device, output_shape, chunks):
+    decode_progress.check_cancel(force=True)
+    decode_progress.write("combine", 0, len(chunks))
     chunk_dec = model.tokens_chunk_size * model.vae_ratio_t
     split_count = int(model.token_drop > 0) + 1
     dec = torch.empty(output_shape, dtype=torch.float32, device="cpu")
@@ -210,6 +224,7 @@ def combine_temporal_vae_chunks(model, device, output_shape, chunks):
 
     def write_part(part):
         nonlocal write_pos
+        decode_progress.check_cancel()
         part_frames = part.shape[2]
         if part_frames <= 0:
             return
@@ -220,6 +235,7 @@ def combine_temporal_vae_chunks(model, device, output_shape, chunks):
             write_pos += copy_frames
 
     for chunk_index, chunk in enumerate(chunks):
+        decode_progress.check_cancel()
         clip_dec = chunk.to(device)
         for j in range(split_count):
             start = j * chunk_dec
@@ -237,6 +253,8 @@ def combine_temporal_vae_chunks(model, device, output_shape, chunks):
             write_part(dec_overlap)
             dec_overlap = None
         del clip_dec, clip_dec_chunk
+        decode_progress.check_cancel()
+        decode_progress.write("combine", chunk_index + 1, len(chunks))
 
     if write_pos != dec.shape[2]:
         raise ValueError(f"Distributed temporal decode wrote {write_pos} frames, expected {dec.shape[2]}.")
@@ -255,6 +273,7 @@ def ray_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, temporal
     import comfy.model_management as model_management
 
     _validate_job_rank(job_rank, job_world_size)
+    decode_progress.check_cancel(force=True)
 
     vae = worker.vae_model
 
@@ -301,6 +320,8 @@ def ray_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, temporal
     pos_2 = _get_pos_func(index_formula, upscale, 2) if spatial_dims >= 3 else None
 
     partials = []
+    part = f"rank{job_rank}"
+    done = 0
 
     if spatial_dims == 1 or extra_channels is not None:
         if latent.ndim == 3:
@@ -315,12 +336,15 @@ def ray_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, temporal
             og_C = partial_latent.shape[1]
 
         tile_ranges = _compute_1d_tile_ranges(partial_latent.shape[2], tile_x, overlap_latent)
+        total = len(range(job_rank, len(tile_ranges), job_world_size))
+        decode_progress.write(part, 0, total)
 
         tiles = []
         job_index = 0
         with model_management.cuda_device_context(vae.device):
             for x, x_end in tile_ranges:
                 if job_index % job_world_size == job_rank:
+                    decode_progress.check_cancel()
                     tile = partial_latent[:, :, x:x_end]
                     if extra_channels is not None:
                         tile = tile.reshape(tile.shape[0], og_C, extra_channels, -1)
@@ -329,6 +353,9 @@ def ray_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, temporal
                         decoded = decoded.reshape(decoded.shape[0], -1, decoded.shape[-1])
                     x_out = _round_upscale(pos_0, x)
                     tiles.append((x, x_out, decoded.to(device="cpu", dtype=decode_dtype, copy=True)))
+                    done += 1
+                    decode_progress.check_cancel()
+                    decode_progress.write(part, done, total)
                 job_index += 1
 
         output_shape = [partial_latent.shape[0], vae.output_channels]
@@ -345,19 +372,28 @@ def ray_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, temporal
         })
 
     elif spatial_dims == 2:
-        for pass_idx, (pass_tile_x, pass_tile_y) in enumerate(((tile_x // 2, tile_y * 2), (tile_x * 2, tile_y // 2), (tile_x, tile_y))):
-            tile_ranges = _compute_2d_tile_ranges(latent.shape[2], latent.shape[3], pass_tile_y, pass_tile_x, overlap_latent)
+        pass_ranges = [
+            _compute_2d_tile_ranges(latent.shape[2], latent.shape[3], pass_tile_y, pass_tile_x, overlap_latent)
+            for pass_tile_x, pass_tile_y in ((tile_x // 2, tile_y * 2), (tile_x * 2, tile_y // 2), (tile_x, tile_y))
+        ]
+        total = sum(len(range(job_rank, len(ranges), job_world_size)) for ranges in pass_ranges)
+        decode_progress.write(part, 0, total)
+        for pass_idx, tile_ranges in enumerate(pass_ranges):
 
             tiles = []
             job_index = 0
             with model_management.cuda_device_context(vae.device):
                 for y, y_end, x, x_end in tile_ranges:
                     if job_index % job_world_size == job_rank:
+                        decode_progress.check_cancel()
                         tile = latent[:, :, y:y_end, x:x_end]
                         decoded = vae.first_stage_model.decode(tile.to(vae.device, dtype=vae.vae_dtype))
                         y_out = _round_upscale(pos_0, y)
                         x_out = _round_upscale(pos_1, x)
                         tiles.append((y, x, y_out, x_out, decoded.to(device="cpu", dtype=decode_dtype, copy=True)))
+                        done += 1
+                        decode_progress.check_cancel()
+                        decode_progress.write(part, done, total)
                     job_index += 1
 
             output_shape = [latent.shape[0], vae.output_channels]
@@ -376,17 +412,23 @@ def ray_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, temporal
 
     elif spatial_dims == 3:
         tile_ranges = _compute_2d_tile_ranges(latent.shape[3], latent.shape[4], tile_y, tile_x, overlap_latent)
+        total = len(range(job_rank, len(tile_ranges), job_world_size))
+        decode_progress.write(part, 0, total)
 
         tiles = []
         job_index = 0
         with model_management.cuda_device_context(vae.device):
             for y, y_end, x, x_end in tile_ranges:
                 if job_index % job_world_size == job_rank:
+                    decode_progress.check_cancel()
                     tile = latent[:, :, :, y:y_end, x:x_end]
                     decoded = vae.first_stage_model.decode(tile.to(vae.device, dtype=vae.vae_dtype))
                     y_out = _round_upscale(pos_1, y)
                     x_out = _round_upscale(pos_2, x)
                     tiles.append((y, x, y_out, x_out, decoded.to(device="cpu", dtype=decode_dtype, copy=True)))
+                    done += 1
+                    decode_progress.check_cancel()
+                    decode_progress.write(part, done, total)
                 job_index += 1
 
         output_shape = [latent.shape[0], vae.output_channels]
@@ -407,6 +449,7 @@ def ray_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, temporal
     else:
         raise ValueError(f"Unsupported VAE latent dimensions: {spatial_dims}")
 
+    decode_progress.check_cancel()
     return partials
 
 
@@ -448,6 +491,7 @@ def _validate_worker_passes(worker_partials, expected_passes, spatial_dims):
 
 
 def combine_dist_vae_partials(worker_partials):
+    decode_progress.check_cancel(force=True)
     if not worker_partials:
         raise ValueError("Distributed VAE decode received no worker results.")
 
@@ -469,7 +513,11 @@ def combine_dist_vae_partials(worker_partials):
             passes.setdefault(idx, []).append(partial)
 
     decoded_passes = []
+    total = sum(len(partial["tiles"]) for group in passes.values() for partial in group)
+    done = 0
+    decode_progress.write("combine", 0, total)
     for pass_index in sorted(passes.keys()):
+        decode_progress.check_cancel()
         group = passes[pass_index]
         first = group[0]
         output_shape = tuple(first["output_shape"])
@@ -501,6 +549,7 @@ def combine_dist_vae_partials(worker_partials):
 
         for partial in group:
             for tile in partial["tiles"]:
+                decode_progress.check_cancel()
                 decoded_tile = tile[-1]
 
                 if spatial_dims == 1:
@@ -584,6 +633,10 @@ def combine_dist_vae_partials(worker_partials):
                     out_slice.add_(decoded_tile.float() * weight)
                     div_slice.add_(weight)
 
+                done += 1
+                decode_progress.check_cancel()
+                decode_progress.write("combine", done, total)
+
         if torch.any(output_div == 0):
             raise RuntimeError("Distributed VAE decode did not cover the complete output.")
         decoded_passes.append(output / output_div)
@@ -591,6 +644,7 @@ def combine_dist_vae_partials(worker_partials):
     decoded = decoded_passes[0]
     if len(decoded_passes) > 1:
         decoded = sum(decoded_passes) / len(decoded_passes)
+    decode_progress.check_cancel()
     return decoded
 
 
@@ -635,6 +689,7 @@ def ray_seedvr2_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, 
     import comfy.model_management as model_management
     from comfy.ldm.seedvr.vae import VideoAutoencoderKLWrapper
 
+    decode_progress.check_cancel(force=True)
     vae = worker.vae_model
     model = vae.first_stage_model
     if not isinstance(model, VideoAutoencoderKLWrapper):
@@ -662,13 +717,19 @@ def ray_seedvr2_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, 
 
     tiles = []
     job_index = 0
+    part = f"rank{job_rank}"
+    total = len(range(job_rank, latent.shape[0] * len(tile_ranges), job_world_size))
+    decode_progress.write(part, 0, total)
     with model_management.cuda_device_context(vae.device):
         for batch_index in range(latent.shape[0]):
             for y, y_end, x, x_end in tile_ranges:
                 if job_index % job_world_size == job_rank:
+                    decode_progress.check_cancel()
                     tile = latent[batch_index:batch_index + 1, :, :, y:y_end, x:x_end]
                     decoded = model.decode(tile.to(device=vae.device, dtype=vae.vae_dtype))
                     tiles.append((batch_index, y, y_end, x, x_end, decoded.to(device="cpu", dtype=torch.float32, copy=True)))
+                    decode_progress.check_cancel()
+                    decode_progress.write(part, len(tiles), total)
                 job_index += 1
 
     output_shape = (
@@ -678,6 +739,7 @@ def ray_seedvr2_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, 
         latent.shape[3] * spatial_scale,
         latent.shape[4] * spatial_scale,
     )
+    decode_progress.check_cancel()
     return {
         "output_shape": output_shape,
         "latent_spatial_shape": (latent.shape[3], latent.shape[4]),
@@ -689,6 +751,7 @@ def ray_seedvr2_vae_decode_partial_impl(worker, samples, tile_size, overlap=64, 
 
 
 def combine_seedvr2_vae_partials(worker_partials):
+    decode_progress.check_cancel(force=True)
     if not worker_partials:
         raise ValueError("SeedVR2 distributed decode received no worker results.")
 
@@ -705,6 +768,9 @@ def combine_seedvr2_vae_partials(worker_partials):
     output = torch.zeros(output_shape, dtype=torch.float32)
     output_div = torch.zeros((output_shape[0], 1, 1, output_shape[3], output_shape[4]), dtype=torch.float32)
     ramp_cache = {}
+    total = sum(len(partial["tiles"]) for partial in worker_partials)
+    done = 0
+    decode_progress.write("combine", 0, total)
 
     def get_ramp(steps):
         if steps not in ramp_cache:
@@ -723,6 +789,7 @@ def combine_seedvr2_vae_partials(worker_partials):
         if metadata != expected_metadata:
             raise ValueError("SeedVR2 distributed decode workers returned inconsistent tiling metadata.")
         for batch_index, y, y_end, x, x_end, tile in partial["tiles"]:
+            decode_progress.check_cancel()
             if not 0 <= batch_index < output_shape[0]:
                 raise ValueError(f"SeedVR2 distributed decode returned invalid batch index {batch_index}.")
             if tile.ndim != 5 or tile.shape[0] != 1 or tile.shape[1] != output_shape[1] or tile.shape[2] != output_shape[2]:
@@ -752,14 +819,24 @@ def combine_seedvr2_vae_partials(worker_partials):
                 raise ValueError("SeedVR2 distributed decode returned a tile outside the output bounds.")
             output[batch_index:batch_index + 1, :, :, y_out:y_out + tile.shape[3], x_out:x_out + tile.shape[4]].add_(tile * weight)
             output_div[batch_index:batch_index + 1, :, :, y_out:y_out + tile.shape[3], x_out:x_out + tile.shape[4]].add_(weight)
+            done += 1
+            decode_progress.check_cancel()
+            decode_progress.write("combine", done, total)
 
     if torch.any(output_div == 0):
         raise RuntimeError("SeedVR2 distributed decode did not cover the complete output.")
-    return output / output_div
+    decoded = output / output_div
+    decode_progress.check_cancel()
+    return decoded
 
 
 def ray_vae_decode_finalize_impl(worker, decoded):
+    decode_progress.check_cancel(force=True)
+    decode_progress.write("finalize", 0, 1)
     images = worker.vae_model.process_output(decoded).movedim(1, -1)
     if len(images.shape) == 5:
         images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
-    return images.cpu()
+    images = images.cpu()
+    decode_progress.check_cancel()
+    decode_progress.write("finalize", 1, 1)
+    return images

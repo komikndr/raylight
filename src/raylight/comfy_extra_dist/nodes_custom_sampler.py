@@ -11,6 +11,7 @@ import comfy.sample
 from comfy.k_diffusion import sa_solver
 from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
 import comfy.utils
+import comfy.model_management
 from raylight.distributed_worker.ray_worker import retire_actors
 from raylight import progress
 from .ray_patch_decorator import prepare_ray_model, ray_patch_with_return
@@ -538,16 +539,15 @@ def _fail_with_peers(failure, pending, ray_actors, slowest_checkpoint):
     raise failure
 
 
-def _gather_with_progress(futures, ray_actors=None):
-    """Wait on the sampling futures while relaying worker progress to the UI.
+def _gather_with_progress(futures, ray_actors=None, *, independent=False, progress_reader=None):
+    """Wait on worker futures while relaying progress to the UI.
 
-    ray.get() would block until sampling finished, leaving the node at 0% for
-    the whole render. Poll instead, and forward whatever rank 0 published to a
-    host-side ProgressBar, which does have the server's hook attached.
+    Poll instead of blocking in ray.get(), forwarding worker progress to a
+    host-side ProgressBar with the server's hook attached. Independent tasks
+    use cooperative cancellation without the sampling ranks' peer deadline.
     """
-    import comfy.model_management
-    import comfy.utils
     pending = list(futures)
+    read_progress = progress.read if progress_reader is None else progress_reader
     pbar = comfy.utils.ProgressBar(1)
     last = None
     last_preview_seq = -1
@@ -559,11 +559,13 @@ def _gather_with_progress(futures, ray_actors=None):
             _ready, pending = ray.wait(pending, num_returns=len(pending), timeout=0.5)
             failure = _first_failure(_ready)
             if failure is not None:
+                if independent:
+                    raise failure
                 _fail_with_peers(failure, pending, ray_actors, max(checkpoints) if checkpoints else 0.0)
             #Checked every pass rather than only when the bar moves: a render that
             #has stopped publishing progress is exactly the one worth cancelling.
             comfy.model_management.throw_exception_if_processing_interrupted()
-            current = progress.read()
+            current = read_progress()
             if current is not None and current != last:
                 now = time.monotonic()
                 #The gap before the first checkpoint covers loading the model, so
@@ -573,13 +575,27 @@ def _gather_with_progress(futures, ray_actors=None):
                 seen_at = now
                 last = current
                 value, total, preview_seq = current
-                if preview_seq != last_preview_seq:
+                if not independent and preview_seq != last_preview_seq:
                     last_preview_seq = preview_seq
                     image = progress.read_preview()
                     preview = ("JPEG", image, 512) if image is not None else None
                 pbar.update_absolute(min(value, total), total, preview)
         return ray.get(futures)
-    except comfy.model_management.InterruptProcessingException:
+    except Exception as error:
+        if independent:
+            progress.request_cancel()
+            # Independent tasks can be at different chunk boundaries. One reply
+            # does not shorten the grace period for the other workers.
+            grace = max(CANCEL_DRAIN_DEFAULT_SECONDS, _drain_seconds(max(checkpoints) if checkpoints else 0.0))
+            try:
+                _done, stuck = ray.wait(futures, num_returns=len(futures), timeout=grace)
+            except ray.exceptions.RayError:
+                stuck = futures
+            if stuck and ray_actors is not None:
+                retire_actors(ray_actors, "%d decode task(s) did not stop" % len(stuck))
+            raise
+        if not isinstance(error, comfy.model_management.InterruptProcessingException):
+            raise
         #Leaving now only stops the host waiting; the workers would sample to the
         #end on a result nobody reads, holding the devices for the whole render.
         progress.request_cancel()
@@ -595,6 +611,9 @@ def _gather_with_progress(futures, ray_actors=None):
             retire_actors(ray_actors, "%d worker(s) that did not answer a cancel"
                           % len(stuck))
         raise
+    finally:
+        if independent:
+            progress.reset_cancel()
 
 
 class XFuserSamplerCustomAdvanced:

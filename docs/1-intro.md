@@ -78,6 +78,14 @@ tiling. H3 ignores the node's tile controls; `temporal_size` and `temporal_overl
 remain unused compatibility inputs. The existing clear-VRAM setting also releases
 cached worker VAEs after decoding.
 
+Distributed decoding reports progress for each worker's chunks or tiles, combining,
+and finalization, using fixed task shares so late-starting workers do not change the
+total. Cancellation is cooperative at these boundaries and before/after loading or
+native decoding; it cannot interrupt a running CUDA kernel. Workers that stop are
+reused after cleanup. Unresponsive tasks get a full grace period (60–180 seconds),
+then the worker group is retired and recreated on the next run. Decode failures
+also cancel peer work and force cleanup, independently of the clear-VRAM setting.
+
 ### GPU Requirements
 
 ```mermaid
