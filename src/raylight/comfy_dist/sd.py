@@ -553,7 +553,7 @@ def load_lora_for_models_quantized(model, lora, strength_model, dynamic_sidecar=
     if isinstance(new_modelpatcher.model, model_base.MiniMaxH3) and new_modelpatcher.fsdp_state_dict is not None:
         for name in ("video_out", "audio_out"):
             module = getattr(new_modelpatcher.model.diffusion_model.final_layer, name)
-            if module.weight.shape[0] > module.out_features:
+            if module is not None and module.weight.shape[0] > module.out_features:
                 reshape_modules.add(f"diffusion_model.final_layer.{name}")
 
     for loaded_key, patch_data in loaded.items():

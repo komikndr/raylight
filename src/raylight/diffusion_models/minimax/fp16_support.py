@@ -20,15 +20,24 @@ class MiniMaxH3FP16(model_base.MiniMaxH3):
         return super().extra_conds(**kwargs)
 
 
+class MiniMaxH3ImageFP16(MiniMaxH3FP16, model_base.MiniMaxH3Image):
+    pass
+
+
 class MiniMaxH3FP16Config(supported_models.MiniMaxH3):
     supported_inference_dtypes = [torch.bfloat16, torch.float16, torch.float32]
+    model_class = MiniMaxH3FP16
 
     def get_model(self, state_dict, prefix="", device=None):
         compute_dtype = self.manual_cast_dtype or self.unet_config.get("dtype")
         if compute_dtype == torch.float16 and self.quant_config is None and self.custom_operations is None:
             # The fp32 text/residual paths also need input-aware casts for plain fp16 weights.
             self.custom_operations = comfy.ops.manual_cast
-        return MiniMaxH3FP16(self, device=device)
+        return self.model_class(self, device=device)
+
+
+class MiniMaxH3ImageFP16Config(MiniMaxH3FP16Config, supported_models.MiniMaxH3Image):
+    model_class = MiniMaxH3ImageFP16
 
 
 @contextmanager
@@ -39,8 +48,9 @@ def minimax_fp16_config(options):
         return
     # Scope detection to this worker's load; do not alter the upstream dtype class.
     original = supported_models.models
-    supported_models.models = [MiniMaxH3FP16Config if model is supported_models.MiniMaxH3 else model
-                               for model in original]
+    replacements = {supported_models.MiniMaxH3: MiniMaxH3FP16Config,
+                    supported_models.MiniMaxH3Image: MiniMaxH3ImageFP16Config}
+    supported_models.models = [replacements.get(model, model) for model in original]
     try:
         yield
     finally:

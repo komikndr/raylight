@@ -2,7 +2,8 @@ import torch
 
 import comfy
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3FunControlBlockPatch
-from comfy.ldm.minimax.model import _mod_gate, _mod_scale_shift, AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP, PackedLayout, mask_row_values, pack_audio, patchify_video, rope_rotation_table, time_shift_sigma, unpack_audio, unpatchify_video
+from comfy.ldm.minimax.model import _mod_gate, _mod_scale_shift, _tag_runs, AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP, SEG_TAG, PackedLayout, mask_row_values, pack_audio, patchify_video, pdd_grid, rope_rotation_table, time_shift_sigma, unpack_audio, unpatchify_video
+from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention, wrap_attn
 from xfuser.core.distributed import get_sequence_parallel_rank, get_sequence_parallel_world_size, get_sp_group
 
 import raylight.distributed_modules.attention as xfuser_attn
@@ -11,7 +12,7 @@ from ..utils import pad_to_world_size
 
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
+xfuser_optimized_attention = wrap_attn(xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses))
 
 
 def _local_range(seq_len):
@@ -106,7 +107,18 @@ def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}, **kwargs)
     q = q.transpose(0, 1).unsqueeze(0)
     k = k.transpose(0, 1).unsqueeze(0)
     v = v.transpose(0, 1).unsqueeze(0)
-    out = xfuser_optimized_attention(q, k, v, self.heads, skip_reshape=True, transformer_options=transformer_options)
+    length = transformer_options["minimax_h3_layout"].seq_len
+    if length % get_sequence_parallel_world_size():
+        # Keep padding out of the softmax when the packed sequence does not divide evenly.
+        k = get_sp_group().all_gather(k.contiguous(), dim=2)[:, :, :length]
+        v = get_sp_group().all_gather(v.contiguous(), dim=2)[:, :, :length]
+        out = optimized_attention(
+            AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v), self.heads,
+            preferred_attention=self.comfy_attention, skip_reshape=True, transformer_options=transformer_options)
+    else:
+        out = xfuser_optimized_attention(
+            AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v), self.heads,
+            preferred_attention=self.comfy_attention, skip_reshape=True, transformer_options=transformer_options)
     out = out.squeeze(0)
     if fp16:
         # Both projections are bias-free. Keep the projected result out of fp16 overflow.
@@ -153,7 +165,8 @@ def usp_mlp_forward(self, x, **kwargs):
 
 
 def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_payload=None, denoise_mask=None, audio_denoise_mask=None, **kwargs):
-    video_x, audio_x = x[0], x[1]
+    image_model = self.audio_latents_dim is None
+    video_x, audio_x = (x, None) if image_model else (x[0], x[1])
     orig_t, orig_h, orig_w = video_x.shape[2], video_x.shape[3], video_x.shape[4]
     video_x = comfy.ldm.common_dit.pad_to_patch_size(video_x, self.patch_size)
     if video_x.shape[0] != 1:
@@ -163,7 +176,7 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     dtype = context.dtype  # compute dtype
 
     latent_t, lat_h, lat_w = video_x.shape[2], video_x.shape[3], video_x.shape[4]
-    audio_t = audio_x.shape[-1]
+    audio_t = 0 if image_model else audio_x.shape[-1]
     text_len = context.shape[1]
     # extra_conds prebuilds the layout once per sampling run
     layout = payload.get("layout")
@@ -174,14 +187,20 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     transformer_options["minimax_h3_layout"] = layout
 
     # model_base passes model_sampling.timestep(sigma) = sigma * 1000
-    shift_v = float(transformer_options.get("minimax_h3_sigma_shift_video", self.sigma_shift_video))
-    shift_a = float(transformer_options.get("minimax_h3_sigma_shift_audio", self.sigma_shift_audio))
-    sigma_v = (timestep.flatten()[0] / 1000.0).float().clamp(min=1e-6)
-    t_v = float(1.0 - sigma_v)
-    t_a = float(1.0 - time_shift_sigma(sigma_v, shift_v, shift_a))
+    if image_model:
+        sigma_v = float(timestep.flatten()[0]) / 1000.0
+        t_v = t_a = 1.0 - sigma_v
+        # The native image forward does not consume denoise masks or condition-noise timestep overrides.
+        denoise_mask = audio_denoise_mask = None
+    else:
+        shift_v = float(transformer_options.get("minimax_h3_sigma_shift_video", self.sigma_shift_video))
+        shift_a = float(transformer_options.get("minimax_h3_sigma_shift_audio", self.sigma_shift_audio))
+        sigma_v = (timestep.flatten()[0] / 1000.0).float().clamp(min=1e-6)
+        t_v = float(1.0 - sigma_v)
+        t_a = float(1.0 - time_shift_sigma(sigma_v, shift_v, shift_a))
 
     # distinct timesteps are known analytically: text/pad follow video, cond rows pin near 1
-    vis_aug = float(payload.get("visual_cond_noise_aug", VISUAL_COND_TIMESTEP))
+    vis_aug = VISUAL_COND_TIMESTEP if image_model else float(payload.get("visual_cond_noise_aug", VISUAL_COND_TIMESTEP))
     aud_aug = float(payload.get("audio_cond_noise_aug", AUDIO_COND_TIMESTEP))
     seg_t = {"text": t_v, "video": t_v, "audio": t_a,
              "cond": max(t_v, vis_aug), "ref_img": max(t_v, vis_aug),
@@ -215,7 +234,6 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
                       | (set(video_rows_t.unique().tolist()) if video_rows_t is not None else set())
                       | (set(audio_rows_t.unique().tolist()) if audio_rows_t is not None else set()))
     t_row = {t: i for i, t in enumerate(unique_t)}
-    seg_tag = {"text": 1, "video": 0, "audio": 2, "cond": 0, "ref_img": 0, "cond_audio": 2, "ref_audio": 2}
 
     def rows_to_mod_index(rows_t, tag):
         # per-row timestep values -> per-row mod-row indices into the t_emb table
@@ -229,38 +247,33 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     for a, b, kind in layout.segments:
         row_base = t_row[seg_t[kind]] * 3
         if kind == "text" and text_tags is not None:
-            # the presentation text span mixes tags (vision pads carry the video modality) split into tag runs
-            tags = text_tags.view(-1).tolist()
-            run_start = 0
-            for i in range(1, b - a + 1):
-                if i == b - a or tags[i] != tags[run_start]:
-                    mod_segments.append((a + run_start, a + i, row_base + int(tags[run_start])))
-                    run_start = i
+            mod_segments.extend(_tag_runs(a, b, row_base, text_tags))
         elif kind == "video" and video_rows_t is not None:
-            mod_segments.append((a, b, rows_to_mod_index(video_rows_t, seg_tag[kind])))
+            mod_segments.append((a, b, rows_to_mod_index(video_rows_t, SEG_TAG[kind])))
         elif kind == "audio" and audio_rows_t is not None:
-            mod_segments.append((a, b, rows_to_mod_index(audio_rows_t, seg_tag[kind])))
+            mod_segments.append((a, b, rows_to_mod_index(audio_rows_t, SEG_TAG[kind])))
         else:
-            mod_segments.append((a, b, row_base + seg_tag[kind]))
+            mod_segments.append((a, b, row_base + SEG_TAG[kind]))
 
     # embed
     img_update = layout.img_update.to(device)
-    audio_update = layout.audio_update.to(device)
     video_rows = patchify_video(video_x.to(torch.float32), self.patch_size)
-    audio_rows = pack_audio(audio_x.to(torch.float32))
     cond_video_rows = self._cond_video_rows(payload, device)
-    cond_audio_rows = self._cond_audio_rows(payload, device)
 
     all_video_rows = video_rows
     if cond_video_rows is not None:
         all_video_rows = torch.empty(img_update.shape[0], video_rows.shape[1], dtype=torch.float32, device=device)
         all_video_rows[~img_update] = cond_video_rows
         all_video_rows[img_update] = video_rows
-    all_audio_rows = audio_rows
-    if cond_audio_rows is not None:
-        all_audio_rows = torch.empty(audio_update.shape[0], audio_rows.shape[1], dtype=torch.float32, device=device)
-        all_audio_rows[~audio_update] = cond_audio_rows
-        all_audio_rows[audio_update] = audio_rows
+    if not image_model:
+        audio_update = layout.audio_update.to(device)
+        audio_rows = pack_audio(audio_x.to(torch.float32))
+        cond_audio_rows = self._cond_audio_rows(payload, device)
+        all_audio_rows = audio_rows
+        if cond_audio_rows is not None:
+            all_audio_rows = torch.empty(audio_update.shape[0], audio_rows.shape[1], dtype=torch.float32, device=device)
+            all_audio_rows[~audio_update] = cond_audio_rows
+            all_audio_rows[audio_update] = audio_rows
 
     text_states = context[0]
     if text_states.shape[-1] != self.hidden_size:
@@ -294,17 +307,10 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     # the projections are FSDP modules, so their forward is a collective: every
     # rank calls each exactly once, on all of its rows, even when it holds none
     _embed_pieces(h, self.video_patch_proj, all_video_rows, video_pieces, dtype)
-    _embed_pieces(h, self.audio_patch_proj, all_audio_rows, audio_pieces, dtype)
+    if not image_model:
+        _embed_pieces(h, self.audio_patch_proj, all_audio_rows, audio_pieces, dtype)
 
-    t_vals = torch.tensor(unique_t, dtype=torch.float32, device=device)
-    if self.use_adaln_curves:
-        # adaln projections consume interpolated coordinates of the time-embedding curve
-        table = comfy.model_management.cast_to(self.adaln_t_table, device=device)
-        pos = t_vals.clamp(0.0, 1.0) * (table.shape[0] - 1)     # t in [0,1] -> fractional grid index, out-of-range t clamps to the curve ends
-        i0 = pos.floor().long().clamp(max=table.shape[0] - 2)   # lower grid row, max-clamp keeps t=1.0 on the last interval instead of reading past the table
-        t_emb = torch.lerp(table[i0], table[i0 + 1], (pos - i0).unsqueeze(1))  # blend the two rows by the fractional part
-    else:
-        t_emb = self.time_embedder(t_vals).to(dtype)
+    t_emb = self._time_embedding(unique_t, device, dtype)
 
     # rotation table computed once per forward, consumed by the kitchen split-half rope
     rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
@@ -321,7 +327,7 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
     blocks_replace = patches_replace.get("dit", {})
     prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.blocks), device, transformer_options)
     for i, block in enumerate(self.blocks):
-        comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, block)
+        comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, block, malloc_scope="block")
         transformer_options["block_index"] = i
         if ("double_block", i) in blocks_replace:
             def block_wrap(args):
@@ -338,33 +344,36 @@ def usp_dit_forward(self, x, timestep, context, transformer_options={}, minimax_
                 h = patch(args, {"original_block": block_wrap})["img"]
         else:
             h = block(h, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)
-    if prefetch_queue is not None:
-        comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)
+    comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None, malloc_scope="block")
 
     va, vb, _ = next(s for s in layout.segments if s[2] == "video")
-    aa, ab, _ = next(s for s in layout.segments if s[2] == "audio")
     if video_rows_t is not None:
         video_seg = (va, vb, rows_to_mod_index(video_rows_t, 0) // 3)
     else:
         video_seg = (va, vb, t_row[seg_t["video"]])
-    if audio_rows_t is not None:
-        audio_seg = (aa, ab, rows_to_mod_index(audio_rows_t, 0) // 3)
-    else:
-        audio_seg = (aa, ab, t_row[seg_t["audio"]])
     # ===================== SP GATHER ===================== #
     # the head is row-local, so it runs on this rank's rows and only its outputs
     # are gathered, not the full-width residual
     local_video = _localize_segments([video_seg], start, end)
-    local_audio = _localize_segments([audio_seg], start, end)
     # a rank holding none of a stream's rows still runs one row of it, and drops it
     v_seg = local_video[0] if local_video else (0, 1, _first_row(video_seg[2]))
-    a_seg = local_audio[0] if local_audio else (0, 1, _first_row(audio_seg[2]))
-    v, a = self.final_layer(h, t_emb, v_seg, a_seg, sigma_v, transformer_options.get("sample_sigmas"), (shift_v, shift_a))
-    v = _gather_stream(v, local_video, end - start)[va:vb]
-    a = _gather_stream(a, local_audio, end - start)[aa:ab]
+    a_seg = None
+    if image_model:
+        grids = (self.pdd_sigmas,)
+    else:
+        aa, ab, _ = next(s for s in layout.segments if s[2] == "audio")
+        audio_seg = (aa, ab, rows_to_mod_index(audio_rows_t, 0) // 3 if audio_rows_t is not None else t_row[seg_t["audio"]])
+        local_audio = _localize_segments([audio_seg], start, end)
+        a_seg = local_audio[0] if local_audio else (0, 1, _first_row(audio_seg[2]))
+        grids = (pdd_grid(self.final_layer.pdd_steps, shift_v), pdd_grid(self.final_layer.pdd_steps, shift_a))
+    outputs = self.final_layer(h, t_emb, v_seg, a_seg, sigma_v, transformer_options.get("sample_sigmas"), grids)
+    v = _gather_stream(outputs[0], local_video, end - start)[va:vb]
 
     video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
     video_out = video_out[:, :, :orig_t, :orig_h, :orig_w]
+    if image_model:
+        return -video_out.to(video_x.dtype)
+    a = _gather_stream(outputs[1], local_audio, end - start)[aa:ab]
     audio_out = unpack_audio(a)
 
     return [-video_out.to(video_x.dtype), -audio_out.to(audio_x.dtype)]

@@ -198,7 +198,7 @@ def test_minimax_usp_passes_pdd_schedule_to_final_layer():
     assert len(call.args) == 7
     assert ast.unparse(call.args[4]) == "sigma_v"
     assert ast.unparse(call.args[5]) == "transformer_options.get('sample_sigmas')"
-    assert ast.unparse(call.args[6]) == "(shift_v, shift_a)"
+    assert ast.unparse(call.args[6]) == "grids"
 
 
 def test_minimax_control_patch_uses_full_sequence_and_returns_local_shard():
