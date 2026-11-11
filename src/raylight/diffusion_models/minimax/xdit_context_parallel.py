@@ -3,7 +3,7 @@ import torch
 import comfy
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3FunControlBlockPatch
 from comfy.ldm.minimax.model import _mod_gate, _mod_scale_shift, _tag_runs, AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP, SEG_TAG, PackedLayout, mask_row_values, pack_audio, patchify_video, pdd_grid, rope_rotation_table, time_shift_sigma, unpack_audio, unpatchify_video
-from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention, wrap_attn
+from comfy.ldm.modules.attention import AttentionTensorContainer, wrap_attn
 from xfuser.core.distributed import get_sequence_parallel_rank, get_sequence_parallel_world_size, get_sp_group
 
 import raylight.distributed_modules.attention as xfuser_attn
@@ -107,18 +107,14 @@ def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}, **kwargs)
     q = q.transpose(0, 1).unsqueeze(0)
     k = k.transpose(0, 1).unsqueeze(0)
     v = v.transpose(0, 1).unsqueeze(0)
-    length = transformer_options["minimax_h3_layout"].seq_len
-    if length % get_sequence_parallel_world_size():
-        # Keep padding out of the softmax when the packed sequence does not divide evenly.
-        k = get_sp_group().all_gather(k.contiguous(), dim=2)[:, :, :length]
-        v = get_sp_group().all_gather(v.contiguous(), dim=2)[:, :, :length]
-        out = optimized_attention(
-            AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v), self.heads,
-            preferred_attention=self.comfy_attention, skip_reshape=True, transformer_options=transformer_options)
-    else:
-        out = xfuser_optimized_attention(
-            AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v), self.heads,
-            preferred_attention=self.comfy_attention, skip_reshape=True, transformer_options=transformer_options)
+    # The sequence is padded to the world size with zero rows, which no segment
+    # modulates, so their keys and values are zero: at most world_size - 1 exp(0)
+    # terms in a softmax over the whole clip. Gathering the full K and V to drop them
+    # would hold the whole sequence on every rank and leave ring attention and the
+    # inner-attention processors (Comfy Kitchen INT8) unused.
+    out = xfuser_optimized_attention(
+        AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v), self.heads,
+        preferred_attention=self.comfy_attention, skip_reshape=True, transformer_options=transformer_options)
     out = out.squeeze(0)
     if fp16:
         # Both projections are bias-free. Keep the projected result out of fp16 overflow.
