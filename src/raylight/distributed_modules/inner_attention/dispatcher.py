@@ -1,3 +1,4 @@
+from ..key_padding import exclude_padded_keys
 from .registry import active_inner_attention, inner_attention_scope
 import torch
 
@@ -16,11 +17,12 @@ class InnerAttentionDispatcher:
         self._dense_ring_attn_fn = xfuser_attention.ring_attn_fn
 
         def dispatch(q, k, v, *args, **kwargs):
+            ring_attn_fn, k, v = exclude_padded_keys(self._dense_ring_attn_fn, k, v, kwargs.get("group"))
             active = active_inner_attention()
             if active is None:
-                return self._dense_ring_attn_fn(q, k, v, *args, **kwargs)
+                return ring_attn_fn(q, k, v, *args, **kwargs)
             processor, transformer_options = active
-            dense = lambda query, key, value, **options: self._dense_ring_attn_fn(
+            dense = lambda query, key, value, **options: ring_attn_fn(
                 query, key, value, *args, **options)
             return processor(
                 dense,

@@ -107,14 +107,14 @@ def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}, **kwargs)
     q = q.transpose(0, 1).unsqueeze(0)
     k = k.transpose(0, 1).unsqueeze(0)
     v = v.transpose(0, 1).unsqueeze(0)
-    # The sequence is padded to the world size with zero rows, which no segment
-    # modulates, so their keys and values are zero: at most world_size - 1 exp(0)
-    # terms in a softmax over the whole clip. Gathering the full K and V to drop them
-    # would hold the whole sequence on every rank and leave ring attention and the
-    # inner-attention processors (Comfy Kitchen INT8) unused.
+    # The sequence is padded to the world size; its padded rows are left out of the keys
+    # without gathering the sequence, so ring attention and the inner-attention
+    # processors still run.
+    length = transformer_options["minimax_h3_layout"].seq_len
     out = xfuser_optimized_attention(
         AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v), self.heads,
-        preferred_attention=self.comfy_attention, skip_reshape=True, transformer_options=transformer_options)
+        preferred_attention=self.comfy_attention, skip_reshape=True, transformer_options=transformer_options,
+        key_length=length if length % get_sequence_parallel_world_size() else None)
     out = out.squeeze(0)
     if fp16:
         # Both projections are bias-free. Keep the projected result out of fp16 overflow.

@@ -9,6 +9,7 @@ from yunchang.kernels import AttnType
 from .sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_kernel
 from .inner_attention import INNER_ATTENTION_KEY, InnerAttentionDispatcher
 from .kitchen_attention import kitchen_attention
+from .key_padding import key_length_scope
 
 _ATTN_TYPE = None
 _SYNC_ULYSSES = None
@@ -135,7 +136,8 @@ def make_xfuser_attention(attn_type, sync_ulysses):
         # For custom inner attentnion, such as SLA, maybe SOL
         transformer_options = kwargs.get("transformer_options", {})
         processor = transformer_options.get(INNER_ATTENTION_KEY)
-        with inner_dispatcher.scope(processor, transformer_options):
+        # key_length: keys past this many rows of the full sequence are padding
+        with inner_dispatcher.scope(processor, transformer_options), key_length_scope(kwargs.get("key_length")):
             if join_q is not None:
                 out = xfuser_attn(
                     None, query, key, value,
