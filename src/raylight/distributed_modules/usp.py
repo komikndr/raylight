@@ -713,3 +713,15 @@ if hasattr(model_base, "LingBotVideo"):
         for block in model.blocks:
             block.attn.forward = types.MethodType(usp_attention_forward, block.attn)
         model.forward = types.MethodType(usp_dit_forward, model)
+
+
+if hasattr(model_base, "PAN2"):
+
+    @USPInjectRegistry.register(model_base.PAN2)
+    def _inject_pan2(model_patcher, base_model, *args):
+        from ..diffusion_models.pan2.xdit_context_parallel import usp_dit_forward
+
+        model = base_model.diffusion_model
+        blocks = list(model.transformer_blocks) + list(model.context_refiner)
+        model.raylight_native_attention = any(block.comfy_attention.function is not None for block in blocks)
+        model._forward = types.MethodType(usp_dit_forward, model)

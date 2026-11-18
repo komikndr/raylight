@@ -324,6 +324,15 @@ if hasattr(model_base, "ErnieImage"):
         return cfg_parallel_forward_wrapper
 
 
+if hasattr(model_base, "PAN2"):
+
+    @CFGParallelInjectRegistry.register(model_base.PAN2)
+    def _inject_pan2():
+        from ..diffusion_models.pan2.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
 # This will cause error for all non specified models above, since all of that will be funneled into this
 @CFGParallelInjectRegistry.register(model_base.BaseModel)
 def _inject_unet():
