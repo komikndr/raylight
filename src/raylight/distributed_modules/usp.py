@@ -471,6 +471,17 @@ if hasattr(model_base, "JoyImage"):
         model._forward = types.MethodType(usp_dit_forward, model)
 
 
+if hasattr(model_base, "MOSSImage"):
+
+    @USPInjectRegistry.register(model_base.MOSSImage)
+    def _inject_moss_image(model_patcher, base_model, *args):
+        from ..diffusion_models.moss_image.xdit_context_parallel import usp_moss_forward
+
+        model = base_model.diffusion_model
+        model.raylight_native_attention = any(block.comfy_attention.function is not None for block in model.layers)
+        model._forward = types.MethodType(usp_moss_forward, model)
+
+
 if hasattr(model_base, "Lens"):
 
     @USPInjectRegistry.register(model_base.Lens)

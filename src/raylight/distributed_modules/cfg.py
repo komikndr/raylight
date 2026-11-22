@@ -116,6 +116,15 @@ if hasattr(model_base, "JoyImage"):
         return cfg_parallel_forward_wrapper
 
 
+if hasattr(model_base, "MOSSImage"):
+
+    @CFGParallelInjectRegistry.register(model_base.MOSSImage)
+    def _inject_moss_image():
+        from ..diffusion_models.moss_image.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+
+        return cfg_parallel_forward_wrapper
+
+
 if hasattr(model_base, "Lens"):
 
     @CFGParallelInjectRegistry.register(model_base.Lens)
