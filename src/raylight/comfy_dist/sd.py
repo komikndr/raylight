@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from raylight import comfy_dist
+from .fsdp_utils import CALIBRATED_LAYOUTS, _decode_comfy_quant, calibrated_weight
 
 from comfy.sd import model_detection_error_hint
 from comfy import model_base, model_detection, model_management
@@ -1135,16 +1136,38 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
         device_mesh=device_mesh,
         is_cpu_offload=is_cpu_offload,
     )
-    corrections = {}
+    quant_extras = {}
 
-    def keep_grouped_corrections(module, state_dict, *args):
+    def prepare_kitchen_weights(module, state_dict, *args):
         # Native loading consumes the scales but drops the optional W4A8
         # correction. Capture it after model-specific checkpoint key conversion.
         for key in [k for k in state_dict if k.endswith("weight_correction")]:
             if key.removesuffix("_correction") + "_s_rel" in state_dict:
-                corrections["diffusion_model." + key] = state_dict.pop(key)
+                quant_extras["diffusion_model." + key] = state_dict.pop(key)
 
-    with model.diffusion_model.register_load_state_dict_pre_hook(keep_grouped_corrections):
+        # Comfy's mixed Linear accepts an already wrapped weight without a
+        # comfy_quant entry. Keep the original metadata for the FSDP reload.
+        for key in [k for k in state_dict if k.endswith("comfy_quant")]:
+            prefix = key[:-len("comfy_quant")]
+            if prefix + "weight_proj_up" not in state_dict and prefix + "weight_zeros" not in state_dict:
+                continue
+            conf = _decode_comfy_quant(state_dict[key])
+            if conf["format"] not in CALIBRATED_LAYOUTS:
+                continue
+            linear = module.get_submodule(prefix.rstrip("."))
+            weight = calibrated_weight(state_dict, prefix, conf, (linear.out_features, linear.in_features), linear.factory_kwargs["dtype"])
+            for payload_key in weight.state_dict(prefix + "weight"):
+                del state_dict[payload_key]
+            state_dict[prefix + "weight"] = weight
+            quant_extras["diffusion_model." + key] = state_dict.pop(key)
+            linear.quant_format = conf["format"]
+            linear._full_precision_mm_config = conf.get("full_precision_matrix_mult", False)
+            linear._full_precision_mm |= linear._full_precision_mm_config
+            bias = state_dict.get(prefix + "bias")
+            if weight._qdata.ndim == 4 and bias is not None and bias.ndim == 2:
+                state_dict[prefix + "bias"] = bias.reshape(linear.out_features)
+
+    with model.diffusion_model.register_load_state_dict_pre_hook(prepare_kitchen_weights):
         model.load_model_weights(new_sd, "", assign=True)
     if not model_management.is_device_cpu(offload_device):
         model.to(offload_device)
@@ -1152,6 +1175,6 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
     if len(left_over) > 0:
         logging.info("left over keys in diffusion model: {}".format(left_over))
     state_dict = model_patcher.model_state_dict(filter_prefix="diffusion_model.")
-    state_dict.update(corrections)
+    state_dict.update(quant_extras)
     model_patcher.model.diffusion_model.to("meta")
     return model_patcher, state_dict

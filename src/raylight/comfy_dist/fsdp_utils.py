@@ -488,8 +488,50 @@ def _shard_block_scale(scale, start, end, padded_rows, scale_cols, device):
     return to_blocked(scales, flatten=False).view(scale.dtype)
 
 
-PACKED_ROW_LAYOUTS = ("TensorCoreConvRotW4A4Layout", "AsymW4A8Int8Layout")
+CALIBRATED_LAYOUTS = {"awq_w4a16": "TensorCoreAWQW4A16Layout", "svdquant_w4a4": "TensorCoreSVDQuantW4A4Layout"}
+PACKED_ROW_LAYOUTS = ("TensorCoreConvRotW4A4Layout", "AsymW4A8Int8Layout", *CALIBRATED_LAYOUTS.values())
 _GROUPED_QUANT_KEYS = ("weight_s_rel", "weight_s_channel", "weight_codebook", "weight_correction")
+_CALIBRATED_KEYS = ("weight_zeros", "weight_proj_down", "weight_proj_up", "weight_smooth_factor")
+
+
+def calibrated_weight(state_dict, prefix, conf, shape, dtype):
+    fmt = conf["format"]
+    layout = CALIBRATED_LAYOUTS[fmt]
+    layout_cls = get_layout_class(layout)
+    rows, cols = shape
+    weight = state_dict[prefix + "weight"]
+    scale = state_dict[prefix + "weight_scale"]
+    options = {**conf.get("params", {}), **conf}
+    tiled = fmt == "svdquant_w4a4" and weight.ndim == 4
+    group = int(options.get("group_size", 64)) if fmt == "awq_w4a16" else 64
+    if group <= 0 or cols % group or cols % 2:
+        raise ValueError(f"Invalid {fmt} group size or packed width for {prefix}weight")
+    groups = cols // group
+    packed_shape = (rows // 128, groups, 32, 128) if tiled else (rows, cols // 2)
+    scale_shape = (rows // 128, groups, 128) if tiled else (groups, rows)
+    if weight.dtype not in (torch.int8, torch.uint8) or weight.shape != packed_shape or scale.shape != scale_shape or (tiled and rows % 128):
+        raise ValueError(f"Invalid {fmt} packed weight or scale shape for {prefix}weight ({rows}, {cols})")
+    if fmt == "awq_w4a16":
+        zeros = state_dict[prefix + "weight_zeros"]
+        if zeros.shape != scale.shape:
+            raise ValueError(f"Mismatched AWQ scales and zeros for {prefix}weight")
+        fields = dict(zeros=zeros, group_size=group)
+    else:
+        down = state_dict[prefix + "weight_proj_down"]
+        up = state_dict[prefix + "weight_proj_up"]
+        smooth = state_dict[prefix + "weight_smooth_factor"]
+        if down.ndim != 2 or down.shape[0] != cols or smooth.shape != (cols,):
+            raise ValueError(f"Invalid SVDQuant input projection or smoothing shape for {prefix}weight")
+        rank = down.shape[1]
+        if up.shape != (rows, rank) and not (tiled and up.shape == (rows // 128, rank, 128)):
+            raise ValueError(f"Invalid SVDQuant output projection for {prefix}weight")
+        fields = dict(proj_down=down, proj_up=up, smooth_factor=smooth, act_unsigned=options.get("act_unsigned", False))
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"{fmt} requires fp16 or bf16 compute, got {dtype} for {prefix}weight")
+    for name, value in fields.items():
+        if isinstance(value, torch.Tensor):
+            fields[name] = value.to(dtype=dtype)
+    return QuantizedTensor(weight.view(torch.int8), layout, layout_cls.Params(scale=scale.to(dtype=dtype), orig_dtype=dtype, orig_shape=shape, **fields))
 
 
 class _PackedRowWeight(QuantizedTensor):
@@ -537,6 +579,16 @@ class _PackedRowWeight(QuantizedTensor):
 
     def fsdp_pre_all_gather(self, mesh, outer_size, outer_stride, module, mp_policy):
         params = self._params
+        if self._layout_cls in CALIBRATED_LAYOUTS.values():
+            scale = params.scale.t() if params.scale.ndim == 2 else params.scale
+            inputs = [self._qdata.contiguous(), scale.contiguous()]
+            if self._layout_cls == "TensorCoreAWQW4A16Layout":
+                inputs.append(params.zeros.t().contiguous())
+                replicated = ()
+            else:
+                inputs.append(params.proj_up.contiguous())
+                replicated = (params.proj_down, params.smooth_factor)
+            return tuple(inputs), (tuple(outer_size), replicated)
         inputs = [self._qdata.contiguous(), params.scale.contiguous()]
         codebook = None
         if self._layout_cls == "AsymW4A8Int8Layout":
@@ -547,6 +599,37 @@ class _PackedRowWeight(QuantizedTensor):
         return tuple(inputs), (tuple(outer_size), codebook)
 
     def fsdp_post_all_gather(self, outputs, metadata, param_dtype, *, out=None):
+        if self._layout_cls in CALIBRATED_LAYOUTS.values():
+            shape, replicated = metadata
+            rows = shape[0]
+            qdata = outputs[0][:rows // 128 if outputs[0].ndim == 4 else rows]
+            storage = list(outputs)
+
+            def group_major(tensor, name):
+                source = tensor[:rows].t()
+                if out is not None:
+                    return getattr(out._params, name).copy_(source)
+                result = source.clone(memory_format=torch.contiguous_format)
+                storage.append(result)
+                return result
+
+            scale = group_major(outputs[1], "scale") if outputs[1].ndim == 2 else outputs[1][:rows // 128]
+            if self._layout_cls == "TensorCoreAWQW4A16Layout":
+                fields = dict(zeros=group_major(outputs[2], "zeros"))
+            else:
+                fields = dict(proj_up=outputs[2][:rows // 128 if outputs[2].ndim == 3 else rows])
+                for name, value in zip(("proj_down", "smooth_factor"), replicated):
+                    if value.device != self._qdata.device:  # FSDP offloaded the shard
+                        if out is None:
+                            storage.append(value)
+                        else:
+                            value = getattr(out._params, name).copy_(value)
+                    fields[name] = value
+            params = replace(self._params, scale=scale, orig_shape=shape, orig_dtype=param_dtype, **fields)
+            if out is not None:
+                out._qdata, out._params = qdata, params
+                return
+            return _PackedRowWeight(qdata, self._layout_cls, params), storage
         shape, codebook = metadata
         rows = shape[0]
         qdata = outputs[0][:rows]
@@ -590,14 +673,48 @@ def _shard_kitchen_weight(weight, meta_param, device):
     end = min(start + chunk, rows)
     local_shape = (chunk, *weight.shape[1:])
 
-    def copy_rows(tensor, padded_rows):
-        shard = tensor[start:end]
+    def copy_rows(tensor, padded_rows, first=start, stop=end):
+        shard = tensor[first:stop]
         if shard.shape[0] == padded_rows:
             return shard.to(device=device, copy=shard.shape != tensor.shape)
         local = tensor.new_zeros((padded_rows, *tensor.shape[1:]), device=device)
-        local[:end - start].copy_(shard)
+        local[:stop - first].copy_(shard)
         return local
 
+    if layout in CALIBRATED_LAYOUTS.values():
+        data = weight._qdata
+        scale = params.scale
+        if layout == "TensorCoreAWQW4A16Layout":
+            fields = dict(zeros=copy_rows(params.zeros.t(), chunk).t())
+        else:
+            up = params.proj_up
+            if data.ndim == 4 and chunk % 128:
+                # Ranks may split a tile. Convert only the overlapping tiles,
+                # and gather natural packed rows on all ranks.
+                first, stop = start // 128, (end + 127) // 128
+                tiles = data[first:stop]
+                data = tiles.unflatten(-1, (4, 32)).permute(0, 2, 3, 1, 4).reshape((stop - first) * 128, local_shape[1] // 2)
+                offset = start - first * 128
+                length = end - start
+                data = copy_rows(data, chunk, offset, offset + length)
+                scale_rows = scale[first:stop].transpose(1, 2).reshape((stop - first) * 128, scale.shape[1])
+                scale = copy_rows(scale_rows, chunk, offset, offset + length).t()
+                if up.ndim == 3:
+                    up_rows = up[first:stop].transpose(1, 2).reshape((stop - first) * 128, up.shape[1])
+                    up = copy_rows(up_rows, chunk, offset, offset + length)
+                else:
+                    up = copy_rows(up, chunk)
+            else:
+                up = copy_rows(up, chunk // 128, start // 128, end // 128) if up.ndim == 3 else copy_rows(up, chunk)
+            fields = dict(proj_up=up, proj_down=params.proj_down.to(device=device), smooth_factor=params.smooth_factor.to(device=device))
+        if weight._qdata.ndim == 2:
+            data = copy_rows(data, chunk)
+            scale = copy_rows(scale.t(), chunk).t()
+        elif chunk % 128 == 0:
+            data = copy_rows(data, chunk // 128, start // 128, end // 128)
+            scale = copy_rows(scale, chunk // 128, start // 128, end // 128)
+        params = replace(params, orig_shape=local_shape, scale=scale, **fields)
+        return _PackedRowWeight(data, layout, params)
     if packed_rows:
         fields = {}
         if layout == "AsymW4A8Int8Layout":
@@ -655,6 +772,9 @@ def _build_quantized_tensor(
         return None
 
     quant_format = conf.get("format", None)
+    if quant_format in CALIBRATED_LAYOUTS:
+        weight = calibrated_weight(full_sd, prefix, conf, tuple(sharded_meta_param.shape), sharded_meta_param.dtype)
+        return _shard_kitchen_weight(weight, sharded_meta_param, device)
     if quant_format is None or quant_format not in QUANT_ALGOS:
         raise ValueError(f"Unknown quantization format for {param_name}: {quant_format}")
     qconfig = QUANT_ALGOS[quant_format]
@@ -765,7 +885,7 @@ def _release_quant_keys(full_sd: dict[str, Any], param_name: str, keep: set[str]
         param_name,
         f"{prefix}weight_scale",
         f"{prefix}weight_scale_2",
-        *(f"{prefix}{name}" for name in _GROUPED_QUANT_KEYS),
+        *(f"{prefix}{name}" for name in (*_GROUPED_QUANT_KEYS, *_CALIBRATED_KEYS)),
         f"{prefix}scale_weight",
         f"{prefix}comfy_quant",
         f"{prefix}super_block_scale_scale",
@@ -800,7 +920,7 @@ def load_from_full_model_state_dict(
             prefix = key[:-len("comfy_quant")]
             meta_sharded_sd[prefix + "weight"] = weight
             del meta_sharded_sd[key]
-            for name in ("weight_scale", "weight_scale_2", *_GROUPED_QUANT_KEYS):
+            for name in ("weight_scale", "weight_scale_2", *_GROUPED_QUANT_KEYS, *_CALIBRATED_KEYS):
                 if name not in module._parameters and name not in module._buffers:
                     meta_sharded_sd.pop(prefix + name, None)
     own_params = set(meta_sharded_sd)

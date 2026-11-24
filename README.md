@@ -20,6 +20,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 - Quantized loading: Default to sequential loading for lower peak RAM; add opt-in parallel loading. (credit: Kanislo)
 - Experimental MXFP8: Add FSDP gathering and reconstruction support for MXFP8 weights and scales.
 - Experimental FSDP: Load and gather ConvRot W4A4 (`convrot_w4a4`), grouped W4A8 (`asym_w4a8_int8`), and uniform W6A8 (`w6a8_int8`) checkpoint weights in packed form.
+- Experimental FSDP: Load Kitchen-format `awq_w4a16` and `svdquant_w4a4` linears with fp16/bf16 compute. SVDQuant accepts row-major and tile-packed weights. Requires a Comfy Kitchen build with the corresponding layout.
 - Attention improvements: Add Kitchen INT8 attention (ring_degree=1), nested patch-scope fixes, and ring-attention LSE correction. (credit: Kanislo)
 - NUMA placement: Add optional GPU-local CPU affinity and preferred host-memory placement, disabled by default. (credit: Kanislo)
 - Worker controls: Add VRAM budgets, collective timeouts, selectable pinned memory, and Kill Ray (from Init). (credit: Kanislo)
