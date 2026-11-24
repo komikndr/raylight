@@ -488,13 +488,74 @@ def _shard_block_scale(scale, start, end, padded_rows, scale_cols, device):
     return to_blocked(scales, flatten=False).view(scale.dtype)
 
 
+PACKED_ROW_LAYOUTS = ("TensorCoreConvRotW4A4Layout",)
+
+
+class _PackedRowWeight(QuantizedTensor):
+    """Keep packed FSDP storage views separate from Kitchen's matrix shape."""
+
+    def __new__(cls, qdata, layout_cls, params, shape=None):
+        return torch.Tensor._make_wrapper_subclass(
+            cls, params.orig_shape if shape is None else shape,
+            dtype=params.orig_dtype, device=qdata.device, requires_grad=False,
+        )
+
+    def __init__(self, qdata, layout_cls, params, shape=None):
+        super().__init__(qdata, layout_cls, params)
+
+    def _copy_with(self, qdata=None, params=None, clone_params=True):
+        if params is None:
+            params = self._params.clone() if clone_params else self._params
+        return type(self)(self._qdata if qdata is None else qdata, self._layout_cls, params, self.shape)
+
+    @staticmethod
+    def __tensor_unflatten__(inner_tensors, ctx, outer_size, outer_stride):
+        qt = QuantizedTensor.__tensor_unflatten__(inner_tensors, ctx, outer_size, outer_stride)
+        return _PackedRowWeight(qt._qdata, qt._layout_cls, qt._params, outer_size)
+
+    def dequantize(self):
+        return super().dequantize().view(self.shape)
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        weight = args[0]
+        if isinstance(weight, cls):
+            if func in (torch.ops.aten.detach.default, torch.ops.aten.alias.default):
+                return cls(weight._qdata, weight._layout_cls, weight._params, weight.shape)
+            # reset_sharded_param saves a flat view; init_unsharded_param
+            # takes an identity as_strided before wrapping the gathered weight.
+            if func == torch.ops.aten.view.default and tuple(args[1]) == (-1,):
+                return cls(weight._qdata, weight._layout_cls, weight._params, (weight.numel(),))
+            if func == torch.ops.aten.as_strided.default:
+                offset = args[3] if len(args) > 3 else (kwargs or {}).get("storage_offset", 0)
+                if tuple(args[1]) == weight.shape and tuple(args[2]) == weight.stride() and offset == 0:
+                    return cls(weight._qdata, weight._layout_cls, weight._params, weight.shape)
+            if weight.ndim == 1:
+                return cls._dequant_and_fallback(func, args, kwargs or {})
+        return super().__torch_dispatch__(func, types, args, kwargs)
+
+    def fsdp_pre_all_gather(self, mesh, outer_size, outer_stride, module, mp_policy):
+        return (self._qdata.contiguous(), self._params.scale.contiguous()), tuple(outer_size)
+
+    def fsdp_post_all_gather(self, outputs, shape, param_dtype, *, out=None):
+        rows = shape[0]
+        qdata = outputs[0][:rows]
+        params = replace(self._params, scale=outputs[1][:rows], orig_shape=shape, orig_dtype=param_dtype)
+        if out is not None:
+            out._qdata = qdata
+            out._params = params
+            return
+        return _PackedRowWeight(qdata, self._layout_cls, params), outputs
+
+
 def _shard_kitchen_weight(weight, meta_param, device):
     layout = weight._layout_cls
     nvfp4 = layout == "TensorCoreNVFP4Layout"
     mxfp8 = layout == "TensorCoreMXFP8Layout"
     int8 = layout == "TensorWiseINT8Layout"
+    packed_rows = layout in PACKED_ROW_LAYOUTS
     fp8 = layout in ("TensorCoreFP8Layout", "TensorCoreFP8E4M3Layout", "TensorCoreFP8E5M2Layout")
-    if not (nvfp4 or mxfp8 or int8 or fp8):
+    if not (nvfp4 or mxfp8 or int8 or fp8 or packed_rows):
         raise NotImplementedError(f"Unsupported FSDP quantized weight layout: {layout}")
 
     params = weight._params
@@ -522,6 +583,9 @@ def _shard_kitchen_weight(weight, meta_param, device):
         local[:end - start].copy_(shard)
         return local
 
+    if packed_rows:
+        params = replace(params, orig_shape=local_shape, scale=copy_rows(params.scale, chunk))
+        return _PackedRowWeight(copy_rows(weight._qdata, chunk), layout, params)
     if nvfp4 or mxfp8:
         padded_rows, padded_cols = weight.layout_cls.get_padded_shape(local_shape)
         qdata = copy_rows(weight._qdata, padded_rows)
@@ -603,6 +667,16 @@ def _build_quantized_tensor(
         if conf.get("convrot", params_conf.get("convrot", False)):
             params_kwargs["convrot"] = True
             params_kwargs["convrot_groupsize"] = int(conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256)))
+    elif quant_format == "convrot_w4a4":
+        rows, cols = params_kwargs["orig_shape"]
+        if qdata.shape != (rows, cols // 2) or cols % 2 or scale is None or scale.numel() != rows:
+            raise ValueError(f"Expected packed W4A4 rows and one weight scale per row for {param_name}")
+        params_conf = conf.get("params", {})
+        if not isinstance(params_conf, dict):
+            params_conf = {}
+        params_kwargs.update(scale=scale.reshape(rows), quant_group_size=64,
+                             convrot_groupsize=int(conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256))),
+                             linear_dtype=conf.get("linear_dtype", params_conf.get("linear_dtype", "int4")))
     elif quant_format == "gguf":
         qdata = _shard_tensor(qdata, sharded_meta_param, device, pad_to_local_meta=False)
         params_kwargs["orig_shape"] = tuple(qdata.shape)

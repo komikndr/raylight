@@ -17,7 +17,7 @@ from comfy.patcher_extension import CallbacksMP
 from comfy.model_patcher import get_key_weight, string_to_seed, move_weight_functions
 
 from raylight import comfy_dist
-from .fsdp_utils import freeze_and_detect_qt, fully_shard_bottom_up, load_from_full_model_state_dict, materialize_excluded_params
+from .fsdp_utils import PACKED_ROW_LAYOUTS, freeze_and_detect_qt, fully_shard_bottom_up, load_from_full_model_state_dict, materialize_excluded_params
 from .kitchen_distributed import temporary_sitepkg_ck_patches
 
 try:
@@ -206,14 +206,19 @@ def _unwrap_base_model(model):
     return getattr(model, "model", model)
 
 
-def _promote_nonfloating_params_to_meta(model: torch.nn.Module, target_dtype: torch.dtype) -> int:
+def _prepare_quant_meta_params(model: torch.nn.Module, target_dtype: torch.dtype) -> int:
     replaced = 0
     for name, param in list(model.named_parameters()):
+        dtype = target_dtype
         if torch.is_floating_point(param) or torch.is_complex(param):
-            continue
+            if not isinstance(param, _CKQuantizedTensor) or param._layout_cls not in PACKED_ROW_LAYOUTS:
+                continue
+            # fully_shard chunks and zero-fills the meta blueprint before we
+            # assign real shards. Kitchen's packed layout only encodes matrices.
+            dtype = param.dtype
         parent_module, leaf_name = _get_parent_module_and_name(model, name)
         meta_param = torch.nn.Parameter(
-            torch.empty(tuple(param.shape), device="meta", dtype=target_dtype),
+            torch.empty(tuple(param.shape), device="meta", dtype=dtype),
             requires_grad=param.requires_grad,
         )
         parent_module.register_parameter(leaf_name, meta_param)
@@ -327,9 +332,9 @@ def patch_fsdp(self):
     if use_quant_loader:
         base_model = _unwrap_base_model(self.model)
         placeholder_dtype = getattr(base_model, "manual_cast_dtype", None) or torch.bfloat16
-        replaced = _promote_nonfloating_params_to_meta(diffusion_model, placeholder_dtype)
+        replaced = _prepare_quant_meta_params(diffusion_model, placeholder_dtype)
         if replaced > 0:
-            print(f"[Rank {self.rank}] Promoted {replaced} non-floating quant params to meta placeholders before FSDP wrapping")
+            print(f"[Rank {self.rank}] Prepared {replaced} quantized meta parameters for FSDP wrapping")
 
     excluded_modules = _collect_controlnet_shared_modules(diffusion_model)
     if excluded_modules:
