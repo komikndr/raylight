@@ -127,63 +127,53 @@ def install_nvfp4_patches() -> None:
         end = max(start, min(end, size))
         return start, end, step
 
-    def _logical_rows_to_storage_rows(qtensor, start: int, end: int) -> tuple[int, int]:
-        logical_rows = int(qtensor._params.orig_shape[0])
-        storage_rows = int(qtensor._qdata.shape[0])
-        if logical_rows <= 0:
-            return 0, 0
-        start_storage = (start * storage_rows) // logical_rows
-        end_storage = (end * storage_rows + logical_rows - 1) // logical_rows
-        return start_storage, end_storage
-
     def _slice_rows_nvfp4(input_tensor, start, end):
-        start_storage, end_storage = _logical_rows_to_storage_rows(input_tensor, start, end)
-        sliced_qdata = torch.ops.aten.slice.Tensor(input_tensor._qdata, 0, start_storage, end_storage, 1)
-        block_scale_rows = _unblock_block_scale(input_tensor)
-        sliced_block_scale = block_scale_rows[start_storage:end_storage]
-        reblocked_scale = _reblock_block_scale(sliced_block_scale, input_tensor._params.block_scale.dtype)
-        new_orig_shape = (end - start, int(input_tensor._params.orig_shape[1]))
-        return _wrap_nvfp4_tensor(input_tensor, sliced_qdata, block_scale=reblocked_scale, orig_shape=new_orig_shape)
+        size = (end - start, input_tensor.shape[1])
+        padded_rows = TensorCoreNVFP4Layout.get_padded_shape(size)[0]
+        if start % 128 == 0:
+            data = input_tensor._qdata[start:start + padded_rows]
+            scale_cols = _block_scale_unblocked_shape(input_tensor)[1]
+            tiles = input_tensor._params.block_scale.reshape(-1, ((scale_cols + 3) // 4) * 4)
+            scales = tiles[start:start + ((size[0] + 127) // 128) * 128]
+        else:
+            data = input_tensor._qdata[start:end]
+            if padded_rows != size[0]:
+                data = torch.nn.functional.pad(data, (0, 0, 0, padded_rows - size[0]))
+            scales = to_blocked(_unblock_block_scale(input_tensor)[start:end], flatten=False)
+        return _wrap_nvfp4_tensor(input_tensor, data, block_scale=scales, orig_shape=size)
 
-    def pre_all_gather(qtensor: QuantizedTensor, mesh):
-        qdata = qtensor._qdata.contiguous()
-        block_scale = qtensor._params.block_scale.contiguous()
-        metadata = {
-            "scale": qtensor._params.scale,
-            "orig_dtype": qtensor._params.orig_dtype,
-            "orig_shape": qtensor._params.orig_shape,
-            "transposed": qtensor._params.transposed,
-            "qdata_shape": tuple(qdata.shape),
-        }
-        return (qdata, block_scale), metadata
+    def pre_all_gather(qtensor: QuantizedTensor, mesh, outer_size):
+        rows = (outer_size[0] + mesh.size() - 1) // mesh.size()
+        data = qtensor._qdata[:rows]
+        scales = qtensor._params.block_scale.view(torch.uint8)
+        if rows % 128:
+            scales = _unblock_block_scale(qtensor, scales)[:rows].contiguous()
+        return (data, scales), (tuple(outer_size), rows % 128 == 0)
 
     def post_all_gather(qtensor: QuantizedTensor, all_gather_outputs, metadata: Any, param_dtype: torch.dtype, *, out=None):
-        gathered_qdata, gathered_block_scale = all_gather_outputs
-        orig_shape = metadata.get("orig_shape")
-        qdata_shape = metadata.get("qdata_shape")
-        if orig_shape is not None and qdata_shape is not None and not metadata.get("transposed", False):
-            orig_shape = tuple(orig_shape)
-            qdata_shape = tuple(qdata_shape)
-            if len(orig_shape) == 2 and len(qdata_shape) == 2 and gathered_qdata.dim() == 2:
-                old_storage_rows = int(qdata_shape[0])
-                new_storage_rows = int(gathered_qdata.shape[0])
-                if old_storage_rows > 0 and new_storage_rows != old_storage_rows:
-                    new_logical_rows = (int(orig_shape[0]) * new_storage_rows + old_storage_rows - 1) // old_storage_rows
-                    orig_shape = (new_logical_rows, int(orig_shape[1]))
-        params = TensorCoreNVFP4Layout.Params(
-            scale=metadata["scale"],
-            orig_dtype=metadata.get("orig_dtype", param_dtype),
-            orig_shape=_scaled_rowwise_orig_shape(qtensor, gathered_qdata, orig_shape),
-            block_scale=gathered_block_scale,
-            transposed=metadata.get("transposed", False),
-        )
+        gathered_data, gathered_scales = all_gather_outputs
+        orig_shape, blocked = metadata
+        rows = orig_shape[0]
+        padded_rows = TensorCoreNVFP4Layout.get_storage_shape(orig_shape)[0]
+        data = gathered_data[:padded_rows]
+        data_buffer = gathered_data
+        if data.shape[0] < padded_rows:
+            data = data_buffer = torch.nn.functional.pad(data, (0, 0, 0, padded_rows - data.shape[0]))
+        if blocked:
+            scales = gathered_scales[:((rows + 127) // 128) * 128]
+            scale_buffer = gathered_scales
+        else:
+            scales = scale_buffer = to_blocked(gathered_scales[:rows], flatten=False)
+        block_scale = scales.view(qtensor._params.block_scale.dtype)
         if out is not None:
-            if not isinstance(out, QuantizedTensor):
-                raise TypeError(f"Expected QuantizedTensor out, got {type(out)}")
-            out._qdata = gathered_qdata
-            out._params = params
+            out._qdata.copy_(data)
+            out._params.block_scale.copy_(block_scale)
             return None
-        return QuantizedTensor(gathered_qdata, qtensor._layout_cls, params), (gathered_qdata, gathered_block_scale)
+        params = TensorCoreNVFP4Layout.Params(
+            scale=qtensor._params.scale.to(device=data.device),
+            orig_dtype=param_dtype, orig_shape=orig_shape, block_scale=block_scale,
+        )
+        return QuantizedTensor(data, qtensor._layout_cls, params), (data_buffer, scale_buffer)
 
     if _ORIG_LAYOUT_PRE is _MISSING:
         _ORIG_LAYOUT_PRE = getattr(TensorCoreNVFP4Layout, "pre_all_gather", _MISSING)
@@ -192,8 +182,8 @@ def install_nvfp4_patches() -> None:
     setattr(TensorCoreNVFP4Layout, "pre_all_gather", pre_all_gather)
     setattr(TensorCoreNVFP4Layout, "post_all_gather", post_all_gather)
 
-    def fsdp_pre_all_gather(self, mesh):
-        return self.layout_cls.pre_all_gather(self, mesh)
+    def fsdp_pre_all_gather(self, mesh, outer_size, outer_stride, module, mp_policy):
+        return self.layout_cls.pre_all_gather(self, mesh, outer_size)
 
     def fsdp_post_all_gather(self, all_gather_outputs, metadata, param_dtype, *, out=None):
         return self.layout_cls.post_all_gather(self, all_gather_outputs, metadata, param_dtype, out=out)
@@ -551,12 +541,15 @@ def install_nvfp4_patches() -> None:
         if any(tensor._params.orig_shape[1] != first._params.orig_shape[1] for tensor in tensors):
             return op_cat(*[_dequantize_arg(arg) for arg in args], **kwargs)
 
-        concatenated_qdata = op_cat([tensor._qdata for tensor in tensors], 0)
-        block_scale_rows = [_unblock_block_scale(tensor) for tensor in tensors]
+        concatenated_qdata = op_cat([tensor._qdata[:tensor.shape[0]] for tensor in tensors], 0)
+        orig_shape = (concatenated_qdata.shape[0], first.shape[1])
+        padded_rows = TensorCoreNVFP4Layout.get_padded_shape(orig_shape)[0]
+        if padded_rows != orig_shape[0]:
+            concatenated_qdata = torch.nn.functional.pad(concatenated_qdata, (0, 0, 0, padded_rows - orig_shape[0]))
+        block_scale_rows = [_unblock_block_scale(tensor)[:tensor.shape[0]] for tensor in tensors]
         concatenated_block_scale = _reblock_block_scale(op_cat(block_scale_rows, 0), first._params.block_scale.dtype)
-        orig_rows = sum(int(tensor._params.orig_shape[0]) for tensor in tensors)
         return _wrap_nvfp4_tensor(
-            first, concatenated_qdata, block_scale=concatenated_block_scale, orig_shape=(orig_rows, int(first._params.orig_shape[1]))
+            first, concatenated_qdata, block_scale=concatenated_block_scale, orig_shape=orig_shape
         )
 
     @maybe_register(op_new_zeros)

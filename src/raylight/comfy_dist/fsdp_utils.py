@@ -472,30 +472,78 @@ def _is_quant_param(param_name: str, full_sd: dict[str, Any], sharded_meta_param
     return False
 
 
-def _shard_mxfp8(qdata, scale, orig_shape, meta_param, device, orig_dtype):
-    rows, cols = orig_shape
-    start, end = 0, rows
-    local_rows = rows
-    if hasattr(meta_param, "device_mesh"):
-        mesh = meta_param.device_mesh
-        if mesh.ndim != 1:
-            raise NotImplementedError("MXFP8 FSDP requires a 1D mesh")
-        chunk_rows = (rows + mesh.size() - 1) // mesh.size()
-        # FSDP needs the same logical padded shard size even on the final rank.
-        local_rows = chunk_rows
-        start = min(mesh.get_local_rank() * chunk_rows, rows)
-        end = min(start + chunk_rows, rows)
-    scale_rows = from_blocked(scale.view(torch.uint8), num_rows=qdata.shape[0], num_cols=qdata.shape[1] // 32)
-    local_data = qdata[start:end].to(device=device)
-    local_scales = scale_rows[start:end].to(device=device)
-    padded_rows = ((local_rows + 31) // 32) * 32
-    local_data = torch.nn.functional.pad(local_data.view(torch.uint8), (0, 0, 0, padded_rows - (end - start))).view(qdata.dtype)
-    local_scales = torch.nn.functional.pad(local_scales, (0, 0, 0, padded_rows - (end - start)))
-    params = get_layout_class("TensorCoreMXFP8Layout").Params(
-        scale=to_blocked(local_scales, flatten=False).view(torch.float8_e8m0fnu),
-        orig_dtype=orig_dtype, orig_shape=(local_rows, cols),
-    )
-    return QuantizedTensor(local_data, "TensorCoreMXFP8Layout", params)
+def _shard_block_scale(scale, start, end, padded_rows, scale_cols, device):
+    # A contiguous group of 128 rows is an independent Kitchen scale tile.
+    tile_cols = ((scale_cols + 3) // 4) * 4
+    tiles = scale.view(torch.uint8).reshape(-1, tile_cols)
+    if start % 128 == 0 and end - start == padded_rows and padded_rows % 128 == 0:
+        return tiles[start:end].to(device=device, copy=True).view(scale.dtype)
+
+    scales = torch.zeros((padded_rows, scale_cols), dtype=torch.uint8, device=device)
+    if start < end:
+        first = start // 128 * 128
+        tiles = tiles[first:((end + 127) // 128) * 128]
+        tile_rows = from_blocked(tiles, num_rows=tiles.shape[0], num_cols=scale_cols)
+        scales[:end - start].copy_(tile_rows[start - first:end - first])
+    return to_blocked(scales, flatten=False).view(scale.dtype)
+
+
+def _shard_kitchen_weight(weight, meta_param, device):
+    layout = weight._layout_cls
+    nvfp4 = layout == "TensorCoreNVFP4Layout"
+    mxfp8 = layout == "TensorCoreMXFP8Layout"
+    int8 = layout == "TensorWiseINT8Layout"
+    fp8 = layout in ("TensorCoreFP8Layout", "TensorCoreFP8E4M3Layout", "TensorCoreFP8E5M2Layout")
+    if not (nvfp4 or mxfp8 or int8 or fp8):
+        raise NotImplementedError(f"Unsupported FSDP quantized weight layout: {layout}")
+
+    params = weight._params
+    mesh = getattr(meta_param, "device_mesh", None)
+    if mesh is None:
+        if params.scale is None:
+            return QuantizedTensor(weight._qdata.to(device=device), layout, params)
+        return weight.to(device=device)
+    if mesh.ndim != 1:
+        raise NotImplementedError(f"{layout} requires a 1D FSDP mesh, got {mesh.ndim} dimensions")
+    if getattr(params, "transposed", False):
+        raise NotImplementedError(f"Cannot row-shard a transposed {layout} weight")
+
+    rows = weight.shape[0]
+    chunk = (rows + mesh.size() - 1) // mesh.size()
+    start = min(mesh.get_local_rank() * chunk, rows)
+    end = min(start + chunk, rows)
+    local_shape = (chunk, *weight.shape[1:])
+
+    def copy_rows(tensor, padded_rows):
+        shard = tensor[start:end]
+        if shard.shape[0] == padded_rows:
+            return shard.to(device=device, copy=shard.shape != tensor.shape)
+        local = tensor.new_zeros((padded_rows, *tensor.shape[1:]), device=device)
+        local[:end - start].copy_(shard)
+        return local
+
+    if nvfp4 or mxfp8:
+        padded_rows, padded_cols = weight.layout_cls.get_padded_shape(local_shape)
+        qdata = copy_rows(weight._qdata, padded_rows)
+        scale = params.block_scale if nvfp4 else params.scale
+        scale_cols = padded_cols // (16 if nvfp4 else 32)
+        local_scale = _shard_block_scale(scale, start, end, padded_rows, scale_cols, device)
+        if nvfp4:
+            params = replace(params, orig_shape=local_shape, scale=params.scale.to(device=device), block_scale=local_scale)
+        else:
+            params = replace(params, orig_shape=local_shape, scale=local_scale)
+    else:
+        qdata = copy_rows(weight._qdata, chunk)
+        scale = params.scale
+        if isinstance(scale, torch.Tensor):
+            if int8 and scale.ndim > 0 and scale.shape[0] == rows:
+                scale = copy_rows(scale, chunk)
+            else:
+                scale = scale.to(device=device)
+                if int8:
+                    scale = scale.reshape(())
+        params = replace(params, orig_shape=local_shape, scale=scale)
+    return QuantizedTensor(qdata, layout, params)
 
 
 def _build_quantized_tensor(
@@ -504,31 +552,12 @@ def _build_quantized_tensor(
     sharded_meta_param: Any,
     device: torch.device,
 ):
-    def _local_orig_shape(layout_name: str, local_qdata: torch.Tensor, logical_orig_shape: tuple[int, ...] | None) -> tuple[int, ...]:
-        if logical_orig_shape is None:
-            return tuple(local_qdata.shape)
-        if layout_name == "TensorCoreNVFP4Layout" and len(logical_orig_shape) == 2 and local_qdata.dim() == 2:
-            return (int(local_qdata.shape[0]), int(logical_orig_shape[1]))
-        return tuple(local_qdata.shape)
-
     if not param_name.endswith("weight"):
         return None
 
     full_q = full_sd.get(param_name)
     if isinstance(full_q, QuantizedTensor):
-        qt = cast(Any, full_q)
-        if qt._layout_cls == "TensorCoreMXFP8Layout":
-            return _shard_mxfp8(qt._qdata, qt._params.scale, qt._params.orig_shape, sharded_meta_param, device, qt._params.orig_dtype)
-        if qt._layout_cls not in ("TensorCoreFP8Layout", "TensorCoreFP8E4M3Layout", "TensorCoreFP8E5M2Layout"):
-            raise NotImplementedError(
-                f"Raylight FSDP direct QuantizedTensor loading only supports FP8 and MXFP8 layouts, got {qt._layout_cls} for {param_name}. "
-                "Use a comfy_quant state dict payload for supported formats or disable Raylight FSDP quant loading."
-            )
-        local_qdata = _shard_tensor(qt._qdata, sharded_meta_param, device, pad_to_local_meta=False)
-        local_params = replace(
-            qt._params, orig_shape=_local_orig_shape(qt._layout_cls, local_qdata, getattr(qt._params, "orig_shape", None))
-        )
-        return QuantizedTensor(local_qdata, qt._layout_cls, local_params)
+        return _shard_kitchen_weight(full_q, sharded_meta_param, device)
 
     prefix = param_name[: -len("weight")]
     conf = _decode_comfy_quant(full_sd.get(f"{prefix}comfy_quant"))
@@ -546,64 +575,27 @@ def _build_quantized_tensor(
     if layout_cls is None:
         raise ValueError(f"Missing layout class for {layout_name}")
 
-    full_qdata = full_sd.get(param_name)
-    if full_qdata is None:
+    if full_q is None:
         raise ValueError(f"Missing quantized weight for {param_name}")
 
-    if quant_format == "mxfp8":
-        scale = full_sd.get(f"{prefix}weight_scale")
+    qdata = full_q.to(dtype=qconfig["storage_t"])
+    params_kwargs: dict[str, Any] = {"orig_shape": tuple(sharded_meta_param.shape), "orig_dtype": sharded_meta_param.dtype}
+    scale = full_sd.get(f"{prefix}weight_scale")
+    if quant_format in ("float8_e4m3fn", "float8_e5m2"):
+        params_kwargs["scale"] = scale if scale is not None else full_sd.get(f"{prefix}scale_weight")
+    elif quant_format == "mxfp8":
         if scale is None:
             raise ValueError(f"Missing MXFP8 block scales for {param_name}")
-        return _shard_mxfp8(full_qdata, scale, tuple(sharded_meta_param.shape), sharded_meta_param, device, sharded_meta_param.dtype)
-
-    qdata = full_qdata.to(dtype=qconfig["storage_t"])
-    qdata = _shard_tensor(qdata, sharded_meta_param, device, pad_to_local_meta=False)
-
-    params_kwargs: dict[str, Any] = {"orig_shape": tuple(qdata.shape)}
-
-    local_meta = None
-    if isinstance(sharded_meta_param, QuantizedTensor):
-        local_meta = sharded_meta_param
-    elif hasattr(sharded_meta_param, "_local_tensor") and isinstance(sharded_meta_param._local_tensor, QuantizedTensor):
-        local_meta = sharded_meta_param._local_tensor
-    orig_dtype = None
-    if local_meta is not None and hasattr(local_meta, "_params"):
-        orig_dtype = getattr(local_meta._params, "orig_dtype", None)
-    if orig_dtype is None:
-        orig_dtype = getattr(sharded_meta_param, "dtype", None)
-    if orig_dtype is not None:
-        params_kwargs["orig_dtype"] = orig_dtype
-
-    logical_orig_shape = getattr(getattr(local_meta, "_params", None), "orig_shape", None)
-    if logical_orig_shape is None and quant_format == "nvfp4" and full_qdata.dim() == 2:
-        logical_orig_shape = (int(full_qdata.shape[0]), int(full_qdata.shape[1] * 2))
-    params_kwargs["orig_shape"] = _local_orig_shape(layout_name, qdata, logical_orig_shape)
-
-    if quant_format in ("float8_e4m3fn", "float8_e5m2"):
-        scale = full_sd.get(f"{prefix}weight_scale")
-        if scale is None:
-            scale = full_sd.get(f"{prefix}scale_weight")
-        if scale is not None:
-            scale = scale.to(device=device)
-        params_kwargs["scale"] = scale
+        params_kwargs["scale"] = scale.view(torch.float8_e8m0fnu)
     elif quant_format == "nvfp4":
         tensor_scale = full_sd.get(f"{prefix}weight_scale_2")
-        block_scale = full_sd.get(f"{prefix}weight_scale")
-        if tensor_scale is None or block_scale is None:
+        if tensor_scale is None or scale is None:
             raise ValueError(f"Missing NVFP4 scales for {param_name}")
-        tensor_scale = tensor_scale.to(device=device)
-        block_scale = block_scale.view(dtype=torch.float8_e4m3fn)
-        block_scale = _shard_tensor(block_scale, sharded_meta_param, device, pad_to_local_meta=False)
         params_kwargs["scale"] = tensor_scale
-        params_kwargs["block_scale"] = block_scale
+        params_kwargs["block_scale"] = scale.view(torch.float8_e4m3fn)
     elif quant_format == "int8_tensorwise":
-        scale = full_sd.get(f"{prefix}weight_scale")
         if scale is None:
             raise ValueError(f"Missing INT8 weight scale for {param_name}")
-        if isinstance(scale, torch.Tensor) and scale.dim() > 0 and scale.numel() > 1:
-            scale = _shard_tensor(scale, sharded_meta_param, device, pad_to_local_meta=False)
-        elif isinstance(scale, torch.Tensor):
-            scale = scale.to(device=device)
         params_kwargs["scale"] = scale
         params_conf = conf.get("params", {})
         if not isinstance(params_conf, dict):
@@ -612,6 +604,8 @@ def _build_quantized_tensor(
             params_kwargs["convrot"] = True
             params_kwargs["convrot_groupsize"] = int(conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256)))
     elif quant_format == "gguf":
+        qdata = _shard_tensor(qdata, sharded_meta_param, device, pad_to_local_meta=False)
+        params_kwargs["orig_shape"] = tuple(qdata.shape)
         n_blocks_per_superblock = conf.get("n_blocks_per_superblock", 8)
         super_block_scale_scale = full_sd.get(f"{prefix}super_block_scale_scale")
         super_block_min_scale = full_sd.get(f"{prefix}super_block_min_scale")
@@ -641,11 +635,12 @@ def _build_quantized_tensor(
             scale = full_sd.get(f"{prefix}scale")
             if scale is not None:
                 params_kwargs["scale"] = scale.to(device=device)
+        return QuantizedTensor(qdata, layout_name, layout_cls.Params(**params_kwargs))
     else:
         raise ValueError(f"Unsupported quantization format: {quant_format}")
 
     params = layout_cls.Params(**params_kwargs)
-    return QuantizedTensor(qdata, layout_name, params)
+    return _shard_kitchen_weight(QuantizedTensor(qdata, layout_name, params), sharded_meta_param, device)
 
 
 def _release_quant_keys(full_sd: dict[str, Any], param_name: str, keep: set[str] | None = None) -> None:
@@ -681,6 +676,20 @@ def load_from_full_model_state_dict(
     release_sd=True,
 ):
     meta_sharded_sd = model.state_dict()
+    # Unsharded Kitchen modules export packed bytes and synthetic scale keys.
+    # Target the actual parameter so its logical dimensions and dtype survive.
+    for key in list(meta_sharded_sd):
+        if key.rsplit(".", 1)[-1] != "comfy_quant":
+            continue
+        module, _ = _get_parent_module_and_name(model, key)
+        weight = module._parameters.get("weight")
+        if isinstance(weight, QuantizedTensor):
+            prefix = key[:-len("comfy_quant")]
+            meta_sharded_sd[prefix + "weight"] = weight
+            del meta_sharded_sd[key]
+            for name in ("weight_scale", "weight_scale_2"):
+                if name not in module._parameters and name not in module._buffers:
+                    meta_sharded_sd.pop(prefix + name, None)
     own_params = set(meta_sharded_sd)
     sharded_sd: dict[str, torch.Tensor] = {}
     unsharded_params = []

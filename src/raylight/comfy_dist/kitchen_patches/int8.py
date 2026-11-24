@@ -48,7 +48,7 @@ def install_int8_patches() -> None:
         return deco
 
     def _is_row_scale(scale: Any, qdata: torch.Tensor) -> bool:
-        return isinstance(scale, torch.Tensor) and scale.dim() > 0 and scale.numel() > 1 and qdata.dim() > 0 and int(scale.shape[0]) == int(qdata.shape[0])
+        return isinstance(scale, torch.Tensor) and scale.dim() > 0 and qdata.dim() > 0 and int(scale.shape[0]) == int(qdata.shape[0])
 
     def _wrap_int8_tensor(qtensor, qdata: torch.Tensor, *, scale=None, orig_shape=None, transposed=None):
         old = qtensor._params
@@ -88,14 +88,14 @@ def install_int8_patches() -> None:
                 return False
         return False
 
-    def pre_all_gather(qtensor: QuantizedTensor, mesh):
+    def pre_all_gather(qtensor: QuantizedTensor, mesh, outer_size):
         qdata = qtensor._qdata.contiguous()
         scale = qtensor._params.scale
         scale_is_sharded = _is_row_scale(scale, qtensor._qdata)
         metadata = {
             "scale_is_sharded": scale_is_sharded,
             "orig_dtype": qtensor._params.orig_dtype,
-            "orig_shape": qtensor._params.orig_shape,
+            "orig_shape": tuple(outer_size),
             "is_weight": getattr(qtensor._params, "is_weight", True),
             "convrot": getattr(qtensor._params, "convrot", False),
             "convrot_groupsize": getattr(qtensor._params, "convrot_groupsize", 256),
@@ -116,9 +116,10 @@ def install_int8_patches() -> None:
             scale = metadata["scale"]
         if isinstance(scale, torch.Tensor):
             scale = scale.to(device=gathered_qdata.device)
-        orig_shape = tuple(gathered_qdata.shape)
-        if metadata.get("transposed", False):
-            orig_shape = tuple(metadata.get("orig_shape", orig_shape))
+        orig_shape = metadata["orig_shape"]
+        gathered_qdata = gathered_qdata[:orig_shape[0]]
+        if metadata["scale_is_sharded"]:
+            scale = scale[:orig_shape[0]]
         params = TensorWiseINT8Layout.Params(
             scale=scale,
             orig_dtype=metadata.get("orig_dtype", param_dtype),
@@ -134,8 +135,7 @@ def install_int8_patches() -> None:
             out._qdata = gathered_qdata
             out._params = params
             return None
-        tensors = (gathered_qdata, scale) if metadata.get("scale_is_sharded", False) else (gathered_qdata,)
-        return QuantizedTensor(gathered_qdata, qtensor._layout_cls, params), tensors
+        return QuantizedTensor(gathered_qdata, qtensor._layout_cls, params), all_gather_outputs
 
     if _ORIG_LAYOUT_PRE is _MISSING:
         _ORIG_LAYOUT_PRE = getattr(TensorWiseINT8Layout, "pre_all_gather", _MISSING)
@@ -144,8 +144,8 @@ def install_int8_patches() -> None:
     setattr(TensorWiseINT8Layout, "pre_all_gather", pre_all_gather)
     setattr(TensorWiseINT8Layout, "post_all_gather", post_all_gather)
 
-    def fsdp_pre_all_gather(self, mesh):
-        return self.layout_cls.pre_all_gather(self, mesh)
+    def fsdp_pre_all_gather(self, mesh, outer_size, outer_stride, module, mp_policy):
+        return self.layout_cls.pre_all_gather(self, mesh, outer_size)
 
     def fsdp_post_all_gather(self, all_gather_outputs, metadata, param_dtype, *, out=None):
         return self.layout_cls.post_all_gather(self, all_gather_outputs, metadata, param_dtype, out=out)

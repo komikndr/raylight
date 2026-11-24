@@ -15,7 +15,7 @@ def install_mxfp8_patches():
         return
     layout = get_layout_class("TensorCoreMXFP8Layout")
 
-    def pre_all_gather(qt, mesh, outer_size, outer_stride, module, mp_policy):
+    def pre_all_gather(qt, mesh, outer_size):
         rows = outer_size[0]
         chunk_rows = (rows + mesh.size() - 1) // mesh.size()
         local_rows = qt.shape[0]
@@ -42,22 +42,19 @@ def install_mxfp8_patches():
             return None
         return QuantizedTensor(data, qt._layout_cls, params), (data, scale)
 
-    old_pre = getattr(QuantizedTensor, "fsdp_pre_all_gather", None)
-    old_post = getattr(QuantizedTensor, "fsdp_post_all_gather", None)
-
     def fsdp_pre_all_gather(self, mesh, outer_size, outer_stride, module, mp_policy):
-        if self._layout_cls == "TensorCoreMXFP8Layout":
-            return pre_all_gather(self, mesh, outer_size, outer_stride, module, mp_policy)
-        return old_pre(self, mesh)
+        return self.layout_cls.pre_all_gather(self, mesh, outer_size)
 
     def fsdp_post_all_gather(self, outputs, metadata, param_dtype, *, out=None):
-        if self._layout_cls == "TensorCoreMXFP8Layout":
-            return post_all_gather(self, outputs, metadata, param_dtype, out=out)
-        return old_post(self, outputs, metadata, param_dtype, out=out)
+        return self.layout_cls.post_all_gather(self, outputs, metadata, param_dtype, out=out)
 
-    for name, method in (("fsdp_pre_all_gather", fsdp_pre_all_gather), ("fsdp_post_all_gather", fsdp_post_all_gather)):
-        _ORIGINALS.append((name, getattr(QuantizedTensor, name, None)))
-        setattr(QuantizedTensor, name, method)
+    for cls, name, method in (
+        (layout, "pre_all_gather", pre_all_gather), (layout, "post_all_gather", post_all_gather),
+        (QuantizedTensor, "fsdp_pre_all_gather", fsdp_pre_all_gather),
+        (QuantizedTensor, "fsdp_post_all_gather", fsdp_post_all_gather),
+    ):
+        _ORIGINALS.append((cls, name, vars(cls).get(name)))
+        setattr(cls, name, method)
 
     def alias(qt, args, kwargs):
         return QuantizedTensor(args[0]._qdata, args[0]._layout_cls, args[0]._params)
@@ -89,10 +86,10 @@ def install_mxfp8_patches():
 
 def restore_mxfp8_patches():
     global _PATCHED
-    for name, original in reversed(_ORIGINALS):
+    for cls, name, original in reversed(_ORIGINALS):
         if original is None:
-            delattr(QuantizedTensor, name)
+            delattr(cls, name)
         else:
-            setattr(QuantizedTensor, name, original)
+            setattr(cls, name, original)
     _ORIGINALS.clear()
     _PATCHED = False

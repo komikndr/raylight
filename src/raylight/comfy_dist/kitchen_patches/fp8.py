@@ -190,7 +190,7 @@ def install_fp8_patches() -> None:
                 raise
             return torch.addmm(*dequantize_args(args))
 
-    def pre_all_gather(qtensor: QuantizedTensor, mesh):
+    def pre_all_gather(qtensor: QuantizedTensor, mesh, outer_size):
         qdata = qtensor._qdata
         if not qdata.is_contiguous():
             qdata = qdata.contiguous()
@@ -199,7 +199,7 @@ def install_fp8_patches() -> None:
         if isinstance(scale, torch.Tensor):
             scale = scale.to(device=qdata.device)
 
-        return (qdata,), (scale,)
+        return (qdata,), (scale, tuple(outer_size))
 
     def post_all_gather(
         qtensor: QuantizedTensor,
@@ -210,8 +210,8 @@ def install_fp8_patches() -> None:
         out: QuantizedTensor | None = None,
     ):
         (data,) = all_gather_outputs
-        (scale,) = metadata
-        orig_shape = tuple(qtensor._params.orig_shape)
+        scale, orig_shape = metadata
+        data = data[:orig_shape[0]]
 
         expected_numel = 1
         for dim in orig_shape:
@@ -243,7 +243,7 @@ def install_fp8_patches() -> None:
             orig_dtype=param_dtype,
             orig_shape=orig_shape,
         )
-        return QuantizedTensor(data, qtensor._layout_cls, params), (data,)
+        return QuantizedTensor(data, qtensor._layout_cls, params), all_gather_outputs
 
     for layout_cls in fp8_layout_classes:
         if layout_cls not in _ORIG_LAYOUT_METHODS:
@@ -254,8 +254,8 @@ def install_fp8_patches() -> None:
         setattr(layout_cls, "pre_all_gather", pre_all_gather)
         setattr(layout_cls, "post_all_gather", post_all_gather)
 
-    def fsdp_pre_all_gather(self, mesh):
-        return self.layout_cls.pre_all_gather(self, mesh)
+    def fsdp_pre_all_gather(self, mesh, outer_size, outer_stride, module, mp_policy):
+        return self.layout_cls.pre_all_gather(self, mesh, outer_size)
 
     def fsdp_post_all_gather(self, all_gather_outputs, metadata, param_dtype, *, out=None):
         return self.layout_cls.post_all_gather(
