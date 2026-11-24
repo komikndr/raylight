@@ -488,7 +488,8 @@ def _shard_block_scale(scale, start, end, padded_rows, scale_cols, device):
     return to_blocked(scales, flatten=False).view(scale.dtype)
 
 
-PACKED_ROW_LAYOUTS = ("TensorCoreConvRotW4A4Layout",)
+PACKED_ROW_LAYOUTS = ("TensorCoreConvRotW4A4Layout", "AsymW4A8Int8Layout")
+_GROUPED_QUANT_KEYS = ("weight_s_rel", "weight_s_channel", "weight_codebook", "weight_correction")
 
 
 class _PackedRowWeight(QuantizedTensor):
@@ -535,12 +536,26 @@ class _PackedRowWeight(QuantizedTensor):
         return super().__torch_dispatch__(func, types, args, kwargs)
 
     def fsdp_pre_all_gather(self, mesh, outer_size, outer_stride, module, mp_policy):
-        return (self._qdata.contiguous(), self._params.scale.contiguous()), tuple(outer_size)
+        params = self._params
+        inputs = [self._qdata.contiguous(), params.scale.contiguous()]
+        codebook = None
+        if self._layout_cls == "AsymW4A8Int8Layout":
+            inputs.append(params.s_channel.contiguous())
+            if params.correction is not None:
+                inputs.append(params.correction.t().contiguous())
+            codebook = params.codebook  # replicated rather than gathered
+        return tuple(inputs), (tuple(outer_size), codebook)
 
-    def fsdp_post_all_gather(self, outputs, shape, param_dtype, *, out=None):
+    def fsdp_post_all_gather(self, outputs, metadata, param_dtype, *, out=None):
+        shape, codebook = metadata
         rows = shape[0]
         qdata = outputs[0][:rows]
-        params = replace(self._params, scale=outputs[1][:rows], orig_shape=shape, orig_dtype=param_dtype)
+        fields = {}
+        if self._layout_cls == "AsymW4A8Int8Layout":
+            fields.update(s_channel=outputs[2][:rows], codebook=codebook.to(qdata.device) if codebook is not None else None)
+            if self._params.correction is not None:
+                fields["correction"] = outputs[3][:rows].t()
+        params = replace(self._params, scale=outputs[1][:rows], orig_shape=shape, orig_dtype=param_dtype, **fields)
         if out is not None:
             out._qdata = qdata
             out._params = params
@@ -584,7 +599,16 @@ def _shard_kitchen_weight(weight, meta_param, device):
         return local
 
     if packed_rows:
-        params = replace(params, orig_shape=local_shape, scale=copy_rows(params.scale, chunk))
+        fields = {}
+        if layout == "AsymW4A8Int8Layout":
+            if params.mma_packed:
+                raise ValueError("FSDP row sharding requires canonical W4A8/W6A8 checkpoint weights, not resident MMA packing")
+            fields["s_channel"] = copy_rows(params.s_channel, chunk)
+            if params.codebook is not None:
+                fields["codebook"] = params.codebook.to(device=device)
+            if params.correction is not None:
+                fields["correction"] = copy_rows(params.correction.t(), chunk).t()
+        params = replace(params, orig_shape=local_shape, scale=copy_rows(params.scale, chunk), **fields)
         return _PackedRowWeight(copy_rows(weight._qdata, chunk), layout, params)
     if nvfp4 or mxfp8:
         padded_rows, padded_cols = weight.layout_cls.get_padded_shape(local_shape)
@@ -645,6 +669,9 @@ def _build_quantized_tensor(
     qdata = full_q.to(dtype=qconfig["storage_t"])
     params_kwargs: dict[str, Any] = {"orig_shape": tuple(sharded_meta_param.shape), "orig_dtype": sharded_meta_param.dtype}
     scale = full_sd.get(f"{prefix}weight_scale")
+    params_conf = conf.get("params", {})
+    if not isinstance(params_conf, dict):
+        params_conf = {}
     if quant_format in ("float8_e4m3fn", "float8_e5m2"):
         params_kwargs["scale"] = scale if scale is not None else full_sd.get(f"{prefix}scale_weight")
     elif quant_format == "mxfp8":
@@ -661,9 +688,6 @@ def _build_quantized_tensor(
         if scale is None:
             raise ValueError(f"Missing INT8 weight scale for {param_name}")
         params_kwargs["scale"] = scale
-        params_conf = conf.get("params", {})
-        if not isinstance(params_conf, dict):
-            params_conf = {}
         if conf.get("convrot", params_conf.get("convrot", False)):
             params_kwargs["convrot"] = True
             params_kwargs["convrot_groupsize"] = int(conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256)))
@@ -671,12 +695,26 @@ def _build_quantized_tensor(
         rows, cols = params_kwargs["orig_shape"]
         if qdata.shape != (rows, cols // 2) or cols % 2 or scale is None or scale.numel() != rows:
             raise ValueError(f"Expected packed W4A4 rows and one weight scale per row for {param_name}")
-        params_conf = conf.get("params", {})
-        if not isinstance(params_conf, dict):
-            params_conf = {}
         params_kwargs.update(scale=scale.reshape(rows), quant_group_size=64,
                              convrot_groupsize=int(conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256))),
                              linear_dtype=conf.get("linear_dtype", params_conf.get("linear_dtype", "int4")))
+    elif quant_format in ("asym_w4a8_int8", "w6a8_int8"):
+        rows, cols = params_kwargs["orig_shape"]
+        bits = 4 if quant_format == "asym_w4a8_int8" else 6
+        if qdata.ndim != 2 or qdata.shape[0] != rows or qdata.shape[1] * 8 != cols * bits:
+            raise ValueError(f"Invalid packed {bits}-bit weight shape {tuple(qdata.shape)} for {param_name} ({rows}, {cols})")
+        scale = full_sd.get(f"{prefix}weight_s_rel")
+        s_channel = full_sd.get(f"{prefix}weight_s_channel")
+        if scale is None or s_channel is None:
+            raise ValueError(f"Missing group or channel scale for {param_name} ({quant_format})")
+        codebook = full_sd.get(f"{prefix}weight_codebook")
+        correction = full_sd.get(f"{prefix}weight_correction")
+        if bits == 6 and (codebook is not None or correction is not None):
+            raise ValueError(f"Uniform W6A8 cannot use a codebook or correction for {param_name}")
+        params_kwargs.update(scale=scale.view(torch.float8_e4m3fn) if scale.dtype == torch.uint8 else scale,
+                             s_channel=s_channel, codebook=codebook, correction=correction,
+                             group_size=int(conf.get("group_size", params_conf.get("group_size", 16))),
+                             convrot_groupsize=int(conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256))))
     elif quant_format == "gguf":
         qdata = _shard_tensor(qdata, sharded_meta_param, device, pad_to_local_meta=False)
         params_kwargs["orig_shape"] = tuple(qdata.shape)
@@ -727,6 +765,7 @@ def _release_quant_keys(full_sd: dict[str, Any], param_name: str, keep: set[str]
         param_name,
         f"{prefix}weight_scale",
         f"{prefix}weight_scale_2",
+        *(f"{prefix}{name}" for name in _GROUPED_QUANT_KEYS),
         f"{prefix}scale_weight",
         f"{prefix}comfy_quant",
         f"{prefix}super_block_scale_scale",
@@ -761,7 +800,7 @@ def load_from_full_model_state_dict(
             prefix = key[:-len("comfy_quant")]
             meta_sharded_sd[prefix + "weight"] = weight
             del meta_sharded_sd[key]
-            for name in ("weight_scale", "weight_scale_2"):
+            for name in ("weight_scale", "weight_scale_2", *_GROUPED_QUANT_KEYS):
                 if name not in module._parameters and name not in module._buffers:
                     meta_sharded_sd.pop(prefix + name, None)
     own_params = set(meta_sharded_sd)

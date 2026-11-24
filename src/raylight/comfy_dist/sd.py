@@ -1135,12 +1135,23 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
         device_mesh=device_mesh,
         is_cpu_offload=is_cpu_offload,
     )
-    model.load_model_weights(new_sd, "", assign=True)
+    corrections = {}
+
+    def keep_grouped_corrections(module, state_dict, *args):
+        # Native loading consumes the scales but drops the optional W4A8
+        # correction. Capture it after model-specific checkpoint key conversion.
+        for key in [k for k in state_dict if k.endswith("weight_correction")]:
+            if key.removesuffix("_correction") + "_s_rel" in state_dict:
+                corrections["diffusion_model." + key] = state_dict.pop(key)
+
+    with model.diffusion_model.register_load_state_dict_pre_hook(keep_grouped_corrections):
+        model.load_model_weights(new_sd, "", assign=True)
     if not model_management.is_device_cpu(offload_device):
         model.to(offload_device)
     left_over = sd.keys()
     if len(left_over) > 0:
         logging.info("left over keys in diffusion model: {}".format(left_over))
     state_dict = model_patcher.model_state_dict(filter_prefix="diffusion_model.")
+    state_dict.update(corrections)
     model_patcher.model.diffusion_model.to("meta")
     return model_patcher, state_dict
