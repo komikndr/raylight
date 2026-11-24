@@ -75,6 +75,7 @@ def usp_dit_forward(
 
     freqs_cis = freqs_cis.to(img.device)
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(img.shape[1],))
     img, img_orig_size = pad_to_world_size(img, dim=1)
     freqs_cis, _ = pad_to_world_size(freqs_cis, dim=1)
 
@@ -169,6 +170,6 @@ def usp_joint_attention_forward(
                                          xv.movedim(1, 2),
                                          self.n_local_heads,
                                          mask=x_mask,
-                                         skip_reshape=True)
+                                         skip_reshape=True, key_lengths=transformer_options.get("raylight_key_lengths"))
 
     return self.out(output)

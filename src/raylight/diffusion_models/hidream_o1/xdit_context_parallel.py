@@ -38,33 +38,35 @@ def _split_freqs_suffix(freqs_cis, prefix_len):
     return tuple(out), orig_size
 
 
-def usp_two_pass_attention(ar_len: int, transformer_options=None):
+def usp_two_pass_attention(ar_len: int, gen_len):
     def two_pass_attention(q, k, v, heads, **kwargs):
         B, H, T, D = q.shape
+        gqa = kwargs.get("enable_gqa", False)
 
         if T < k.shape[2]:
-            out = comfy.ops.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+            out = comfy.ops.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, enable_gqa=gqa)
         elif ar_len >= T:
-            out = comfy.ops.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True)
+            out = comfy.ops.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True, enable_gqa=gqa)
         elif ar_len <= 0:
+            if gqa:
+                k = k.repeat_interleave(H // k.shape[1], dim=1)
+                v = v.repeat_interleave(H // v.shape[1], dim=1)
             out = xfuser_optimized_attention(
-                q, k, v, heads,
+                q, k, v, heads, key_lengths=(gen_len,),
                 skip_reshape=True,
                 skip_output_reshape=True,
             )
         else:
             out_ar = comfy.ops.scaled_dot_product_attention(
                 q[:, :, :ar_len], k[:, :, :ar_len], v[:, :, :ar_len],
-                attn_mask=None, dropout_p=0.0, is_causal=True,
+                attn_mask=None, dropout_p=0.0, is_causal=True, enable_gqa=gqa,
             )
-            full_k_gen = get_sp_group().all_gather(k[:, :, ar_len:].contiguous(), dim=2)
-            full_v_gen = get_sp_group().all_gather(v[:, :, ar_len:].contiguous(), dim=2)
+            full_k_gen = get_sp_group().all_gather(k[:, :, ar_len:].contiguous(), dim=2)[:, :, :gen_len]
+            full_v_gen = get_sp_group().all_gather(v[:, :, ar_len:].contiguous(), dim=2)[:, :, :gen_len]
             full_k = torch.cat([k[:, :, :ar_len], full_k_gen], dim=2)
             full_v = torch.cat([v[:, :, :ar_len], full_v_gen], dim=2)
-            out_gen = xfuser_optimized_attention(
-                q[:, :, ar_len:], full_k, full_v, heads,
-                skip_reshape=True,
-                skip_output_reshape=True,
+            out_gen = comfy.ops.scaled_dot_product_attention(
+                q[:, :, ar_len:], full_k, full_v, enable_gqa=gqa,
             )
             out = torch.cat([out_ar, out_gen], dim=2)
 
@@ -129,7 +131,7 @@ def usp_dit_forward(self, x, timesteps, context=None, transformer_options={}, in
     inputs_embeds, gen_orig_size = _split_suffix(inputs_embeds, prefix_len, dim=1)
     freqs_cis, _ = _split_freqs_suffix(freqs_cis, prefix_len)
 
-    two_pass_attn = usp_two_pass_attention(prefix_len, transformer_options=transformer_options)
+    two_pass_attn = usp_two_pass_attention(prefix_len, gen_orig_size)
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
     transformer_options["total_blocks"] = len(self.language_model.layers)

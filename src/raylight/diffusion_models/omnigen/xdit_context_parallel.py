@@ -31,6 +31,7 @@ def _gather_sequence(tensor, orig_size):
 
 def _run_refiner_layers(hidden_states, rotary_emb, layers, temb=None, transformer_options={}):
     hidden_states, orig_size = _split_sequence(hidden_states)
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(orig_size,))
     rotary_emb, _ = _split_sequence(rotary_emb)
 
     for layer in layers:
@@ -138,6 +139,7 @@ def usp_dit_forward(
     hidden_states = torch.cat([text_hidden_states, hidden_states], dim=1)
 
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(hidden_states.shape[1],))
     hidden_states, hidden_states_orig_size = _split_sequence(hidden_states)
     rotary_emb, _ = _split_sequence(rotary_emb)
 
@@ -201,6 +203,6 @@ def usp_attention_forward(
         value,
         self.heads,
         mask=None,
-        skip_reshape=True,
+        skip_reshape=True, key_lengths=transformer_options.get("raylight_key_lengths"),
     )
     return self.to_out[0](hidden_states)

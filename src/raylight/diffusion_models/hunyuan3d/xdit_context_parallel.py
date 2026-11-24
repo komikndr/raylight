@@ -56,6 +56,7 @@ def usp_dit_forward(self, x, timestep, context, guidance=None, transformer_optio
 
     # ===================== SP SPLIT ====================== #
     img, img_orig_size = pad_to_world_size(img, dim=1)
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(txt.shape[1], img_orig_size))
     txt, txt_orig_size = pad_to_world_size(txt, dim=1)
     sp_world = get_sequence_parallel_world_size()
     sp_rank = get_sequence_parallel_rank()
@@ -99,6 +100,7 @@ def usp_dit_forward(self, x, timestep, context, guidance=None, transformer_optio
     # ===================== SP SPLIT ====================== #
 
     img, joint_orig_size = pad_to_world_size(img, dim=1)
+    transformer_options["raylight_key_lengths"] = (joint_orig_size,)
     img = torch.chunk(img, sp_world, dim=1)[sp_rank]
 
     for i, block in enumerate(self.single_blocks):

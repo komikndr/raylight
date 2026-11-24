@@ -9,6 +9,7 @@ from ..utils import pad_to_world_size
 
 
 def _target_attention(q, k, v, heads, prefix_kv, target_len, transformer_options, preferred_attention=None):
+    q, k, v = q.take(), k.take(), v.take()
     group = get_sp_group()
     k = group.all_gather(k.take().contiguous(), dim=1)[:, :target_len]
     v = group.all_gather(v.take().contiguous(), dim=1)[:, :target_len]

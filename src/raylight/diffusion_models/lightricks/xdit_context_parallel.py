@@ -174,7 +174,9 @@ def usp_dit_forward(
     pe = self._prepare_positional_embeddings(pixel_coords, frame_rate, input_dtype)
     # ===================== SP SPLIT ====================== #
     x, x_orig = pad_group_to_world_size(x, dim=1)
-    context, _ = pad_group_to_world_size(context, dim=1)
+    context, context_orig = pad_group_to_world_size(context, dim=1)
+    key_lengths = (*x_orig, *context_orig) if isinstance(x_orig, (tuple, list)) else (x_orig, None, context_orig)
+    transformer_options = dict(transformer_options, raylight_stream_lengths=key_lengths)
     pe = pad_and_split_pe(pe, dim=1, sp_world_size=sp_world_size, sp_rank=sp_rank)
 
     x = sp_chunk_group(x, sp_world_size, sp_rank, dim=1)
@@ -215,6 +217,7 @@ def usp_cross_attn_forward(self, x, context=None, mask=None, pe=None, k_pe=None,
             v,
             self.heads,
             attn_precision=self.attn_precision,
+            key_lengths=(transformer_options["raylight_stream_lengths"][self.raylight_key_stream],),
         )
 
     if self.to_gate_logits is not None:

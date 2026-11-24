@@ -138,10 +138,7 @@ if hasattr(model_base, "WAN22_Animate"):
 
     @USPInjectRegistry.register(model_base.WAN22_Animate)
     def _inject_wan22_animate(model_patcher, base_model, *args):
-        from ..diffusion_models.wan.xdit_context_parallel_animate import (
-            usp_animate_dit_forward,
-            usp_face_block_forward,
-        )
+        from ..diffusion_models.wan.xdit_context_parallel_animate import usp_animate_dit_forward
         from ..diffusion_models.wan.xdit_context_parallel import (
             usp_self_attn_forward,
             usp_i2v_cross_attn_forward,
@@ -155,8 +152,6 @@ if hasattr(model_base, "WAN22_Animate"):
             usp_t2v_cross_attn_forward,
             usp_i2v_cross_attn_forward,
         )
-        for face_block in model.face_adapter.fuser_blocks:
-            face_block.forward = types.MethodType(usp_face_block_forward, face_block)
         model.forward_orig = types.MethodType(usp_animate_dit_forward, model)
 
 
@@ -690,11 +685,17 @@ if hasattr(model_base, "LTXAV"):
         model = base_model.diffusion_model
         for block in model.transformer_blocks:
             block.attn1.forward = types.MethodType(usp_cross_attn_forward, block.attn1)
+            block.attn1.raylight_key_stream = 0
             block.audio_attn1.forward = types.MethodType(usp_cross_attn_forward, block.audio_attn1)
+            block.audio_attn1.raylight_key_stream = 1
             block.attn2.forward = types.MethodType(usp_cross_attn_forward, block.attn2)
+            block.attn2.raylight_key_stream = 2
             block.audio_attn2.forward = types.MethodType(usp_cross_attn_forward, block.audio_attn2)
+            block.audio_attn2.raylight_key_stream = 3
             block.audio_to_video_attn.forward = types.MethodType(usp_cross_attn_forward, block.audio_to_video_attn)
+            block.audio_to_video_attn.raylight_key_stream = 1
             block.video_to_audio_attn.forward = types.MethodType(usp_cross_attn_forward, block.video_to_audio_attn)
+            block.video_to_audio_attn.raylight_key_stream = 0
 
         model._forward = types.MethodType(usp_dit_forward, model)
 
@@ -708,7 +709,9 @@ if hasattr(model_base, "LTXV"):
         model = base_model.diffusion_model
         for block in model.transformer_blocks:
             block.attn1.forward = types.MethodType(usp_cross_attn_forward, block.attn1)
+            block.attn1.raylight_key_stream = 0
             block.attn2.forward = types.MethodType(usp_cross_attn_forward, block.attn2)
+            block.attn2.raylight_key_stream = 2
 
         model._forward = types.MethodType(usp_dit_forward, model)
 

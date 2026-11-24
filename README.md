@@ -347,6 +347,12 @@ This is experimental mode where all type of parallel group can work at a sime ti
 | H3 FL2VA           | ✅  | ✅   | ❌  |
 
 
+**MOSS Image**
+| Model        | USP | FSDP | CFG |
+|--------------|-----|------|-----|
+| MOSS Image   | ❓  | ❌   | ❓  |
+
+
 **UNet**
 | Model  | USP | FSDP | CFG |
 |--------|-----|------|-----|
@@ -367,6 +373,9 @@ This is experimental mode where all type of parallel group can work at a sime ti
 - Non standard Wan variant (Phantom, etc...) is not tested
 - CFG parallel for Flux, Hunyuan, is technically supported by Raylight,
   but since these models do not support conditional batches (CFG = 1), enabling it has no effect.
+- MOSS Image USP is code-ready but awaiting parallel runtime validation. Padding rows from the joint and
+  reference sequences are excluded from attention.
+  The context attention bias (prompt/image weights) keeps affecting the text embedder only.
 - Chroma and Hunyuan Video ControlNet support is implemented in the USP/FSDP code paths
   but no ControlNet model weights are currently available in ComfyUI to test with.
 - Only one ControlNet model per workflow is supported. To apply the same model with

@@ -95,7 +95,7 @@ def attention(q, k, v, pe, mask=None, transformer_options={}, preferred_attentio
     if preferred_attention is not None and preferred_attention.function is not None:
         return _checkpoint_attention(q, k, v, mask, transformer_options, preferred_attention)
     heads = q.shape[1]
-    x = xfuser_optimized_attention(q, k, v, heads, skip_reshape=True)
+    x = xfuser_optimized_attention(q, k, v, heads, skip_reshape=True, key_lengths=transformer_options.get("raylight_key_lengths"))
     return x
 
 

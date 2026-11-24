@@ -29,7 +29,7 @@ def usp_attention_forward(self, x, rotary_emb, attention_mask=None, transformer_
         k.transpose(1, 2),
         v.transpose(1, 2),
         heads=self.num_heads,
-        mask=attention_mask,
+        mask=attention_mask, key_lengths=transformer_options.get("raylight_key_lengths"),
         skip_reshape=True,
         transformer_options=transformer_options,
     )
@@ -87,6 +87,7 @@ def usp_dit_forward(
     t_emb = self.time_embedder(timestep_proj)
     temb_input = t_emb.unsqueeze(1).expand(B, joint_seq_len, -1)
 
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(joint.shape[1],))
     joint, joint_orig_size = pad_to_world_size(joint, dim=1)
     rotary, _ = pad_to_world_size(rotary, dim=1)
     local_temb_input, _ = pad_to_world_size(temb_input, dim=1)

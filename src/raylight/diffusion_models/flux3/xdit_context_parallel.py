@@ -20,13 +20,7 @@ def _split_sequence(tensor):
 
 def usp_attention(original_attention, q, k, v, heads, transformer_options={}, **kwargs):
     length = transformer_options[_SEQUENCE_LENGTH]
-    if length % get_sequence_parallel_world_size():
-        # Padding must not enter the softmax. Keep queries local and gather only
-        # valid keys/values when the sequence cannot be evenly distributed.
-        k = get_sp_group().all_gather(k.contiguous(), dim=1)[:, :length]
-        v = get_sp_group().all_gather(v.contiguous(), dim=1)[:, :length]
-        return original_attention(q, k, v, heads, transformer_options=transformer_options, **kwargs)
-    return xfuser_optimized_attention(q, k, v, heads, transformer_options=transformer_options, **kwargs)
+    return xfuser_optimized_attention(q, k, v, heads, transformer_options=transformer_options, key_lengths=(length,), **kwargs)
 
 
 def usp_block_forward(self, x, spans, pe, transformer_options={}):
@@ -75,6 +69,7 @@ def usp_flux3_forward(self, x, timestep, context=None, ref_latents=None, transfo
     lengths.append(txt_states.shape[1])
 
     pe = self.rope(torch.cat([ids for _, _, ids in parts]))
+    # ===================== SP SPLIT ====================== #
     image_pe = _split_sequence(pe[:, :image_length])
     pe = _split_sequence(pe)
     spans, length = [], 0
@@ -100,6 +95,7 @@ def usp_flux3_forward(self, x, timestep, context=None, ref_latents=None, transfo
         comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, block, dtype, malloc_scope="block")
         img = block(img, [(0, img.shape[1], early)], image_pe, transformer_options)
 
+    # ===================== SP GATHER ===================== #
     img = get_sp_group().all_gather(img.contiguous(), dim=1)[:, :image_length]
     parts[0] = (img, "image", parts[0][2])
     local_spans = []
@@ -122,6 +118,7 @@ def usp_flux3_forward(self, x, timestep, context=None, ref_latents=None, transfo
     comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None, malloc_scope="block")
     comfy.model_prefetch.malloc_graph_end()
 
+    # ===================== SP GATHER ===================== #
     img = get_sp_group().all_gather(joint.contiguous(), dim=1)[:, :image_length]
     out = self.final_layer["image"](img, vec_img)
     return out.transpose(1, 2).reshape(B, self.in_channels, H, W)

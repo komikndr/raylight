@@ -135,6 +135,7 @@ def _parallel_blocks(self, x, hidden_states, img_ids, encoder_hidden_states, txt
             txt_ids = out["txt_ids"]
 
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(encoder_hidden_states.shape[1], hidden_states.shape[1]))
     hidden_states, hidden_states_orig_size = pad_to_world_size(hidden_states, dim=1)
     encoder_hidden_states, _ = pad_to_world_size(encoder_hidden_states, dim=1)
     img_ids, _ = pad_to_world_size(img_ids, dim=1)
@@ -224,7 +225,8 @@ def _parallel_blocks(self, x, hidden_states, img_ids, encoder_hidden_states, txt
 
 
 def usp_attention(original_attention, q, k, v, heads, mask=None, **kwargs):
-    return xfuser_optimized_attention(q, k, v, heads, mask=mask, **kwargs)
+    return xfuser_optimized_attention(q, k, v, heads, mask=mask,
+                                      key_lengths=kwargs["transformer_options"]["raylight_key_lengths"], **kwargs)
 
 
 def usp_attn_forward(self, hidden_states, encoder_hidden_states=None, encoder_hidden_states_mask=None,

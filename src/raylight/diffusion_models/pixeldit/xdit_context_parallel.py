@@ -59,7 +59,7 @@ def usp_joint_attention_forward(self, x, y, pos_img, pos_txt=None, attn_mask=Non
         H,
         mask=None,
         skip_reshape=True,
-        skip_output_reshape=True,
+        skip_output_reshape=True, key_lengths=transformer_options.get("raylight_key_lengths"),
     )
 
     out_y = out_joint[:, :, :Ny, :].transpose(1, 2).reshape(B, Ny, H * D)
@@ -74,7 +74,7 @@ def usp_rotary_attention_forward(self, x, pos, mask=None, transformer_options={}
     qkv = self.qkv(x).reshape(B, N, 3, H, D).permute(2, 0, 3, 1, 4)
     q, k, v = qkv.unbind(0)
     q, k = apply_rope(self.q_norm(q), self.k_norm(k), pos[None, None])
-    x = xfuser_optimized_attention(q, k, v, H, mask=None, skip_reshape=True)
+    x = xfuser_optimized_attention(q, k, v, H, mask=None, skip_reshape=True, key_lengths=transformer_options.get("raylight_key_lengths"))
     return self.proj(x)
 
 
@@ -145,6 +145,7 @@ def usp_pixdit_forward(self, x, timesteps, context=None, attention_mask=None, tr
 
     s = self.s_embedder(x_patches)
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(Ltxt, s.shape[1]))
     s, s_orig_size = _pad_and_chunk(s, dim=1)
     y_emb, _ = _pad_and_chunk(y_emb, dim=1)
     pos_img, _ = _pad_and_chunk_pos(pos_img)
@@ -171,6 +172,7 @@ def usp_pixdit_forward(self, x, timesteps, context=None, attention_mask=None, tr
     local_l = x_pixels.shape[1]
     x_pixels = x_pixels.reshape(B * local_l, P2, self.pixel_hidden_size)
 
+    transformer_options["raylight_key_lengths"] = (s_orig_size,)
     transformer_options["_raylight_pixeldit_batch"] = B
     transformer_options["_raylight_pixeldit_local_l"] = local_l
     transformer_options["_raylight_pixeldit_pos"] = pos_img
