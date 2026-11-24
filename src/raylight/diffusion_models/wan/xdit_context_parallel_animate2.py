@@ -34,7 +34,9 @@ def usp_animate2_self_attn_forward_pose(self, x, freqs, transformer_options={}, 
     q = apply_rope1(self.norm_q(self.q(x)).view(b, s, n, d), freqs)
     k = apply_rope1(self.norm_k(self.k(x)).view(b, s, n, d), freqs)
     v = self.v(x).view(b, s, n, d)
-    out = optimized_attention(q.reshape(b, s, n * d), _gather(k).reshape(b, -1, n * d), _gather(v).reshape(b, -1, n * d), heads=n, transformer_options=transformer_options)
+    frames, height, width = transformer_options["grid_sizes"]
+    length = (frames - 1) * height * width
+    out = optimized_attention(q.reshape(b, s, n * d), _gather(k)[:, :length].reshape(b, -1, n * d), _gather(v)[:, :length].reshape(b, -1, n * d), heads=n, transformer_options=transformer_options)
     for p in transformer_options.get("patches", {}).get("attn1_patch", []):
         out = p({"x": out, "q": q, "k": k, "transformer_options": transformer_options})
     return self.o(out), k, v
@@ -63,8 +65,8 @@ def usp_animate2_self_attn_forward_gen(
         if ref_slice is not None:
             v[:, ref_slice[0]:ref_slice[1]] *= ref_strength
 
-    full_k = _gather(k)
-    full_v = _gather(v)
+    full_k = _gather(k)[:, :f_gen * hw]
+    full_v = _gather(v)[:, :f_gen * hw]
     out = x.new_empty(b, s, n, d)
     full_k_pose = None if k_pose is None else _gather(k_pose)
     full_v_pose = None if v_pose is None else _gather(v_pose)

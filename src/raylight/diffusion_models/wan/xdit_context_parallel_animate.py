@@ -1,18 +1,11 @@
 import torch
-from typing import Optional
-from einops import rearrange
 from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
     get_sp_group,
 )
-import raylight.distributed_modules.attention as xfuser_attn
 from .xdit_context_parallel import sinusoidal_embedding_1d
 from ..utils import pad_to_world_size
-
-attn_type = xfuser_attn.get_attn_type()
-sync_ulysses = xfuser_attn.get_sync_ulysses()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
 
 
 def _pad_and_split_for_sp(tensor, dim=1):
@@ -21,48 +14,6 @@ def _pad_and_split_for_sp(tensor, dim=1):
     tensor, orig_size = pad_to_world_size(tensor, dim=dim)
     tensor = torch.chunk(tensor, get_sequence_parallel_world_size(), dim=dim)[get_sequence_parallel_rank()]
     return tensor, orig_size
-
-
-def usp_face_block_forward(
-    self,
-    x: torch.Tensor,
-    motion_vec: torch.Tensor,
-    motion_mask: Optional[torch.Tensor] = None,
-    *args,
-    **kwargs,
-    # use_context_parallel=False,
-) -> torch.Tensor:
-    B, T, N, C = motion_vec.shape
-    T_comp = T
-
-    x_motion = self.pre_norm_motion(motion_vec)
-    x_feat = self.pre_norm_feat(x)
-
-    kv = self.linear1_kv(x_motion)
-    q = self.linear1_q(x_feat)
-
-    k, v = rearrange(kv, "B L N (K H D) -> K B L N H D", K=2, H=self.heads_num)
-    q = rearrange(q, "B S (H D) -> B S H D", H=self.heads_num)
-
-    # Apply QK-Norm if needed.
-    q = self.q_norm(q).to(v)
-    k = self.k_norm(k).to(v)
-
-    k = rearrange(k, "B L N H D -> (B L) N H D")
-    v = rearrange(v, "B L N H D -> (B L) N H D")
-
-    q = rearrange(q, "B (L S) H D -> (B L) S (H D)", L=T_comp)
-
-    attn = xfuser_optimized_attention(q, k, v, heads=self.heads_num)
-
-    attn = rearrange(attn, "(B L) S C -> B (L S) C", L=T_comp)
-
-    output = self.linear2(attn)
-
-    if motion_mask is not None:
-        output = output * rearrange(motion_mask, "B T H W -> B (T H W)").unsqueeze(-1)
-
-    return output
 
 
 def usp_animate_dit_forward(
@@ -107,6 +58,7 @@ def usp_animate_dit_forward(
         context_img_len = clip_fea.shape[-2]
 
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(x.shape[1],))
     x, orig_size = _pad_and_split_for_sp(x, dim=1)
     freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
 
@@ -139,7 +91,19 @@ def usp_animate_dit_forward(
             x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
 
         if i % 5 == 0 and motion_vec is not None:
-            x = x + self.face_adapter.fuser_blocks[i // 5](x, motion_vec)
+            # A shard can start or end inside a frame. Pair each query only with its own frame's face tokens.
+            frame_rows = orig_size // motion_vec.shape[1]
+            shard_start = get_sequence_parallel_rank() * x.shape[1]
+            shard_end = min(shard_start + x.shape[1], orig_size)
+            fuser = self.face_adapter.fuser_blocks[i // 5]
+            start = shard_start
+            while start < shard_end:
+                frame, offset = divmod(start, frame_rows)
+                count = 1 if offset else max(1, (shard_end - start) // frame_rows)
+                end = min((frame + count) * frame_rows, shard_end)
+                rows = slice(start - shard_start, end - shard_start)
+                x[:, rows] = x[:, rows] + fuser(x[:, rows], motion_vec[:, frame:frame + count])
+                start = end
 
     # head
     # ===================== SP GATHER ===================== #

@@ -56,9 +56,11 @@ def usp_dit_forward(self, x, timesteps, context, attention_mask=None, ref_latent
         tvec = torch.cat((tvec, self.tproj(t0)), dim=0)
 
     txtpos = torch.zeros(bs, context.shape[1], 3, device=img.device, dtype=torch.float32)
+    # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(context.shape[1],))
     context, _ = pad_to_world_size(context, dim=1)
     txtpos, _ = pad_to_world_size(txtpos, dim=1)
-    img, _ = pad_to_world_size(img, dim=1)
+    img, full_img_len = pad_to_world_size(img, dim=1)
     imgpos, _ = pad_to_world_size(imgpos, dim=1)
 
     sp_rank = get_sequence_parallel_rank()
@@ -81,6 +83,7 @@ def usp_dit_forward(self, x, timesteps, context, attention_mask=None, ref_latent
             imgpos, txtpos = out["img_ids"], out["txt_ids"]
 
     txtlen = context.shape[1]
+    transformer_options["raylight_key_lengths"] += (full_img_len,)
     combined = torch.cat((context, img), dim=1)
     pos = torch.cat((txtpos, imgpos), dim=1)
     freqs = self.pe_embedder(pos)
@@ -95,6 +98,7 @@ def usp_dit_forward(self, x, timesteps, context, attention_mask=None, ref_latent
         combined = block(combined, tvec, freqs, None, timestep_zero_index=timestep_zero_index, transformer_options=transformer_options)
 
     out = self.last(combined, t)[:, txtlen:, :]
+    # ===================== SP GATHER ===================== #
     out = get_sp_group().all_gather(out.contiguous(), dim=1)
     out = out[:, :img_total_tokens, :]
     out = out[:, :img_tokens, :]
@@ -129,7 +133,7 @@ def usp_attention_forward(self, x, freqs=None, mask=None, transformer_options={}
         repeats = self.heads // self.kvheads
         k = k.repeat_interleave(repeats, dim=1)
         v = v.repeat_interleave(repeats, dim=1)
-    out = xfuser_optimized_attention(q, k, v, self.heads, mask=mask, skip_reshape=True)
+    out = xfuser_optimized_attention(q, k, v, self.heads, mask=mask, skip_reshape=True, key_lengths=transformer_options.get("raylight_key_lengths"))
 
     if "block_index" in transformer_options and "attn1_output_patch" in transformer_patches:
         for patch in transformer_patches["attn1_output_patch"]:

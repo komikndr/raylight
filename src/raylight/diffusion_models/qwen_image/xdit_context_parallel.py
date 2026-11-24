@@ -110,6 +110,7 @@ def usp_dit_forward(
     del txt_ids, img_ids
 
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(encoder_hidden_states.shape[1], hidden_states.shape[1]))
     hidden_states, hidden_states_orig_size = pad_to_world_size(hidden_states, dim=1)
     encoder_hidden_states, _ = pad_to_world_size(encoder_hidden_states, dim=1)
     image_rotary_emb[0], _ = pad_to_world_size(image_rotary_emb[0], dim=1)
@@ -258,7 +259,7 @@ def usp_attn_forward(
         joint_key,
         joint_value,
         self.heads,
-        mask=attention_mask,
+        mask=attention_mask, key_lengths=transformer_options.get("raylight_key_lengths"),
     )
 
     txt_attn_output = joint_hidden_states[:, :seq_txt, :]

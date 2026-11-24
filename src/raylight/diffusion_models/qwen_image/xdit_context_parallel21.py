@@ -9,6 +9,7 @@ from ..utils import pad_to_world_size
 
 
 def _target_attention(q, k, v, heads, prefix_kv, target_len, transformer_options, preferred_attention=None):
+    q, k, v = q.take(), k.take(), v.take()
     group = get_sp_group()
     k = group.all_gather(k.contiguous(), dim=1)[:, :target_len]
     v = group.all_gather(v.contiguous(), dim=1)[:, :target_len]
@@ -80,7 +81,7 @@ def usp_dit_forward(self, x, timesteps, context, ref_latents=None, image_slots=N
             causal = block_causal_attention(segments[:-1], transformer_options, block_index=i, prefix_len=prefix_len)
 
             def prefix_attention(q, k, v, heads, preferred_attention=None):
-                prefix_kv.extend((k, v))
+                prefix_kv.extend((k.peek(), v.peek()))
                 return causal(q, k, v, heads, preferred_attention=preferred_attention)
 
             prefix = block(prefix, mod, prefix_pe, prefix_attention, prefix_len, transformer_options)

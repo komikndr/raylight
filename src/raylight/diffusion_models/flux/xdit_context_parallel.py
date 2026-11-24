@@ -74,7 +74,7 @@ def attention(q, k, v, pe, mask=None, transformer_options={}) -> Tensor:
         q, k = apply_rope(q, k, pe)
 
     heads = q.shape[1]
-    x = xfuser_optimized_attention(q, k, v, heads, skip_reshape=True)
+    x = xfuser_optimized_attention(q, k, v, heads, skip_reshape=True, key_lengths=transformer_options.get("raylight_key_lengths"))
     return x
 
 
@@ -102,6 +102,7 @@ def usp_dit_forward(
 
     img, img_orig_size = pad_to_world_size(img, dim=1)
     img_ids, _ = pad_to_world_size(img_ids, dim=1)
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(txt.shape[1], img_orig_size))
     txt, txt_orig_size = pad_to_world_size(txt, dim=1)
     txt_ids, _ = pad_to_world_size(txt_ids, dim=1)
 
@@ -149,10 +150,11 @@ def usp_dit_forward(
 
     # ===================== SP SPLIT ====================== #
     if img_ids is not None:
-        ids = torch.cat((txt_ids, img_ids), dim=1)
+        ids = torch.cat((txt_ids[:, :txt_orig_size], img_ids[:, :img_orig_size]), dim=1)
         pe_combine = self.pe_embedder(ids)
         pe_image = self.pe_embedder(img_ids)
         # seq parallel
+        pe_combine, _ = pad_to_world_size(pe_combine, dim=2)
         pe_combine = torch.chunk(pe_combine, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
         pe_image = torch.chunk(pe_image, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
     else:
@@ -219,6 +221,7 @@ def usp_dit_forward(
     img = torch.cat((txt, img), 1)
     # ===================== SP SPLIT ====================== #
     img, img_orig_size = pad_to_world_size(img, dim=1)
+    transformer_options["raylight_key_lengths"] = (img_orig_size,)
 
     if self.params.global_modulation:
         vec, _ = self.single_stream_modulation(vec_orig)

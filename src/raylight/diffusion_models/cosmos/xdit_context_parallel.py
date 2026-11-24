@@ -26,6 +26,7 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 import raylight.distributed_modules.attention as xfuser_attn
+from comfy.ldm.modules.attention import AttentionTensorContainer
 from ..utils import pad_to_world_size
 
 attn_type = xfuser_attn.get_attn_type()
@@ -60,7 +61,11 @@ def usp_general_attention_forward(
     **kwargs,
 ):
     q, k, v = self.cal_qkv(x, context, mask, rope_emb=rope_emb, **kwargs)
-    out = xfuser_optimized_attention(q, k, v, self.heads, skip_reshape=True, mask=mask, skip_output_reshape=True)
+    if self.is_selfattn:
+        t, h, w = transformer_options["raylight_grid"]
+        out = xfuser_optimized_attention(q, k, v, self.heads, skip_reshape=True, mask=mask, skip_output_reshape=True, key_lengths=(t,), key_unit=h * w)
+    else:
+        out = xfuser_optimized_attention(q, k, v, self.heads, skip_reshape=True, mask=mask, skip_output_reshape=True)
     del q, k, v
     out = rearrange(out, " b n s c -> s b (n c)")
     return self.to_out(out)
@@ -142,7 +147,7 @@ def usp_general_dit_forward(
 
     rope_emb_L_1_1_D = rearrange(rope_emb_L_1_1_D, "t h w s c d -> (t h w) s c d")
     # ================ SEQUENCE PARALLEL ================== #
-    transformer_options = kwargs.get("transformer_options", {})
+    transformer_options = dict(kwargs.get("transformer_options", {}), raylight_grid=(T, H, W))
     for _, block in self.blocks.items():
         assert self.blocks["block0"].x_format == block.x_format, f"First block has x_format {self.blocks[0].x_format}, got {block.x_format}"
 
@@ -181,12 +186,15 @@ def usp_xfuser_attention_op(
     q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H_D: torch.Tensor, transformer_options: Optional[dict] = {},
     **kwargs,
 ) -> torch.Tensor:
+    if isinstance(q_B_S_H_D, AttentionTensorContainer):
+        q_B_S_H_D, k_B_S_H_D, v_B_S_H_D = q_B_S_H_D.take(), k_B_S_H_D.take(), v_B_S_H_D.take()
+    t, h, w = transformer_options["raylight_grid"]
     in_q_shape = q_B_S_H_D.shape
     in_k_shape = k_B_S_H_D.shape
     q_B_H_S_D = rearrange(q_B_S_H_D, "b ... h k -> b h ... k").view(in_q_shape[0], in_q_shape[-2], -1, in_q_shape[-1])
     k_B_H_S_D = rearrange(k_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
     v_B_H_S_D = rearrange(v_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
-    return xfuser_optimized_attention(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D, in_q_shape[-2], skip_reshape=True)
+    return xfuser_optimized_attention(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D, in_q_shape[-2], skip_reshape=True, key_lengths=(h,) * t, key_unit=w)
 
 
 def usp_mini_train_dit_forward(
@@ -265,7 +273,7 @@ def usp_mini_train_dit_forward(
         "rope_emb_L_1_1_D": rope_emb_L_1_1_D.unsqueeze(1).unsqueeze(0),
         "adaln_lora_B_T_3D": adaln_lora_B_T_3D,
         "extra_per_block_pos_emb": extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
-        "transformer_options": kwargs.get("transformer_options", {}),
+        "transformer_options": dict(kwargs.get("transformer_options", {}), raylight_grid=(T, H, W)),
     }
     for block in self.blocks:
         x_B_T_H_W_D = block(

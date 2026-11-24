@@ -52,6 +52,33 @@ def block_key_rows(length, block, block_rows):
     return max(0, min(block_rows, length - block * block_rows))
 
 
+def key_slices(lengths, world, ring):
+    """Valid rows per ring block when each SP rank concatenates its stream shards."""
+    widths = [-(n // -world) for n in lengths]
+    blocks = []
+    for first in range(0, world, world // ring):
+        runs = []
+        offset = 0
+        for rank in range(first, first + world // ring):
+            for n, width in zip(lengths, widths):
+                end = offset + block_key_rows(n, rank, width)
+                if end > offset:
+                    if runs and runs[-1][1] == offset:
+                        runs[-1] = (runs[-1][0], end)
+                    else:
+                        runs.append((offset, end))
+                offset += width
+        blocks.append(runs)
+    return blocks
+
+
+def select_rows(x, runs):
+    if len(runs) == 1:
+        start, end = runs[0]
+        return x[:, start:end]
+    return torch.cat([x[:, start:end] for start, end in runs], dim=1)
+
+
 def exclude_padded_keys(ring_attn_fn, k, v, group):
     """Return the ring attention, keys and values that leave the active scope's padding out.
 
@@ -65,14 +92,18 @@ def exclude_padded_keys(ring_attn_fn, k, v, group):
         return ring_attn_fn, k, v
     block_rows = k.shape[1]
     ring_rank, ring_size = _ring_position(group)
-    if length > ring_size * block_rows:
+    if isinstance(length, list):
+        blocks = length
+    elif length > ring_size * block_rows:
         raise ValueError("key length {} is past the padded sequence of {} rows".format(
             length, ring_size * block_rows))
-    if length <= (ring_size - 1) * block_rows:
+    elif length <= (ring_size - 1) * block_rows:
         raise ValueError("a whole ring block of {} rows is padding (key length {})".format(
             block_rows, length))
+    else:
+        blocks = [[(0, block_key_rows(length, r, block_rows))] for r in range(ring_size)]
     if ring_size == 1:
-        return ring_attn_fn, k[:, :length], v[:, :length]
+        return ring_attn_fn, select_rows(k, blocks[0]), select_rows(v, blocks[0])
     _check_layout(group)
 
     from yunchang.kernels import AttnType, select_flash_attn_impl
@@ -86,9 +117,8 @@ def exclude_padded_keys(ring_attn_fn, k, v, group):
         steps = iter(range(ring_size))
 
         def step(query, key, value, *step_args, **step_kwargs):
-            rows = block_key_rows(length, (ring_rank - next(steps)) % ring_size, block_rows)
-            if rows < key.shape[1]:
-                key, value = key[:, :rows], value[:, :rows]
+            runs = blocks[(ring_rank - next(steps)) % ring_size]
+            key, value = select_rows(key, runs), select_rows(value, runs)
             return step_attention(query, key, value, *step_args, **step_kwargs)
 
         kwargs["attn_type"] = None

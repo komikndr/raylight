@@ -58,7 +58,7 @@ def usp_lens_attention_forward(
     k = torch.cat([img_k, txt_k], dim=1).flatten(start_dim=2)
     v = torch.cat([img_v, txt_v], dim=1).flatten(start_dim=2)
 
-    out = xfuser_optimized_attention(q, k, v, self.heads, mask=None)
+    out = xfuser_optimized_attention(q, k, v, self.heads, mask=None, key_lengths=transformer_options.get("raylight_key_lengths"))
     img_out = self.to_out[1](self.to_out[0](out[:, :seq_img, :]))
     txt_out = self.to_add_out(out[:, seq_img:, :])
     return img_out, txt_out
@@ -121,6 +121,7 @@ def usp_lens_forward(
     freqs_txt = freqs_cis[:, img_len:]
 
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(hidden_states.shape[1], encoder_hidden_states.shape[1]))
     hidden_states, hidden_states_orig_size = _pad_and_chunk(hidden_states, dim=1)
     encoder_hidden_states, _ = _pad_and_chunk(encoder_hidden_states, dim=1)
     freqs_img, _ = _pad_and_chunk(freqs_img, dim=1)

@@ -3,8 +3,8 @@ import torch
 import comfy
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3FunControlBlockPatch
 from comfy.ldm.minimax.model import _mod_gate, _mod_scale_shift, _tag_runs, AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP, SEG_TAG, PackedLayout, mask_row_values, pack_audio, patchify_video, pdd_grid, rope_rotation_table, time_shift_sigma, unpack_audio, unpatchify_video
-from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention, wrap_attn
-from xfuser.core.distributed import get_ring_parallel_world_size, get_sequence_parallel_rank, get_sequence_parallel_world_size, get_sp_group
+from comfy.ldm.modules.attention import AttentionTensorContainer, wrap_attn
+from xfuser.core.distributed import get_sequence_parallel_rank, get_sequence_parallel_world_size, get_sp_group
 
 import raylight.distributed_modules.attention as xfuser_attn
 from ..utils import pad_to_world_size
@@ -108,21 +108,9 @@ def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}, **kwargs)
     k = k.transpose(0, 1).unsqueeze(0)
     v = v.transpose(0, 1).unsqueeze(0)
     length = transformer_options["minimax_h3_layout"].seq_len
-    world_size = get_sequence_parallel_world_size()
-    attention = xfuser_optimized_attention
-    options = {}
-    if length % world_size:
-        padded_rows = s * world_size
-        # A ring step needs at least one real key after the Ulysses exchange.
-        if padded_rows - length >= padded_rows // get_ring_parallel_world_size():
-            k = get_sp_group().all_gather(k.contiguous(), dim=2)[:, :, :length]
-            v = get_sp_group().all_gather(v.contiguous(), dim=2)[:, :, :length]
-            attention = optimized_attention
-        else:
-            options["key_length"] = length
-    out = attention(
+    out = xfuser_optimized_attention(
         AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v), self.heads,
-        preferred_attention=self.comfy_attention, skip_reshape=True, transformer_options=transformer_options, **options)
+        preferred_attention=self.comfy_attention, skip_reshape=True, transformer_options=transformer_options, key_lengths=(length,))
     out = out.squeeze(0)
     if fp16:
         # Both projections are bias-free. Keep the projected result out of fp16 overflow.

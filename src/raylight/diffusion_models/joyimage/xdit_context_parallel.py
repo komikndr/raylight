@@ -45,6 +45,7 @@ def usp_attention_forward(self, img, txt, image_rotary_emb, transformer_options=
         joint_k,
         joint_v,
         heads=heads,
+        key_lengths=transformer_options.get("raylight_key_lengths"),
         transformer_options=transformer_options,
     )
 
@@ -80,6 +81,7 @@ def usp_dit_forward(
     vec = vec.unflatten(1, (6, -1))
     image_rotary_emb = self.get_rotary_pos_embed_for_components(component_sizes, device=hidden_states.device)
 
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(img.shape[1], txt.shape[1]))
     img, img_orig_size = pad_to_world_size(img, dim=1)
     txt, _ = pad_to_world_size(txt, dim=1)
     image_rotary_emb, _ = pad_to_world_size(image_rotary_emb, dim=1)

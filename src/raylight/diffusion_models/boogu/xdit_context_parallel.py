@@ -115,6 +115,7 @@ def usp_dit_forward(
     instruct_rotary_emb = rotary_emb[:, :instruct_size]
 
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(text_hidden_states.shape[1], combined_img_hidden_states.shape[1]))
     text_hidden_states, text_orig_size = _split_sequence(text_hidden_states)
     combined_img_hidden_states, img_orig_size = _split_sequence(combined_img_hidden_states)
     instruct_rotary_emb, _ = _split_sequence(instruct_rotary_emb)
@@ -139,6 +140,7 @@ def usp_dit_forward(
 
     hidden_states = torch.cat([text_hidden_states, combined_img_hidden_states], dim=1)
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(hidden_states.shape[1],))
     hidden_states, hidden_states_orig_size = _split_sequence(hidden_states)
     rotary_emb, _ = _split_sequence(rotary_emb)
 
@@ -212,7 +214,7 @@ def usp_joint_attention_forward(
         value,
         self.heads,
         mask=None,
-        skip_reshape=True,
+        skip_reshape=True, key_lengths=transformer_options.get("raylight_key_lengths"),
     )
 
     instruct_hidden_states = processor.instruct_out(hidden_states[:, :instruct_size])
@@ -236,7 +238,7 @@ def usp_img_self_attention_forward(
         encoder_hidden_states,
         attention_mask,
         image_rotary_emb,
-        transformer_options,
+        dict(transformer_options, raylight_key_lengths=transformer_options["raylight_key_lengths"][-1:]),
     )
 
 
