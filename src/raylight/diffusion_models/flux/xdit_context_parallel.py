@@ -8,28 +8,15 @@ from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
-from ..utils import pad_to_world_size
+from ..utils import joint_rope_shards, pad_to_world_size, shard_ranges
 from comfy.ldm.flux import layers as flux_layers
 from comfy.ldm.flux.math import apply_rope
-from comfy.ldm.flux.layers import modulated_norm
+from comfy.ldm.flux.layers import apply_mod, modulated_norm
+from comfy.ldm.flux.model import invert_slices
 import raylight.distributed_modules.attention as xfuser_attn
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
-
-
-def apply_mod(tensor, m_mult, m_add=None, modulation_dims=None):
-    if modulation_dims is None:
-        if m_add is not None:
-            return torch.addcmul(m_add, tensor, m_mult)
-        else:
-            return tensor * m_mult
-    else:
-        for d in modulation_dims:
-            tensor[:, d[0]:d[1]] *= m_mult[:, d[2]]
-            if m_add is not None:
-                tensor[:, d[0]:d[1]] += m_add[:, d[2]]
-        return tensor
 
 
 def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
@@ -52,21 +39,6 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
     if torch.is_floating_point(t):
         embedding = embedding.to(t)
     return embedding
-
-
-def invert_slices(slices, length):
-    if slices is None:
-        return [(0, length)]
-
-    output = []
-    current = 0
-    for start, end in slices:
-        if start > current:
-            output.append((current, start))
-        current = end
-    if current < length:
-        output.append((current, length))
-    return output
 
 
 def attention(q, k, v, pe, mask=None, transformer_options={}) -> Tensor:
@@ -100,11 +72,6 @@ def usp_dit_forward(
     if img.ndim != 3 or txt.ndim != 3:
         raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
-    img, img_orig_size = pad_to_world_size(img, dim=1)
-    img_ids, _ = pad_to_world_size(img_ids, dim=1)
-    txt, txt_orig_size = pad_to_world_size(txt, dim=1)
-    txt_ids, _ = pad_to_world_size(txt_ids, dim=1)
-
     # running on sequences img
     img = self.img_in(img)
     vec = self.time_in(timestep_embedding(timesteps, 256).to(img.dtype))
@@ -130,6 +97,8 @@ def usp_dit_forward(
             txt_ids = out["txt_ids"]
 
     vec_orig = vec
+    img, img_orig_size = pad_to_world_size(img, dim=1)
+    txt, txt_orig_size = pad_to_world_size(txt, dim=1)
     txt_vec = vec
     modulation_dims = None
     extra_kwargs = {}
@@ -137,30 +106,28 @@ def usp_dit_forward(
         modulation_dims = []
         batch = vec.shape[0] // 2
         vec_orig = vec_orig.reshape(2, batch, vec.shape[1]).movedim(0, 1)
-        invert = invert_slices(timestep_zero_index, img.shape[1])
+        invert = invert_slices(timestep_zero_index, img_orig_size)
         for start, end in invert:
             modulation_dims.append((start, end, 0))
         for start, end in timestep_zero_index:
             modulation_dims.append((start, end, 1))
-        extra_kwargs["modulation_dims_img"] = modulation_dims
         txt_vec = vec[:batch]
     if self.params.global_modulation:
         vec = (self.double_stream_modulation_img(vec_orig), self.double_stream_modulation_txt(txt_vec))
 
     # ===================== SP SPLIT ====================== #
     if img_ids is not None:
-        ids = torch.cat((txt_ids, img_ids), dim=1)
-        pe_combine = self.pe_embedder(ids)
-        pe_image = self.pe_embedder(img_ids)
-        # seq parallel
-        pe_combine = torch.chunk(pe_combine, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
-        pe_image = torch.chunk(pe_image, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+        img_ids, _ = pad_to_world_size(img_ids, dim=1)
+        txt_ids, _ = pad_to_world_size(txt_ids, dim=1)
+        pe_image, pe_combine = joint_rope_shards(self.pe_embedder, txt_ids, img_ids, txt_orig_size, img_orig_size)
     else:
         pe_combine = None
         pe_image = None
 
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    if modulation_dims is not None:
+        extra_kwargs["modulation_dims_img"] = shard_ranges(modulation_dims, img.shape[1])
 
     blocks_replace = patches_replace.get("dit", {})
     transformer_options["total_blocks"] = len(self.double_blocks)
@@ -203,9 +170,8 @@ def usp_dit_forward(
             if i < len(control_i):
                 add = control_i[i]
                 if add is not None:
-                    # Pad + chunk control signal to match USP sequence split
-                    add, _ = pad_to_world_size(add, dim=1)
-                    add = torch.chunk(add, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+                    start = img.shape[1] * get_sequence_parallel_rank()
+                    add = add[:, start:start + img.shape[1]]
                     img[:, :add.shape[1]] += add
     # ===================== SP GATHER ===================== #
     img = get_sp_group().all_gather(img.contiguous(), dim=1)
@@ -230,9 +196,11 @@ def usp_dit_forward(
         )
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
+    if timestep_zero_index is not None:
+        extra_kwargs["modulation_dims"] = shard_ranges(extra_kwargs["modulation_dims"], img.shape[1])
     transformer_options["total_blocks"] = len(self.single_blocks)
     transformer_options["block_type"] = "single"
-    transformer_options["img_slice"] = [txt.shape[1], img.shape[1]]
+    transformer_options["img_slice"] = [max(0, min(img.shape[1], txt.shape[1] - get_sequence_parallel_rank() * img.shape[1])), img.shape[1]]
     for i, block in enumerate(self.single_blocks):
         transformer_options["block_index"] = i
         if ("single_block", i) in blocks_replace:
@@ -397,7 +365,6 @@ def usp_double_stream_forward(
     del txt_modulated
     txt_q, txt_k, txt_v = txt_qkv.view(txt_qkv.shape[0], txt_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
     del txt_qkv
-    txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
 
     if chunk_qkv:
         n_txt = txt.shape[1]
@@ -407,10 +374,12 @@ def usp_double_stream_forward(
         del txt_q, txt_k, txt_v
         for s in range(0, img.shape[1], chunk):
             qkv[:, n_txt + s:n_txt + s + chunk] = self.img_attn.qkv(modulated_norm(img[:, s:s + chunk], self.img_norm1, img_mod1.scale, img_mod1.shift))
-        self.img_attn.norm.norm_rope_(q[:, :, n_txt:], k[:, :, n_txt:], pe)
+        self.txt_attn.norm.norm_rope_(q[:, :, :n_txt], k[:, :, :n_txt], pe[:, :, :n_txt])
+        self.img_attn.norm.norm_rope_(q[:, :, n_txt:], k[:, :, n_txt:], pe[:, :, n_txt:])
+        pe = None
         del qkv
     else:
-        img_q, img_k = apply_rope(img_q, img_k, pe)
+        txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
         q = torch.cat((txt_q, img_q), dim=2)
         del txt_q, img_q
         k = torch.cat((txt_k, img_k), dim=2)
@@ -421,11 +390,11 @@ def usp_double_stream_forward(
     if "attn1_patch" in transformer_patches:
         patch = transformer_patches["attn1_patch"]
         for p in patch:
-            out = p(q, k, v, pe=None, attn_mask=attn_mask, extra_options=extra_options)
+            out = p(q, k, v, pe=pe, attn_mask=attn_mask, extra_options=extra_options)
             q, k, v, pe, attn_mask = out.get("q", q), out.get("k", k), out.get("v", v), out.get("pe", pe), out.get("attn_mask", attn_mask)
 
     # run actual attention
-    attn = attention(q, k, v, pe=None, mask=attn_mask, transformer_options=transformer_options)
+    attn = attention(q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options)
     del q, k, v
 
     if "attn1_output_patch" in transformer_patches:

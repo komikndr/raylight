@@ -63,6 +63,16 @@ def _patch_pixeldit_blocks(model, usp_joint_attention_forward, usp_rotary_attent
         block.forward = types.MethodType(usp_pit_block_forward, block)
 
 
+if hasattr(model_base, "WAN22_RelayVSR"):
+
+    @USPInjectRegistry.register(model_base.WAN22_RelayVSR)
+    def _inject_wan_relay(model_patcher, base_model, *args):
+        from ..diffusion_models.wan.relay_vsr import usp_relay_block
+
+        for block in base_model.diffusion_model.blocks:
+            block.forward = types.MethodType(usp_relay_block, block)
+
+
 if hasattr(model_base, "WAN21_Vace"):
 
     @USPInjectRegistry.register(model_base.WAN21_Vace)
@@ -405,19 +415,30 @@ if hasattr(model_base, "QwenImage21"):
         model._forward = types.MethodType(usp_dit_forward, model)
 
 
+def _patch_qwen_blocks(model, forward):
+    from ..diffusion_models.qwen_image.xdit_context_parallel import usp_attn_forward
+
+    for block in model.transformer_blocks:
+        block.attn.forward = types.MethodType(usp_attn_forward, block.attn)
+    model._forward = types.MethodType(forward, model)
+
+
+if hasattr(model_base, "MageFlow"):
+
+    @USPInjectRegistry.register(model_base.MageFlow)
+    def _inject_mage(model_patcher, base_model, *args):
+        from ..diffusion_models.qwen_image.xdit_context_parallel import usp_mage_forward
+
+        _patch_qwen_blocks(base_model.diffusion_model, usp_mage_forward)
+
+
 if hasattr(model_base, "QwenImage"):
 
     @USPInjectRegistry.register(model_base.QwenImage)
     def _inject_qwen(model_patcher, base_model, *args):
-        from ..diffusion_models.qwen_image.xdit_context_parallel import (
-            usp_dit_forward,
-            usp_attn_forward,
-        )
+        from ..diffusion_models.qwen_image.xdit_context_parallel import usp_dit_forward
 
-        model = base_model.diffusion_model
-        for block in model.transformer_blocks:
-            block.attn.forward = types.MethodType(usp_attn_forward, block.attn)
-        model._forward = types.MethodType(usp_dit_forward, model)
+        _patch_qwen_blocks(base_model.diffusion_model, usp_dit_forward)
 
 
 if hasattr(model_base, "MiniMaxH3"):

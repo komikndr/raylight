@@ -94,6 +94,39 @@ def usp_dit_forward(
         transformer_options = transformer_options.copy()
         transformer_options["reference_image_num_tokens"] = ref_num_tokens
 
+    hidden_states = _parallel_blocks(self, x, hidden_states, img_ids, encoder_hidden_states, txt_ids,
+                                     encoder_hidden_states_mask, temb, timestep_zero_index, control, transformer_options, x.dtype)
+    hidden_states = hidden_states[:, :num_embeds].view(
+        orig_shape[0], orig_shape[-3], orig_shape[-2] // 2, orig_shape[-1] // 2, orig_shape[1], 2, 2
+    )
+    hidden_states = hidden_states.permute(0, 4, 1, 2, 5, 3, 6)
+    return hidden_states.reshape(orig_shape)[:, :, :, :x.shape[-2], :x.shape[-1]]
+
+
+def usp_mage_forward(self, x, timestep, context, attention_mask=None, ref_latents=None, transformer_options={}, control=None, **kwargs):
+    hidden_states, img_ids, (h, w) = self.process_img(x)
+    transformer_options = transformer_options.copy()
+    if ref_latents is not None:
+        ref_sizes = []
+        for index, ref in enumerate(ref_latents, 1):
+            tokens, ids, _ = self.process_img(ref, index=index)
+            hidden_states = torch.cat((hidden_states, tokens), dim=1)
+            img_ids = torch.cat((img_ids, ids), dim=1)
+            ref_sizes.append(tokens.shape[1])
+        transformer_options["reference_image_num_tokens"] = ref_sizes
+
+    if attention_mask is not None and not torch.is_floating_point(attention_mask):
+        attention_mask = (attention_mask - 1).to(x.dtype) * torch.finfo(x.dtype).max
+    txt_ids = img_ids.new_zeros((x.shape[0], context.shape[1], 3))
+    hidden_states = self.img_in(hidden_states)
+    temb = self.time_text_embed(timestep, hidden_states)
+    hidden_states = _parallel_blocks(self, x, hidden_states, img_ids, self.txt_in(self.txt_norm(context)), txt_ids,
+                                     attention_mask, temb, None, control, transformer_options)
+    return hidden_states[:, :h * w].reshape(x.shape[0], h, w, self.out_channels).movedim(-1, 1)
+
+
+def _parallel_blocks(self, x, hidden_states, img_ids, encoder_hidden_states, txt_ids, encoder_hidden_states_mask,
+                     temb, timestep_zero_index, control, transformer_options, rope_dtype=None):
     patches = transformer_options.get("patches", {})
     if "post_input" in patches:
         for p in patches["post_input"]:
@@ -103,9 +136,8 @@ def usp_dit_forward(
             img_ids = out["img_ids"]
             txt_ids = out["txt_ids"]
 
-    # SP Modified, freq rope : List[txt, img]
-    image_rotary_emb = [self.pe_embedder(img_ids).squeeze(1).unsqueeze(2).to(x.dtype).contiguous(),
-                        self.pe_embedder(txt_ids).squeeze(1).unsqueeze(2).to(x.dtype).contiguous()]
+    image_rotary_emb = [self.pe_embedder(ids).transpose(1, 2).to(dtype=rope_dtype).contiguous()
+                        for ids in (img_ids, txt_ids)]
 
     del txt_ids, img_ids
 
@@ -120,6 +152,9 @@ def usp_dit_forward(
 
     hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
     encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_world_size, dim=1)[sp_rank]
+    if timestep_zero_index is not None:
+        width = hidden_states.shape[1]
+        timestep_zero_index = max(0, min(width, timestep_zero_index - sp_rank * width))
 
     # Modified, freq rope : List[txt, img]
     image_rotary_emb[0] = torch.chunk(image_rotary_emb[0], sp_world_size, dim=1)[sp_rank]
@@ -178,8 +213,8 @@ def usp_dit_forward(
                 add = control_i[i]
                 if add is not None:
                     # Pad + chunk control signal to match USP sequence split
-                    add, _ = pad_to_world_size(add, dim=1)
-                    add = torch.chunk(add, sp_world_size, dim=1)[sp_rank]
+                    start = sp_rank * hidden_states.shape[1]
+                    add = add[:, start:start + hidden_states.shape[1]]
                     hidden_states[:, :add.shape[1]] += add
 
     if timestep_zero_index is not None:
@@ -190,13 +225,7 @@ def usp_dit_forward(
     hidden_states = hidden_states[:, :hidden_states_orig_size, :]
 
     hidden_states = self.norm_out(hidden_states, temb)
-    hidden_states = self.proj_out(hidden_states)
-
-    hidden_states = hidden_states[:, :num_embeds].view(
-        orig_shape[0], orig_shape[-3], orig_shape[-2] // 2, orig_shape[-1] // 2, orig_shape[1], 2, 2
-    )
-    hidden_states = hidden_states.permute(0, 4, 1, 2, 5, 3, 6)
-    return hidden_states.reshape(orig_shape)[:, :, :, :x.shape[-2], :x.shape[-1]]
+    return self.proj_out(hidden_states)
 
 
 def usp_attn_forward(

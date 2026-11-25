@@ -9,6 +9,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 <details><summary><strong>Click to expand changelog</strong></summary>
 
+- Experimental USP paths: Ming-Image, Z-Image PixelSpace, MageFlow, and Wan 2.2 RelayVSR. RelayVSR distributes spatial rows within each temporal chunk and retains native window attention.
 - FLUX.3 USP: Add dedicated sequence parallelism with native block operations, reference-image handling, and CFG integration.
 - MiniMax H3 optimization: Add FP16 attention/MLP, FP32 residuals, token chunking, and local embedding/output-head computation. (credit: Kanislo)
 - MiniMax Fun ControlNet: Add Raylight integration with correct full-sequence control metadata. (credit: Kanislo)

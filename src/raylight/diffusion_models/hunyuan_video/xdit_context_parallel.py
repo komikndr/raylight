@@ -8,7 +8,7 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 import raylight.distributed_modules.attention as xfuser_attn
-from ..utils import pad_to_world_size
+from ..utils import joint_rope_shards, pad_to_world_size, shard_ranges
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
@@ -172,15 +172,11 @@ def usp_dit_forward(
     txt, txt_orig_size = pad_to_world_size(txt, dim=1)
     txt_ids, _ = pad_to_world_size(txt_ids, dim=1)
 
-    ids = torch.cat((txt_ids, img_ids), dim=1)
-    pe_combine = self.pe_embedder(ids)
-    pe_image = self.pe_embedder(img_ids)
-
-    pe_combine = torch.chunk(pe_combine, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
-    pe_image = torch.chunk(pe_image, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+    pe_image, pe_combine = joint_rope_shards(self.pe_embedder, txt_ids, img_ids, txt_orig_size, img_orig_size)
 
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    local_dims = shard_ranges(modulation_dims, img.shape[1])
     blocks_replace = patches_replace.get("dit", {})
     transformer_options["total_blocks"] = len(self.double_blocks)
     transformer_options["block_type"] = "double"
@@ -189,8 +185,7 @@ def usp_dit_forward(
         if ("double_block", i) in blocks_replace:
             def block_wrap(args):
                 out = {}
-                out["img"],
-                out["txt"] = block(img=args["img"],
+                out["img"], out["txt"] = block(img=args["img"],
                                    txt=args["txt"],
                                    vec=args["vec"],
                                    pe=args["pe"],
@@ -205,7 +200,7 @@ def usp_dit_forward(
                                                        "vec": vec,
                                                        "pe": pe_image,
                                                        "attention_mask": attn_mask,
-                                                       'modulation_dims_img': modulation_dims,
+                                                       'modulation_dims_img': local_dims,
                                                        'modulation_dims_txt': modulation_dims_txt,
                                                        'transformer_options': transformer_options},
                                                       {"original_block": block_wrap})
@@ -217,7 +212,7 @@ def usp_dit_forward(
                              vec=vec,
                              pe=pe_image,
                              attn_mask=attn_mask,
-                             modulation_dims_img=modulation_dims,
+                             modulation_dims_img=local_dims,
                              modulation_dims_txt=modulation_dims_txt,
                              transformer_options=transformer_options)
 
@@ -241,9 +236,10 @@ def usp_dit_forward(
     # ===================== SP SPLIT ====================== #
     img, img_orig_size = pad_to_world_size(img, dim=1)
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    local_dims = shard_ranges(modulation_dims, img.shape[1])
     transformer_options["total_blocks"] = len(self.single_blocks)
     transformer_options["block_type"] = "single"
-    transformer_options["img_slice"] = [txt.shape[1], img.shape[1]]
+    transformer_options["img_slice"] = [max(0, min(img.shape[1], txt.shape[1] - get_sequence_parallel_rank() * img.shape[1])), img.shape[1]]
     for i, block in enumerate(self.single_blocks):
         transformer_options["block_index"] = i
         if ("single_block", i) in blocks_replace:
@@ -261,7 +257,7 @@ def usp_dit_forward(
                                                        "vec": vec,
                                                        "pe": pe_combine,
                                                        "attention_mask": attn_mask,
-                                                       'modulation_dims': modulation_dims,
+                                                       'modulation_dims': local_dims,
                                                        'transformer_options': transformer_options},
                                                       {"original_block": block_wrap})
             img = out["img"]
@@ -270,7 +266,7 @@ def usp_dit_forward(
                         vec=vec,
                         pe=pe_combine,
                         attn_mask=attn_mask,
-                        modulation_dims=modulation_dims,
+                        modulation_dims=local_dims,
                         transformer_options=transformer_options)
 
         if control is not None:  # Controlnet
