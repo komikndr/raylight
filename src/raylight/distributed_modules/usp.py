@@ -392,7 +392,7 @@ if hasattr(model_base, "HunyuanVideo"):
 
     @USPInjectRegistry.register(model_base.HunyuanVideo)
     def _inject_hunyuan(model_patcher, base_model, *args):
-        from ..diffusion_models.hunyuan_video.xdit_context_parallel import usp_dit_forward, usp_token_refiner_forward
+        from ..diffusion_models.hunyuan_video.xdit_context_parallel import usp_dit_forward
         from ..diffusion_models.flux.xdit_context_parallel import usp_single_stream_forward, usp_double_stream_forward
 
         model = base_model.diffusion_model
@@ -400,8 +400,6 @@ if hasattr(model_base, "HunyuanVideo"):
             block.forward = types.MethodType(usp_double_stream_forward, block)
         for block in model.single_blocks:
             block.forward = types.MethodType(usp_single_stream_forward, block)
-        for block_token_refiner in model.txt_in.individual_token_refiner.blocks:
-            block_token_refiner.forward = types.MethodType(usp_token_refiner_forward, block_token_refiner)
         model.forward_orig = types.MethodType(usp_dit_forward, model)
 
 

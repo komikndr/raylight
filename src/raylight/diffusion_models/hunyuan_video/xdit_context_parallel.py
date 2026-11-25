@@ -7,11 +7,7 @@ from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
-import raylight.distributed_modules.attention as xfuser_attn
 from ..utils import joint_rope_shards, pad_to_world_size, shard_ranges
-attn_type = xfuser_attn.get_attn_type()
-sync_ulysses = xfuser_attn.get_sync_ulysses()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
 
 # HunyuanVid use the same DiT single/double block as Flux
 
@@ -49,19 +45,6 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
     if torch.is_floating_point(t):
         embedding = embedding.to(t)
     return embedding
-
-
-def usp_token_refiner_forward(self, x, c, mask, transformer_options={}, *args, **kwargs):
-    mod1, mod2 = self.adaLN_modulation(c).chunk(2, dim=1)
-
-    norm_x = self.norm1(x)
-    qkv = self.self_attn.qkv(norm_x)
-    q, k, v = qkv.reshape(qkv.shape[0], qkv.shape[1], 3, self.heads, -1).permute(2, 0, 3, 1, 4)
-    attn = xfuser_optimized_attention(q, k, v, self.heads, skip_reshape=True)
-
-    x = x + self.self_attn.proj(attn) * mod1.unsqueeze(1)
-    x = x + self.mlp(self.norm2(x)) * mod2.unsqueeze(1)
-    return x
 
 
 def usp_dit_forward(
