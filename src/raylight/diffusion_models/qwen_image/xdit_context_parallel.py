@@ -1,13 +1,11 @@
 import torch
-from torch import Tensor
-from typing import Optional, Tuple
 from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
     get_sp_group,
 )
 from ..utils import pad_to_world_size
-from comfy.ldm.flux.math import apply_rope
+from comfy.ldm.qwen_image.model import Attention
 import raylight.distributed_modules.attention as xfuser_attn
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
@@ -136,16 +134,11 @@ def _parallel_blocks(self, x, hidden_states, img_ids, encoder_hidden_states, txt
             img_ids = out["img_ids"]
             txt_ids = out["txt_ids"]
 
-    image_rotary_emb = [self.pe_embedder(ids).transpose(1, 2).to(dtype=rope_dtype).contiguous()
-                        for ids in (img_ids, txt_ids)]
-
-    del txt_ids, img_ids
-
     # ===================== SP SPLIT ====================== #
     hidden_states, hidden_states_orig_size = pad_to_world_size(hidden_states, dim=1)
     encoder_hidden_states, _ = pad_to_world_size(encoder_hidden_states, dim=1)
-    image_rotary_emb[0], _ = pad_to_world_size(image_rotary_emb[0], dim=1)
-    image_rotary_emb[1], _ = pad_to_world_size(image_rotary_emb[1], dim=1)
+    img_ids, _ = pad_to_world_size(img_ids, dim=1)
+    txt_ids, _ = pad_to_world_size(txt_ids, dim=1)
 
     sp_rank = get_sequence_parallel_rank()
     sp_world_size = get_sequence_parallel_world_size()
@@ -156,9 +149,11 @@ def _parallel_blocks(self, x, hidden_states, img_ids, encoder_hidden_states, txt
         width = hidden_states.shape[1]
         timestep_zero_index = max(0, min(width, timestep_zero_index - sp_rank * width))
 
-    # Modified, freq rope : List[txt, img]
-    image_rotary_emb[0] = torch.chunk(image_rotary_emb[0], sp_world_size, dim=1)[sp_rank]
-    image_rotary_emb[1] = torch.chunk(image_rotary_emb[1], sp_world_size, dim=1)[sp_rank]
+    ids = torch.cat((txt_ids.chunk(sp_world_size, dim=1)[sp_rank], img_ids.chunk(sp_world_size, dim=1)[sp_rank]), dim=1)
+    image_rotary_emb = self.pe_embedder(ids).to(dtype=rope_dtype).contiguous()
+    if encoder_hidden_states_mask is not None:
+        encoder_hidden_states_mask, _ = pad_to_world_size(encoder_hidden_states_mask, dim=-1)
+        encoder_hidden_states_mask = encoder_hidden_states_mask.chunk(sp_world_size, dim=-1)[sp_rank]
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
@@ -228,73 +223,12 @@ def _parallel_blocks(self, x, hidden_states, img_ids, encoder_hidden_states, txt
     return self.proj_out(hidden_states)
 
 
-def usp_attn_forward(
-    self,
-    hidden_states: torch.FloatTensor,  # Image stream
-    encoder_hidden_states: torch.FloatTensor = None,  # Text stream
-    encoder_hidden_states_mask: torch.FloatTensor = None,
-    attention_mask: Optional[torch.FloatTensor] = None,
-    image_rotary_emb: Optional[torch.Tensor] = None,
-    **kwargs
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    seq_txt = encoder_hidden_states.shape[1]
-    transformer_options = kwargs.get("transformer_options", {})
-    transformer_patches = transformer_options.get("patches", {})
-    extra_options = transformer_options.copy()
+def usp_attention(original_attention, q, k, v, heads, mask=None, **kwargs):
+    return xfuser_optimized_attention(q, k, v, heads, mask=mask, **kwargs)
 
-    img_query = self.to_q(hidden_states).unflatten(-1, (self.heads, -1))
-    img_key = self.to_k(hidden_states).unflatten(-1, (self.heads, -1))
-    img_value = self.to_v(hidden_states).unflatten(-1, (self.heads, -1))
 
-    txt_query = self.add_q_proj(encoder_hidden_states).unflatten(-1, (self.heads, -1))
-    txt_key = self.add_k_proj(encoder_hidden_states).unflatten(-1, (self.heads, -1))
-    txt_value = self.add_v_proj(encoder_hidden_states).unflatten(-1, (self.heads, -1))
-
-    img_query = self.norm_q(img_query)
-    img_key = self.norm_k(img_key)
-
-    txt_query = self.norm_added_q(txt_query)
-    txt_key = self.norm_added_k(txt_key)
-
-    joint_query = torch.cat([txt_query, img_query], dim=1)
-    joint_key = torch.cat([txt_key, img_key], dim=1)
-    joint_value = torch.cat([txt_value, img_value], dim=1)
-
-    extra_options["img_slice"] = [txt_query.shape[1], joint_query.shape[1]]
-    if "attn1_patch" in transformer_patches:
-        patch = transformer_patches["attn1_patch"]
-        for p in patch:
-            out = p(joint_query, joint_key, joint_value, pe=image_rotary_emb, attn_mask=encoder_hidden_states_mask, extra_options=extra_options)
-            joint_query, joint_key, joint_value, image_rotary_emb, encoder_hidden_states_mask = out.get("q", joint_query), out.get("k", joint_key), out.get("v", joint_value), out.get("pe", image_rotary_emb), out.get("attn_mask", encoder_hidden_states_mask)
-
-    if image_rotary_emb is not None:
-        txt_len = seq_txt
-        txt_query, img_query = joint_query[:, :txt_len], joint_query[:, txt_len:]
-        txt_key, img_key = joint_key[:, :txt_len], joint_key[:, txt_len:]
-        img_rotary_emb = image_rotary_emb[0]
-        txt_rotary_emb = image_rotary_emb[1]
-        img_query, img_key = apply_rope(img_query, img_key, img_rotary_emb)
-        txt_query, txt_key = apply_rope(txt_query, txt_key, txt_rotary_emb)
-        joint_query = torch.cat([txt_query, img_query], dim=1)
-        joint_key = torch.cat([txt_key, img_key], dim=1)
-
-    joint_query = joint_query.flatten(start_dim=2)
-    joint_key = joint_key.flatten(start_dim=2)
-    joint_value = joint_value.flatten(start_dim=2)
-
-    joint_hidden_states = xfuser_optimized_attention(
-        joint_query,
-        joint_key,
-        joint_value,
-        self.heads,
-        mask=attention_mask,
-    )
-
-    txt_attn_output = joint_hidden_states[:, :seq_txt, :]
-    img_attn_output = joint_hidden_states[:, seq_txt:, :]
-
-    img_attn_output = self.to_out[0](img_attn_output)
-    img_attn_output = self.to_out[1](img_attn_output)
-    txt_attn_output = self.to_add_out(txt_attn_output)
-
-    return img_attn_output, txt_attn_output
+def usp_attn_forward(self, hidden_states, encoder_hidden_states=None, encoder_hidden_states_mask=None,
+                     attention_mask=None, image_rotary_emb=None, transformer_options={}):
+    options = dict(transformer_options, optimized_attention_override=usp_attention)
+    return Attention.forward(self, hidden_states, encoder_hidden_states, encoder_hidden_states_mask,
+                             attention_mask, image_rotary_emb, transformer_options=options)
