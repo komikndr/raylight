@@ -8,9 +8,10 @@ from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
+from yunchang.comm.all_to_all import SeqAllToAll4D
 from ..utils import joint_rope_shards, pad_to_world_size, shard_ranges
 from comfy.ldm.flux import layers as flux_layers
-from comfy.ldm.flux.math import apply_rope
+from comfy.ldm.flux.math import apply_rope, attention as native_attention
 from comfy.ldm.flux.layers import apply_mod, modulated_norm
 from comfy.ldm.flux.model import invert_slices
 import raylight.distributed_modules.attention as xfuser_attn
@@ -41,10 +42,58 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
     return embedding
 
 
-def attention(q, k, v, pe, mask=None, transformer_options={}) -> Tensor:
+def _checkpoint_attention(q, k, v, mask, options, preferred_attention):
+    lengths = options.get("raylight_key_lengths")
+    if lengths is None:
+        raise ValueError("Checkpoint-selected attention requires FLUX sequence shard lengths")
+    group = get_sp_group()
+    world = group.world_size
+    if world == 1:
+        return native_attention(q, k, v, None, mask=mask, transformer_options=options, preferred_attention=preferred_attention)
+
+    # Gather tokens only for the heads owned by this rank. SOL routes token
+    # blocks, so joining rank-local [text, image] pairs in rank order is wrong.
+    widths = [(length + world - 1) // world for length in lengths]
+    heads = q.shape[1]
+    head_pad = -heads % world
+    local_heads = (heads + head_pad) // world
+
+    def gather_tokens(t):
+        t = t.transpose(1, 2)
+        if head_pad:
+            t = torch.nn.functional.pad(t, (0, 0, 0, head_pad))
+        t = SeqAllToAll4D.apply(group.device_group, t, 2, 1, sync_ulysses)
+        if len(lengths) == 1:
+            return t[:, :lengths[0]].transpose(1, 2)
+        streams = t.unflatten(1, (world, sum(widths))).split(widths, dim=2)
+        return torch.cat([s.flatten(1, 2)[:, :n] for s, n in zip(streams, lengths)], dim=1).transpose(1, 2)
+
+    if mask is not None and mask.ndim == 4 and mask.shape[1] != 1:
+        if mask.shape[1] != heads:
+            raise ValueError("FLUX checkpoint attention mask must cover one or all heads")
+        if head_pad:
+            mask = torch.nn.functional.pad(mask, (0, 0, 0, 0, 0, head_pad))
+        mask = mask.narrow(1, group.rank_in_group * local_heads, local_heads)
+
+    out = native_attention(gather_tokens(q), gather_tokens(k), gather_tokens(v), None,
+                           mask=mask, transformer_options=options, preferred_attention=preferred_attention)
+    parts = []
+    for stream, length, width in zip(out.split(lengths, dim=1), lengths, widths):
+        if width * world != length:
+            stream = torch.nn.functional.pad(stream, (0, 0, 0, width * world - length))
+        parts.append(stream.unflatten(1, (world, width)))
+    out = torch.cat(parts, dim=2) if len(parts) > 1 else parts[0]
+    out = out.flatten(1, 2).unflatten(-1, (local_heads, v.shape[-1]))
+    out = SeqAllToAll4D.apply(group.device_group, out, 1, 2, sync_ulysses)
+    return out[:, :, :heads].flatten(2)
+
+
+def attention(q, k, v, pe, mask=None, transformer_options={}, preferred_attention=None) -> Tensor:
     if pe is not None:
         q, k = apply_rope(q, k, pe)
 
+    if preferred_attention is not None and preferred_attention.function is not None:
+        return _checkpoint_attention(q, k, v, mask, transformer_options, preferred_attention)
     heads = q.shape[1]
     x = xfuser_optimized_attention(q, k, v, heads, skip_reshape=True)
     return x
@@ -132,6 +181,7 @@ def usp_dit_forward(
     blocks_replace = patches_replace.get("dit", {})
     transformer_options["total_blocks"] = len(self.double_blocks)
     transformer_options["block_type"] = "double"
+    transformer_options["raylight_key_lengths"] = (txt_orig_size, img_orig_size)
     for i, block in enumerate(self.double_blocks):
         transformer_options["block_index"] = i
         if ("double_block", i) in blocks_replace:
@@ -200,6 +250,7 @@ def usp_dit_forward(
         extra_kwargs["modulation_dims"] = shard_ranges(extra_kwargs["modulation_dims"], img.shape[1])
     transformer_options["total_blocks"] = len(self.single_blocks)
     transformer_options["block_type"] = "single"
+    transformer_options["raylight_key_lengths"] = (img_orig_size,)
     transformer_options["img_slice"] = [max(0, min(img.shape[1], txt.shape[1] - get_sequence_parallel_rank() * img.shape[1])), img.shape[1]]
     for i, block in enumerate(self.single_blocks):
         transformer_options["block_index"] = i
@@ -262,8 +313,6 @@ def usp_single_stream_forward(
     transformer_options={},
     **kwargs
 ) -> Tensor:
-    if self.comfy_attention.function is not None:
-        raise ValueError("Checkpoint-selected attention is not supported by Raylight USP")
     if self.modulation:
         mod, _ = self.modulation(vec)
     else:
@@ -298,7 +347,7 @@ def usp_single_stream_forward(
             q, k, v, pe, attn_mask = out.get("q", q), out.get("k", k), out.get("v", v), out.get("pe", pe), out.get("attn_mask", attn_mask)
 
     # compute attention
-    attn = attention(q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options)
+    attn = attention(q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options, preferred_attention=self.comfy_attention)
     del q, k, v
 
     if "attn1_output_patch" in transformer_patches:
@@ -336,8 +385,6 @@ def usp_double_stream_forward(
     transformer_options={},
     **kwargs
 ):
-    if self.comfy_attention.function is not None:
-        raise ValueError("Checkpoint-selected attention is not supported by Raylight USP")
     if self.modulation:
         img_mod1, img_mod2 = self.img_mod(vec)
         txt_mod1, txt_mod2 = self.txt_mod(vec)
@@ -394,7 +441,7 @@ def usp_double_stream_forward(
             q, k, v, pe, attn_mask = out.get("q", q), out.get("k", k), out.get("v", v), out.get("pe", pe), out.get("attn_mask", attn_mask)
 
     # run actual attention
-    attn = attention(q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options)
+    attn = attention(q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options, preferred_attention=self.comfy_attention)
     del q, k, v
 
     if "attn1_output_patch" in transformer_patches:
