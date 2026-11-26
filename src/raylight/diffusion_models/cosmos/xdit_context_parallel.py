@@ -19,6 +19,8 @@ from enum import Enum
 from einops import rearrange
 import torch
 import comfy.ldm.common_dit
+from comfy.ldm.anima.lllite import AnimaLLLitePatch
+from comfy.ldm.modules.attention import AttentionTensorContainer
 
 from xfuser.core.distributed import (
     get_sequence_parallel_rank,
@@ -181,12 +183,14 @@ def usp_xfuser_attention_op(
     q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H_D: torch.Tensor, transformer_options: Optional[dict] = {},
     **kwargs,
 ) -> torch.Tensor:
+    if isinstance(q_B_S_H_D, AttentionTensorContainer):
+        q_B_S_H_D, k_B_S_H_D, v_B_S_H_D = q_B_S_H_D.take(), k_B_S_H_D.take(), v_B_S_H_D.take()
     in_q_shape = q_B_S_H_D.shape
     in_k_shape = k_B_S_H_D.shape
     q_B_H_S_D = rearrange(q_B_S_H_D, "b ... h k -> b h ... k").view(in_q_shape[0], in_q_shape[-2], -1, in_q_shape[-1])
     k_B_H_S_D = rearrange(k_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
     v_B_H_S_D = rearrange(v_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
-    return xfuser_optimized_attention(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D, in_q_shape[-2], skip_reshape=True)
+    return xfuser_optimized_attention(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D, in_q_shape[-2], skip_reshape=True, transformer_options=transformer_options)
 
 
 def usp_mini_train_dit_forward(
@@ -221,17 +225,18 @@ def usp_mini_train_dit_forward(
     t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder[1](self.t_embedder[0](timesteps_B_T).to(x_B_T_H_W_D.dtype))
     t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
 
-    # for logging purpose
-    affline_scale_log_info = {}
-    affline_scale_log_info["t_embedding_B_T_D"] = t_embedding_B_T_D.detach()
-    self.affline_scale_log_info = affline_scale_log_info
-    self.affline_emb = t_embedding_B_T_D
-    self.crossattn_emb = crossattn_emb
-
     if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
         assert x_B_T_H_W_D.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape, (
             f"{x_B_T_H_W_D.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape}"
         )
+
+    transformer_options = kwargs.get("transformer_options", {})
+    post_input = transformer_options.get("patches", {}).get("post_input", ())
+    if post_input:
+        transformer_options = {**transformer_options, "model_patch_data": {}}
+        for patch in post_input:
+            out = patch({"img": x_B_T_H_W_D, "x": x_B_C_T_H_W, "transformer_options": transformer_options})
+            x_B_T_H_W_D = out["img"]
 
     # The residual stream for this model has large values. To make fp16 compute_dtype work, we keep the residual stream
     # in fp32, but run attention and MLP modules in fp16.
@@ -254,6 +259,11 @@ def usp_mini_train_dit_forward(
 
     # ===================== SP SPLIT ====================== #
     x_B_T_H_W_D = torch.chunk(x_B_T_H_W_D, sp_world, dim=2)[sp_rank]
+    if post_input and sp_world > 1:
+        for patch, cond in transformer_options["model_patch_data"].items():
+            if isinstance(patch, AnimaLLLitePatch):
+                rows, _ = pad_to_world_size(cond.unflatten(1, (H, W)), dim=1)
+                transformer_options["model_patch_data"][patch] = rows.chunk(sp_world, dim=1)[sp_rank].flatten(1, 2).clone()
     rope_emb_L_1_1_D = torch.chunk(rope_emb_L_1_1_D, sp_world, dim=1)[sp_rank]
     if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
         extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = torch.chunk(extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D, sp_world, dim=2)[sp_rank]
@@ -265,9 +275,10 @@ def usp_mini_train_dit_forward(
         "rope_emb_L_1_1_D": rope_emb_L_1_1_D.unsqueeze(1).unsqueeze(0),
         "adaln_lora_B_T_3D": adaln_lora_B_T_3D,
         "extra_per_block_pos_emb": extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
-        "transformer_options": kwargs.get("transformer_options", {}),
+        "transformer_options": transformer_options,
     }
-    for block in self.blocks:
+    for i, block in enumerate(self.blocks):
+        transformer_options["block_index"] = i
         x_B_T_H_W_D = block(
             x_B_T_H_W_D,
             t_embedding_B_T_D,
