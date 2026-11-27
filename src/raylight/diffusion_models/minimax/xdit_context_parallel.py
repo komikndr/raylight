@@ -3,8 +3,9 @@ import torch
 import comfy
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3FunControlBlockPatch
 from comfy.ldm.minimax.model import _mod_gate, _mod_scale_shift, _tag_runs, AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP, SEG_TAG, PackedLayout, mask_row_values, pack_audio, patchify_video, pdd_grid, rope_rotation_table, time_shift_sigma, unpack_audio, unpatchify_video
-from comfy.ldm.modules.attention import AttentionTensorContainer, wrap_attn
+from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention, wrap_attn
 from xfuser.core.distributed import get_sequence_parallel_rank, get_sequence_parallel_world_size, get_sp_group
+from yunchang.comm.all_to_all import SeqAllToAll4D
 
 import raylight.distributed_modules.attention as xfuser_attn
 from ..utils import pad_to_world_size
@@ -13,6 +14,31 @@ from ..utils import pad_to_world_size
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = wrap_attn(xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses))
+
+
+def _checkpoint_attention(q, k, v, length, preferred_attention, transformer_options):
+    group = get_sp_group()
+    world = group.world_size
+    _, heads, rows, dim = q.shape
+    head_pad = -heads % world
+    local_heads = (heads + head_pad) // world
+
+    def gather(t):
+        t = t.transpose(1, 2)
+        if head_pad:
+            t = torch.nn.functional.pad(t, (0, 0, 0, head_pad))
+        if world > 1:
+            t = SeqAllToAll4D.apply(group.device_group, t, 2, 1, sync_ulysses)
+        return AttentionTensorContainer(t[:, :length].transpose(1, 2))
+
+    out = optimized_attention(gather(q), gather(k), gather(v), local_heads, skip_reshape=True,
+                              preferred_attention=preferred_attention, transformer_options=transformer_options)
+    if world == 1:
+        return out
+    if length != rows * world:
+        out = torch.nn.functional.pad(out, (0, 0, 0, rows * world - length))
+    out = SeqAllToAll4D.apply(group.device_group, out.unflatten(-1, (local_heads, dim)), 1, 2, sync_ulysses)
+    return out[:, :, :heads].flatten(2)
 
 
 def _local_range(seq_len):
@@ -111,10 +137,13 @@ def usp_attn_forward(self, x, rope_freqs=None, transformer_options={}, **kwargs)
     # without gathering the sequence, so ring attention and the inner-attention
     # processors still run.
     length = transformer_options["minimax_h3_layout"].seq_len
-    out = xfuser_optimized_attention(
-        AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v), self.heads,
-        preferred_attention=self.comfy_attention, skip_reshape=True, transformer_options=transformer_options,
-        key_length=length if length % get_sequence_parallel_world_size() else None)
+    if self.comfy_attention.function is not None:
+        out = _checkpoint_attention(q, k, v, length, self.comfy_attention, transformer_options)
+    else:
+        out = xfuser_optimized_attention(
+            AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v), self.heads,
+            skip_reshape=True, transformer_options=transformer_options,
+            key_length=length if length % get_sequence_parallel_world_size() else None)
     out = out.squeeze(0)
     if fp16:
         # Both projections are bias-free. Keep the projected result out of fp16 overflow.

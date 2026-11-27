@@ -1,6 +1,5 @@
 import types
 from comfy import model_base
-from comfy.ldm.modules.attention import ComfyAttention
 
 
 class USPInjectRegistry:
@@ -436,10 +435,6 @@ if hasattr(model_base, "MiniMaxH3"):
         fp32_residual = options.fp32_residual
         chunk = options.mlp_chunk_tokens
         model.raylight_fp32_residual = fp32_residual
-        for block in model.blocks:
-            for attention in block.attn.modules():
-                if isinstance(attention, ComfyAttention) and attention.function is not None:
-                    raise ValueError("Checkpoint-selected MiniMax H3 attention is not supported by Raylight USP")
         for i, block in enumerate(model.blocks):
             block.attn.forward = types.MethodType(usp_attn_forward, block.attn)
             if attention_fp16 or mlp_fp16 or fp32_residual:
