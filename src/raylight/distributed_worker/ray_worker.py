@@ -1229,36 +1229,44 @@ class RayWorker:
     @patch_ray_tqdm
     @ray.method(num_returns=2)
     def ray_vae_decode_partial(self, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8, job_rank=0, job_world_size=1):
-        return ray_vae_decode_partial_impl(self, samples, tile_size, overlap, temporal_size, temporal_overlap, job_rank, job_world_size), None
+        with torch.no_grad():
+            return ray_vae_decode_partial_impl(self, samples, tile_size, overlap, temporal_size, temporal_overlap, job_rank, job_world_size), None
 
     def ray_vae_decode_spatial_combine(self, *worker_partials):
-        return ray_vae_decode_finalize_impl(self, combine_dist_vae_partials(worker_partials))
+        with torch.no_grad():
+            return ray_vae_decode_finalize_impl(self, combine_dist_vae_partials(worker_partials))
 
     def ray_vae_decode_mode(self):
         return vae_decode_mode(self.vae_model)
 
     @patch_ray_tqdm
     def ray_vae_decode_native(self, samples):
-        return ray_vae_decode_native_impl(self, samples)
+        with torch.no_grad():
+            return ray_vae_decode_native_impl(self, samples)
 
     @patch_ray_tqdm
     @ray.method(num_returns=2)
     def ray_vae_decode_temporal_partial(self, samples, job_rank=0, job_world_size=1):
-        return ray_vae_decode_temporal_partial_impl(self, samples, job_rank, job_world_size), None
+        with torch.no_grad():
+            return ray_vae_decode_temporal_partial_impl(self, samples, job_rank, job_world_size), None
 
     def ray_vae_decode_temporal_combine(self, *worker_partials):
-        return ray_vae_decode_temporal_combine_impl(self, worker_partials)
+        with torch.no_grad():
+            return ray_vae_decode_temporal_combine_impl(self, worker_partials)
 
     def ray_vae_decode_finalize(self, decoded):
-        return ray_vae_decode_finalize_impl(self, decoded)
+        with torch.no_grad():
+            return ray_vae_decode_finalize_impl(self, decoded)
 
     @patch_ray_tqdm
     @ray.method(num_returns=2)
     def ray_seedvr2_vae_decode_partial(self, samples, tile_size, overlap=64, job_rank=0, job_world_size=1):
-        return ray_seedvr2_vae_decode_partial_impl(self, samples, tile_size, overlap, job_rank, job_world_size), None
+        with torch.no_grad():
+            return ray_seedvr2_vae_decode_partial_impl(self, samples, tile_size, overlap, job_rank, job_world_size), None
 
     def ray_seedvr2_vae_decode_combine(self, *worker_partials):
-        return ray_vae_decode_finalize_impl(self, combine_seedvr2_vae_partials(worker_partials))
+        with torch.no_grad():
+            return ray_vae_decode_finalize_impl(self, combine_seedvr2_vae_partials(worker_partials))
 
     @report_progress
     @patch_temp_fix_ck_ops
