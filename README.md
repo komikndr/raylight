@@ -262,7 +262,7 @@ This is experimental mode where all type of parallel group can work at a sime ti
 | Wan2.2 14B I2V    | ✅  | ✅   | ✅  |
 | Wan2.1 1.3B T2V   | ✅  | ✅   | ✅  |
 | Wan2.1 1.3B AR    | ✅  | ❌   | ✅  |
-| Wan2.2 5B TI2V    | ✅  | ✅   | ✅  |
+| Wan2.2 5B TI2V    | ❌  | ✅   | ✅  |
 | Wan2.1 Vace       | ✅  | ❌   | ✅  |
 | Wan2.1 Bernini R  | ✅  | ❌   | ✅  |
 | Wan2.2 I2V Hi-Lo  | ✅  | ✅   | ✅  |

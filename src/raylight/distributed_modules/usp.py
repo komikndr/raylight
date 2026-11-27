@@ -26,6 +26,8 @@ class USPInjectRegistry:
     @classmethod
     def inject(cls, model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
         base_model = model_patcher.model
+        if isinstance(base_model, model_base.WAN22):
+            raise ValueError("Wan 2.2 5B TI2V USP is disabled. Set Ulysses and Ring degrees to 1; CFG parallelism is supported.")
         for registered_cls, inject_func in cls._REGISTRY.items():
             if isinstance(base_model, registered_cls):
                 print(f"[USP] Initializing USP for {registered_cls.__name__}")
