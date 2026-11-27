@@ -548,7 +548,6 @@ if hasattr(model_base, "CosmosPredict2"):
 
         model = base_model.diffusion_model
         for block in model.blocks:
-            block.cross_attn.attn_op = usp_xfuser_attention_op
             block.self_attn.attn_op = usp_xfuser_attention_op
         model._forward = types.MethodType(usp_mini_train_dit_forward, model)
 
@@ -561,7 +560,6 @@ if hasattr(model_base, "Anima"):
 
         model = base_model.diffusion_model
         for block in model.blocks:
-            block.cross_attn.attn_op = usp_xfuser_attention_op
             block.self_attn.attn_op = usp_xfuser_attention_op
         model._forward = types.MethodType(usp_mini_train_dit_forward, model)
 

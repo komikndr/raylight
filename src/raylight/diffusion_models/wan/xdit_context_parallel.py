@@ -1,3 +1,5 @@
+import math
+
 import torch
 from xfuser.core.distributed import (
     get_sequence_parallel_rank,
@@ -24,6 +26,21 @@ def _pad_and_split_for_sp(tensor, dim=1):
 
 def _sp_chunk_len(size):
     return (size + get_sequence_parallel_world_size() - 1) // get_sequence_parallel_world_size()
+
+
+def _shard_timestep_projection(e0, seq_len, shard_len, rank):
+    # Native repeat_e broadcasts each timestep over contiguous rows of the full sequence.
+    span = (seq_len + e0.size(1) - 1) // e0.size(1)
+    start = rank * shard_len
+    first = min(start // span, e0.size(1) - 1)
+    last = min((start + shard_len - 1) // span, e0.size(1) - 1)
+    if first == last:
+        return e0[:, first:first + 1]
+    stride = math.gcd(shard_len, span)
+    if stride == span and last - first + 1 == shard_len // span:
+        return e0[:, first:last + 1]
+    rows = torch.arange(start, start + shard_len, stride, device=e0.device)
+    return e0.index_select(1, (rows // span).clamp_max_(e0.size(1) - 1))
 
 
 def _sync_ar_kv_cache_for_sampler(cache):
@@ -313,6 +330,8 @@ def usp_dit_forward(
     # ===================== SP SPLIT ====================== #
     x, orig_size = _pad_and_split_for_sp(x, dim=1)
     freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
+    if sp_world > 1 and e0.size(1) > 1:
+        e0 = _shard_timestep_projection(e0, orig_size, x.size(1), sp_rank)
 
     # context
     context = self.text_embedding(context)
