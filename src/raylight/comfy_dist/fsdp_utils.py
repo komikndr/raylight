@@ -929,6 +929,13 @@ def load_from_full_model_state_dict(
     for param_name, sharded_meta_param in meta_sharded_sd.items():
         parent_module, leaf_name = _get_parent_module_and_name(model, param_name)
         is_buffer = leaf_name in parent_module._buffers
+        if not is_buffer and leaf_name not in parent_module._parameters:
+            # Custom state-dict entries (e.g. ComfyAttention.config) belong to the module's load hook.
+            if param_name in full_sd:
+                sharded_sd[param_name] = full_sd[param_name]
+                if release_sd:
+                    full_sd[param_name] = None
+            continue
         if not is_buffer and _should_materialize_unsharded_param(param_name, sharded_meta_param, full_sd):
             full_tensor = full_sd.get(param_name)
             if full_tensor is None:
