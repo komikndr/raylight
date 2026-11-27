@@ -8,27 +8,16 @@ from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
-from ..utils import pad_to_world_size
-from comfy.ldm.flux.math import apply_rope
-from comfy.ldm.flux.layers import modulated_norm
+from yunchang.comm.all_to_all import SeqAllToAll4D
+from ..utils import joint_rope_shards, pad_to_world_size, shard_ranges
+from comfy.ldm.flux import layers as flux_layers
+from comfy.ldm.flux.math import apply_rope, attention as native_attention
+from comfy.ldm.flux.layers import apply_mod, modulated_norm
+from comfy.ldm.flux.model import invert_slices
 import raylight.distributed_modules.attention as xfuser_attn
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
-
-
-def apply_mod(tensor, m_mult, m_add=None, modulation_dims=None):
-    if modulation_dims is None:
-        if m_add is not None:
-            return torch.addcmul(m_add, tensor, m_mult)
-        else:
-            return tensor * m_mult
-    else:
-        for d in modulation_dims:
-            tensor[:, d[0]:d[1]] *= m_mult[:, d[2]]
-            if m_add is not None:
-                tensor[:, d[0]:d[1]] += m_add[:, d[2]]
-        return tensor
 
 
 def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
@@ -53,25 +42,58 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
     return embedding
 
 
-def invert_slices(slices, length):
-    if slices is None:
-        return [(0, length)]
+def _checkpoint_attention(q, k, v, mask, options, preferred_attention):
+    lengths = options.get("raylight_key_lengths")
+    if lengths is None:
+        raise ValueError("Checkpoint-selected attention requires FLUX sequence shard lengths")
+    group = get_sp_group()
+    world = group.world_size
+    if world == 1:
+        return native_attention(q, k, v, None, mask=mask, transformer_options=options, preferred_attention=preferred_attention)
 
-    output = []
-    current = 0
-    for start, end in slices:
-        if start > current:
-            output.append((current, start))
-        current = end
-    if current < length:
-        output.append((current, length))
-    return output
+    # Gather tokens only for the heads owned by this rank. SOL routes token
+    # blocks, so joining rank-local [text, image] pairs in rank order is wrong.
+    widths = [(length + world - 1) // world for length in lengths]
+    heads = q.shape[1]
+    head_pad = -heads % world
+    local_heads = (heads + head_pad) // world
+
+    def gather_tokens(t):
+        t = t.transpose(1, 2)
+        if head_pad:
+            t = torch.nn.functional.pad(t, (0, 0, 0, head_pad))
+        t = SeqAllToAll4D.apply(group.device_group, t, 2, 1, sync_ulysses)
+        if len(lengths) == 1:
+            return t[:, :lengths[0]].transpose(1, 2)
+        streams = t.unflatten(1, (world, sum(widths))).split(widths, dim=2)
+        return torch.cat([s.flatten(1, 2)[:, :n] for s, n in zip(streams, lengths)], dim=1).transpose(1, 2)
+
+    if mask is not None and mask.ndim == 4 and mask.shape[1] != 1:
+        if mask.shape[1] != heads:
+            raise ValueError("FLUX checkpoint attention mask must cover one or all heads")
+        if head_pad:
+            mask = torch.nn.functional.pad(mask, (0, 0, 0, 0, 0, head_pad))
+        mask = mask.narrow(1, group.rank_in_group * local_heads, local_heads)
+
+    out = native_attention(gather_tokens(q), gather_tokens(k), gather_tokens(v), None,
+                           mask=mask, transformer_options=options, preferred_attention=preferred_attention)
+    parts = []
+    for stream, length, width in zip(out.split(lengths, dim=1), lengths, widths):
+        if width * world != length:
+            stream = torch.nn.functional.pad(stream, (0, 0, 0, width * world - length))
+        parts.append(stream.unflatten(1, (world, width)))
+    out = torch.cat(parts, dim=2) if len(parts) > 1 else parts[0]
+    out = out.flatten(1, 2).unflatten(-1, (local_heads, v.shape[-1]))
+    out = SeqAllToAll4D.apply(group.device_group, out, 1, 2, sync_ulysses)
+    return out[:, :, :heads].flatten(2)
 
 
-def attention(q, k, v, pe, mask=None, transformer_options={}) -> Tensor:
+def attention(q, k, v, pe, mask=None, transformer_options={}, preferred_attention=None) -> Tensor:
     if pe is not None:
         q, k = apply_rope(q, k, pe)
 
+    if preferred_attention is not None and preferred_attention.function is not None:
+        return _checkpoint_attention(q, k, v, mask, transformer_options, preferred_attention)
     heads = q.shape[1]
     x = xfuser_optimized_attention(q, k, v, heads, skip_reshape=True)
     return x
@@ -99,11 +121,6 @@ def usp_dit_forward(
     if img.ndim != 3 or txt.ndim != 3:
         raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
-    img, img_orig_size = pad_to_world_size(img, dim=1)
-    img_ids, _ = pad_to_world_size(img_ids, dim=1)
-    txt, txt_orig_size = pad_to_world_size(txt, dim=1)
-    txt_ids, _ = pad_to_world_size(txt_ids, dim=1)
-
     # running on sequences img
     img = self.img_in(img)
     vec = self.time_in(timestep_embedding(timesteps, 256).to(img.dtype))
@@ -129,6 +146,8 @@ def usp_dit_forward(
             txt_ids = out["txt_ids"]
 
     vec_orig = vec
+    img, img_orig_size = pad_to_world_size(img, dim=1)
+    txt, txt_orig_size = pad_to_world_size(txt, dim=1)
     txt_vec = vec
     modulation_dims = None
     extra_kwargs = {}
@@ -136,34 +155,33 @@ def usp_dit_forward(
         modulation_dims = []
         batch = vec.shape[0] // 2
         vec_orig = vec_orig.reshape(2, batch, vec.shape[1]).movedim(0, 1)
-        invert = invert_slices(timestep_zero_index, img.shape[1])
+        invert = invert_slices(timestep_zero_index, img_orig_size)
         for start, end in invert:
             modulation_dims.append((start, end, 0))
         for start, end in timestep_zero_index:
             modulation_dims.append((start, end, 1))
-        extra_kwargs["modulation_dims_img"] = modulation_dims
         txt_vec = vec[:batch]
     if self.params.global_modulation:
         vec = (self.double_stream_modulation_img(vec_orig), self.double_stream_modulation_txt(txt_vec))
 
     # ===================== SP SPLIT ====================== #
     if img_ids is not None:
-        ids = torch.cat((txt_ids, img_ids), dim=1)
-        pe_combine = self.pe_embedder(ids)
-        pe_image = self.pe_embedder(img_ids)
-        # seq parallel
-        pe_combine = torch.chunk(pe_combine, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
-        pe_image = torch.chunk(pe_image, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+        img_ids, _ = pad_to_world_size(img_ids, dim=1)
+        txt_ids, _ = pad_to_world_size(txt_ids, dim=1)
+        pe_image, pe_combine = joint_rope_shards(self.pe_embedder, txt_ids, img_ids, txt_orig_size, img_orig_size)
     else:
         pe_combine = None
         pe_image = None
 
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    if modulation_dims is not None:
+        extra_kwargs["modulation_dims_img"] = shard_ranges(modulation_dims, img.shape[1])
 
     blocks_replace = patches_replace.get("dit", {})
     transformer_options["total_blocks"] = len(self.double_blocks)
     transformer_options["block_type"] = "double"
+    transformer_options["raylight_key_lengths"] = (txt_orig_size, img_orig_size)
     for i, block in enumerate(self.double_blocks):
         transformer_options["block_index"] = i
         if ("double_block", i) in blocks_replace:
@@ -202,9 +220,8 @@ def usp_dit_forward(
             if i < len(control_i):
                 add = control_i[i]
                 if add is not None:
-                    # Pad + chunk control signal to match USP sequence split
-                    add, _ = pad_to_world_size(add, dim=1)
-                    add = torch.chunk(add, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+                    start = img.shape[1] * get_sequence_parallel_rank()
+                    add = add[:, start:start + img.shape[1]]
                     img[:, :add.shape[1]] += add
     # ===================== SP GATHER ===================== #
     img = get_sp_group().all_gather(img.contiguous(), dim=1)
@@ -229,9 +246,12 @@ def usp_dit_forward(
         )
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
+    if timestep_zero_index is not None:
+        extra_kwargs["modulation_dims"] = shard_ranges(extra_kwargs["modulation_dims"], img.shape[1])
     transformer_options["total_blocks"] = len(self.single_blocks)
     transformer_options["block_type"] = "single"
-    transformer_options["img_slice"] = [txt.shape[1], img.shape[1]]
+    transformer_options["raylight_key_lengths"] = (img_orig_size,)
+    transformer_options["img_slice"] = [max(0, min(img.shape[1], txt.shape[1] - get_sequence_parallel_rank() * img.shape[1])), img.shape[1]]
     for i, block in enumerate(self.single_blocks):
         transformer_options["block_index"] = i
         if ("single_block", i) in blocks_replace:
@@ -293,8 +313,6 @@ def usp_single_stream_forward(
     transformer_options={},
     **kwargs
 ) -> Tensor:
-    if self.comfy_attention.function is not None:
-        raise ValueError("Checkpoint-selected attention is not supported by Raylight USP")
     if self.modulation:
         mod, _ = self.modulation(vec)
     else:
@@ -303,11 +321,24 @@ def usp_single_stream_forward(
     transformer_patches = transformer_options.get("patches", {})
     extra_options = transformer_options.copy()
 
-    qkv, mlp = torch.split(self.linear1(modulated_norm(x, self.pre_norm, mod.scale, mod.shift, modulation_dims)), [3 * self.hidden_size, self.mlp_hidden_dim_first], dim=-1)
+    chunked = transformer_options.get("chunk_tokens") and flux_layers.chunk_tokens(x, transformer_options, modulation_dims)
+    if chunked:
+        chunk = flux_layers.CHUNK_TOKENS
+        qkv = x.new_empty((*x.shape[:2], 3 * self.hidden_size))
+        mlp = x.new_empty((*x.shape[:2], self.mlp_hidden_dim))
+        for i, part in enumerate(self.qkv_chunks(x, mod, mlp, chunk)):
+            qkv[:, i * chunk:(i + 1) * chunk] = part
+            del part
+    else:
+        qkv, mlp = torch.split(self.linear1(modulated_norm(x, self.pre_norm, mod.scale, mod.shift, modulation_dims)), [3 * self.hidden_size, self.mlp_hidden_dim_first], dim=-1)
 
     q, k, v = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
     del qkv
-    q, k = self.norm(q, k, v)
+    if chunked and pe is not None and "attn1_patch" not in transformer_patches:
+        self.norm.norm_rope_(q, k, pe)
+        pe = None
+    else:
+        q, k = self.norm(q, k, v)
 
     if "attn1_patch" in transformer_patches:
         patch = transformer_patches["attn1_patch"]
@@ -316,7 +347,7 @@ def usp_single_stream_forward(
             q, k, v, pe, attn_mask = out.get("q", q), out.get("k", k), out.get("v", v), out.get("pe", pe), out.get("attn_mask", attn_mask)
 
     # compute attention
-    attn = attention(q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options)
+    attn = attention(q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options, preferred_attention=self.comfy_attention)
     del q, k, v
 
     if "attn1_output_patch" in transformer_patches:
@@ -325,13 +356,18 @@ def usp_single_stream_forward(
             attn = p(attn, extra_options)
 
     # compute activation in mlp stream, cat again and run second linear layer
-    if self.yak_mlp:
-        mlp = self.mlp_act(mlp[..., self.mlp_hidden_dim_first // 2:]) * mlp[..., :self.mlp_hidden_dim_first // 2]
+    if chunked:
+        for s in range(0, x.shape[1], chunk):
+            rows = slice(s, s + chunk)
+            projected = self.linear2(torch.cat((attn[:, rows], mlp[:, rows]), dim=2))
+            x[:, rows] += apply_mod(projected, mod.gate)
     else:
-        mlp = self.mlp_act(mlp)
-
-    output = self.linear2(torch.cat((attn, mlp), 2))
-    x += apply_mod(output, mod.gate, None, modulation_dims)
+        if self.yak_mlp:
+            mlp = self.mlp_act(mlp[..., self.mlp_hidden_dim_first // 2:]) * mlp[..., :self.mlp_hidden_dim_first // 2]
+        else:
+            mlp = self.mlp_act(mlp)
+        output = self.linear2(torch.cat((attn, mlp), 2))
+        x += apply_mod(output, mod.gate, None, modulation_dims)
     if x.dtype == torch.float16:
         x = torch.nan_to_num(x, nan=0.0, posinf=65504, neginf=-65504)
     return x
@@ -349,8 +385,6 @@ def usp_double_stream_forward(
     transformer_options={},
     **kwargs
 ):
-    if self.comfy_attention.function is not None:
-        raise ValueError("Checkpoint-selected attention is not supported by Raylight USP")
     if self.modulation:
         img_mod1, img_mod2 = self.img_mod(vec)
         txt_mod1, txt_mod2 = self.txt_mod(vec)
@@ -360,13 +394,17 @@ def usp_double_stream_forward(
     transformer_patches = transformer_options.get("patches", {})
     extra_options = transformer_options.copy()
 
-    # prepare image for attention
-    img_modulated = modulated_norm(img, self.img_norm1, img_mod1.scale, img_mod1.shift, modulation_dims_img)
-    img_qkv = self.img_attn.qkv(img_modulated)
-    del img_modulated
-    img_q, img_k, img_v = img_qkv.view(img_qkv.shape[0], img_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
-    del img_qkv
-    img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
+    chunked = transformer_options.get("chunk_tokens") and flux_layers.chunk_tokens(img, transformer_options, modulation_dims_img)
+    chunk_qkv = chunked and pe is not None and "attn1_patch" not in transformer_patches
+    if chunked:
+        chunk = flux_layers.CHUNK_TOKENS
+    if not chunk_qkv:
+        img_modulated = modulated_norm(img, self.img_norm1, img_mod1.scale, img_mod1.shift, modulation_dims_img)
+        img_qkv = self.img_attn.qkv(img_modulated)
+        del img_modulated
+        img_q, img_k, img_v = img_qkv.view(img_qkv.shape[0], img_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        del img_qkv
+        img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
 
     # prepare txt for attention
     txt_modulated = modulated_norm(txt, self.txt_norm1, txt_mod1.scale, txt_mod1.shift, modulation_dims_txt)
@@ -374,24 +412,36 @@ def usp_double_stream_forward(
     del txt_modulated
     txt_q, txt_k, txt_v = txt_qkv.view(txt_qkv.shape[0], txt_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
     del txt_qkv
-    txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
 
-    img_q, img_k = apply_rope(img_q, img_k, pe)
-    q = torch.cat((txt_q, img_q), dim=2)
-    del txt_q, img_q
-    k = torch.cat((txt_k, img_k), dim=2)
-    del txt_k, img_k
-    v = torch.cat((txt_v, img_v), dim=2)
-    del txt_v, img_v
+    if chunk_qkv:
+        n_txt = txt.shape[1]
+        qkv = img.new_empty((img.shape[0], n_txt + img.shape[1], 3 * self.hidden_size))
+        q, k, v = qkv.view(img.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        q[:, :, :n_txt], k[:, :, :n_txt], v[:, :, :n_txt] = txt_q, txt_k, txt_v
+        del txt_q, txt_k, txt_v
+        for s in range(0, img.shape[1], chunk):
+            qkv[:, n_txt + s:n_txt + s + chunk] = self.img_attn.qkv(modulated_norm(img[:, s:s + chunk], self.img_norm1, img_mod1.scale, img_mod1.shift))
+        self.txt_attn.norm.norm_rope_(q[:, :, :n_txt], k[:, :, :n_txt], pe[:, :, :n_txt])
+        self.img_attn.norm.norm_rope_(q[:, :, n_txt:], k[:, :, n_txt:], pe[:, :, n_txt:])
+        pe = None
+        del qkv
+    else:
+        txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
+        q = torch.cat((txt_q, img_q), dim=2)
+        del txt_q, img_q
+        k = torch.cat((txt_k, img_k), dim=2)
+        del txt_k, img_k
+        v = torch.cat((txt_v, img_v), dim=2)
+        del txt_v, img_v
     extra_options["img_slice"] = [txt.shape[1], q.shape[2]]
     if "attn1_patch" in transformer_patches:
         patch = transformer_patches["attn1_patch"]
         for p in patch:
-            out = p(q, k, v, pe=None, attn_mask=attn_mask, extra_options=extra_options)
+            out = p(q, k, v, pe=pe, attn_mask=attn_mask, extra_options=extra_options)
             q, k, v, pe, attn_mask = out.get("q", q), out.get("k", k), out.get("v", v), out.get("pe", pe), out.get("attn_mask", attn_mask)
 
     # run actual attention
-    attn = attention(q, k, v, pe=None, mask=attn_mask, transformer_options=transformer_options)
+    attn = attention(q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options, preferred_attention=self.comfy_attention)
     del q, k, v
 
     if "attn1_output_patch" in transformer_patches:
@@ -405,7 +455,12 @@ def usp_double_stream_forward(
     # calculate the img bloks
     img += apply_mod(self.img_attn.proj(img_attn), img_mod1.gate, None, modulation_dims_img)
     del img_attn
-    img += apply_mod(self.img_mlp(modulated_norm(img, self.img_norm2, img_mod2.scale, img_mod2.shift, modulation_dims_img)), img_mod2.gate, None, modulation_dims_img)
+    if chunked:
+        for s in range(0, img.shape[1], chunk):
+            rows = slice(s, s + chunk)
+            img[:, rows] += apply_mod(self.img_mlp(modulated_norm(img[:, rows], self.img_norm2, img_mod2.scale, img_mod2.shift)), img_mod2.gate)
+    else:
+        img += apply_mod(self.img_mlp(modulated_norm(img, self.img_norm2, img_mod2.scale, img_mod2.shift, modulation_dims_img)), img_mod2.gate, None, modulation_dims_img)
 
     # calculate the txt bloks
     txt += apply_mod(self.txt_attn.proj(txt_attn), txt_mod1.gate, None, modulation_dims_txt)
