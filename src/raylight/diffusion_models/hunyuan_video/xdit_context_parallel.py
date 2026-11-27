@@ -152,6 +152,7 @@ def usp_dit_forward(
     # ===================== SP SPLIT ====================== #
     img, img_orig_size = pad_to_world_size(img, dim=1)
     img_ids, _ = pad_to_world_size(img_ids, dim=1)
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(txt.shape[1], img_orig_size))
     txt, txt_orig_size = pad_to_world_size(txt, dim=1)
     txt_ids, _ = pad_to_world_size(txt_ids, dim=1)
 
@@ -218,6 +219,7 @@ def usp_dit_forward(
     img = torch.cat((txt, img), 1)
     # ===================== SP SPLIT ====================== #
     img, img_orig_size = pad_to_world_size(img, dim=1)
+    transformer_options["raylight_key_lengths"] = (img_orig_size,)
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     local_dims = shard_ranges(modulation_dims, img.shape[1])
     transformer_options["total_blocks"] = len(self.single_blocks)

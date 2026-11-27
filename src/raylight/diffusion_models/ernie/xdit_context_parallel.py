@@ -12,6 +12,7 @@ import raylight.distributed_modules.attention as xfuser_attn
 
 from comfy.ldm.ernie.model import apply_rotary_emb
 
+from ...distributed_modules.key_padding import key_length_scope
 from ..utils import pad_to_world_size
 
 attn_type = xfuser_attn.get_attn_type()
@@ -111,8 +112,9 @@ def usp_dit_forward(self, x, timesteps, context, **kwargs):
     rotary_pos_emb = torch.chunk(rotary_pos_emb, sp_world_size, dim=2)[sp_rank]
 
     # Ernie attends over a single joint image+text sequence, so shard both together.
-    for layer in self.layers:
-        hidden_states = layer(hidden_states, rotary_pos_emb, temb)
+    with key_length_scope((hidden_states_orig_size,)):
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, rotary_pos_emb, temb)
 
     # ===================== SP GATHER ===================== #
     hidden_states = get_sp_group().all_gather(hidden_states.contiguous(), dim=1)

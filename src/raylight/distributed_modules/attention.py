@@ -1,5 +1,7 @@
 import functools
 import torch
+from comfy.ldm.modules.attention import optimized_attention
+from xfuser.core.distributed import get_sequence_parallel_world_size, get_sp_group
 
 from xfuser.core.long_ctx_attention import (
     xFuserLongContextAttention,
@@ -9,7 +11,7 @@ from yunchang.kernels import AttnType
 from .sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_kernel
 from .inner_attention import INNER_ATTENTION_KEY, InnerAttentionDispatcher
 from .kitchen_attention import kitchen_attention
-from .key_padding import key_length_scope
+from .key_padding import active_key_length, key_length_scope, key_slices, select_rows
 
 _ATTN_TYPE = None
 _SYNC_ULYSSES = None
@@ -137,7 +139,27 @@ def make_xfuser_attention(attn_type, sync_ulysses):
         transformer_options = kwargs.get("transformer_options", {})
         processor = transformer_options.get(INNER_ATTENTION_KEY)
         # key_length: keys past this many rows of the full sequence are padding
-        with inner_dispatcher.scope(processor, transformer_options), key_length_scope(kwargs.get("key_length")):
+        length = kwargs.get("key_length")
+        lengths = kwargs.get("key_lengths")
+        if lengths is None and length is None:
+            lengths = active_key_length()
+        if lengths:
+            world = get_sequence_parallel_world_size()
+            if any(n % world for n in lengths):
+                ring = inner_dispatcher.ring_world_size
+                length = key_slices(lengths, world, ring)
+                unit = kwargs.get("key_unit", 1)
+                if unit != 1:
+                    length = [[(a * unit, b * unit) for a, b in runs] for runs in length]
+                if ring > 1 and (not all(length) or attn in (AttnType.FA3, AttnType.SPARSE_SAGE)):
+                    runs = key_slices(lengths, world, 1)[0]
+                    runs = [(a * unit, b * unit) for a, b in runs]
+                    key = select_rows(get_sp_group().all_gather(key.contiguous(), dim=1), runs)
+                    value = select_rows(get_sp_group().all_gather(value.contiguous(), dim=1), runs)
+                    return optimized_attention(q, key.transpose(1, 2), value.transpose(1, 2), heads,
+                                               skip_reshape=True, skip_output_reshape=skip_output_reshape,
+                                               **({"scale": kwargs["scale"]} if "scale" in kwargs else {}))
+        with inner_dispatcher.scope(processor, transformer_options), key_length_scope(length):
             if join_q is not None:
                 out = xfuser_attn(
                     None, query, key, value,

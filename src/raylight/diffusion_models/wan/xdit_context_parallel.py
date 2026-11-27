@@ -1,3 +1,5 @@
+import math
+
 import torch
 from xfuser.core.distributed import (
     get_sequence_parallel_rank,
@@ -7,6 +9,7 @@ from xfuser.core.distributed import (
 import raylight.distributed_modules.attention as xfuser_attn
 import comfy
 from comfy.ldm.flux.math import apply_rope1
+from ...distributed_modules.key_padding import key_length_scope
 from ..utils import pad_to_world_size
 
 attn_type = xfuser_attn.get_attn_type()
@@ -26,6 +29,21 @@ def _sp_chunk_len(size):
     return (size + get_sequence_parallel_world_size() - 1) // get_sequence_parallel_world_size()
 
 
+def _shard_timestep_projection(e0, seq_len, shard_len, rank):
+    # Native repeat_e broadcasts each timestep over contiguous rows of the full sequence.
+    span = (seq_len + e0.size(1) - 1) // e0.size(1)
+    start = rank * shard_len
+    first = min(start // span, e0.size(1) - 1)
+    last = min((start + shard_len - 1) // span, e0.size(1) - 1)
+    if first == last:
+        return e0[:, first:first + 1]
+    stride = math.gcd(shard_len, span)
+    if stride == span and last - first + 1 == shard_len // span:
+        return e0[:, first:last + 1]
+    rows = torch.arange(start, start + shard_len, stride, device=e0.device)
+    return e0.index_select(1, (rows // span).clamp_max_(e0.size(1) - 1))
+
+
 def _sync_ar_kv_cache_for_sampler(cache):
     if cache is None or "sp_full_end" not in cache:
         return
@@ -35,8 +53,12 @@ def _sync_ar_kv_cache_for_sampler(cache):
     if full_end >= sp_full_end:
         return
 
-    full_delta = sp_full_end - full_end
-    cache["sp_local_end"] = max(0, cache["sp_local_end"] - _sp_chunk_len(full_delta))
+    blocks = cache["sp_key_lengths"]
+    while sp_full_end > full_end:
+        sp_full_end -= blocks.pop()
+    if sp_full_end != full_end:
+        raise ValueError("Wan AR cache rewind must end on a cached block boundary")
+    cache["sp_local_end"] = sum(map(_sp_chunk_len, blocks))
     cache["sp_full_end"] = full_end
 
 
@@ -193,7 +215,7 @@ def usp_causal_ar_self_attn_forward(self, x, freqs, kv_cache=None, transformer_o
             q.view(b, s, n * d),
             k.view(b, s, n * d),
             v.view(b, s, n * d),
-            heads=self.num_heads,
+            heads=self.num_heads, key_lengths=(transformer_options["usp_ar_block_seq_len"],),
         )
         return self.o(x.flatten(2))
 
@@ -202,6 +224,8 @@ def usp_causal_ar_self_attn_forward(self, x, freqs, kv_cache=None, transformer_o
     full_end = kv_cache["end"]
     local_end = kv_cache.get("sp_local_end", _sp_chunk_len(full_end))
     full_block_seq_len = transformer_options["usp_ar_block_seq_len"]
+    blocks = kv_cache.setdefault("sp_key_lengths", [])
+    blocks.append(full_block_seq_len)
     local_new_end = local_end + s
     full_new_end = full_end + full_block_seq_len
 
@@ -215,7 +239,7 @@ def usp_causal_ar_self_attn_forward(self, x, freqs, kv_cache=None, transformer_o
         q.view(b, s, n * d),
         kv_cache["k"][:, :local_new_end].view(b, local_new_end, n * d),
         kv_cache["v"][:, :local_new_end].view(b, local_new_end, n * d),
-        heads=self.num_heads,
+        heads=self.num_heads, key_lengths=blocks,
     )
     return self.o(x.flatten(2))
 
@@ -311,8 +335,11 @@ def usp_dit_forward(
     sp_rank = get_sequence_parallel_rank()
 
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(x.shape[1],))
     x, orig_size = _pad_and_split_for_sp(x, dim=1)
     freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
+    if sp_world > 1 and e0.size(1) > 1:
+        e0 = _shard_timestep_projection(e0, orig_size, x.size(1), sp_rank)
 
     # context
     context = self.text_embedding(context)
@@ -409,6 +436,7 @@ def usp_vace_dit_forward(
     c = list(c.split(orig_shape[0], dim=0))
 
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(x.shape[1],))
     x, orig_size = _pad_and_split_for_sp(x, dim=1)
     freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
     c = [_pad_and_split_for_sp(item, dim=1)[0] for item in c]
@@ -501,6 +529,7 @@ def usp_camera_dit_forward(
         context_img_len = clip_fea.shape[-2]
 
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(x.shape[1],))
     x, orig_size = _pad_and_split_for_sp(x, dim=1)
     freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
 
@@ -593,6 +622,7 @@ def usp_humo_dit_forward(
         audio = None
 
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(x.shape[1],))
     x, orig_size = _pad_and_split_for_sp(x, dim=1)
     freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
 
@@ -712,6 +742,7 @@ def usp_s2v_dit_forward(
     context = self.text_embedding(context)
 
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(x.shape[1],))
     x, orig_size = _pad_and_split_for_sp(x, dim=1)
     freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
     patches_replace = transformer_options.get("patches_replace", {})
@@ -808,6 +839,7 @@ def usp_wandancer_dit_forward(
             x = torch.concat((full_ref, x), dim=1)
 
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(x.shape[1],))
     x, orig_size = _pad_and_split_for_sp(x, dim=1)
     freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
 
@@ -825,8 +857,9 @@ def usp_wandancer_dit_forward(
         music_feature, music_orig_size = _pad_and_split_for_sp(music_feature, dim=1)
         music_freqs, _ = _pad_and_split_for_sp(music_freqs, dim=1)
 
-        for layer in self.music_encoder:
-            music_feature = layer(music_feature, music_freqs)
+        with key_length_scope((music_orig_size,)):
+            for layer in self.music_encoder:
+                music_feature = layer(music_feature, music_freqs)
 
         # ===================== SP GATHER ===================== #
         music_feature = get_sp_group().all_gather(music_feature.contiguous(), dim=1)
@@ -934,7 +967,7 @@ def usp_self_attn_forward(self, x, freqs, transformer_options={}, **kwargs):
         q.view(b, s, n * d),
         k.view(b, s, n * d),
         self.v(x).view(b, s, n * d),
-        heads=self.num_heads,
+        heads=self.num_heads, key_lengths=transformer_options.get("raylight_key_lengths"),
     )
     x = x.flatten(2)
 
@@ -1049,6 +1082,7 @@ def usp_scail_dit_forward(
         del scail_x
 
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(x.shape[1],))
     x, orig_size = _pad_and_split_for_sp(x, dim=1)
     freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
 
@@ -1138,6 +1172,7 @@ def usp_multitalk_dit_forward(
     sp_rank = get_sequence_parallel_rank()
 
     # ===================== SP SPLIT ====================== #
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(x.shape[1],))
     x, orig_size = _pad_and_split_for_sp(x, dim=1)
     freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
 

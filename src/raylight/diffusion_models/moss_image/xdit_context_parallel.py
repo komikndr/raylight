@@ -18,7 +18,7 @@ xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(xfuser_attn.get_a
 
 
 def usp_attention(original_attention, q, k, v, heads, transformer_options={}, **kwargs):
-    return xfuser_optimized_attention(q, k, v, heads, transformer_options=transformer_options, **kwargs)
+    return xfuser_optimized_attention(q, k, v, heads, transformer_options=transformer_options, key_lengths=transformer_options["raylight_key_lengths"], **kwargs)
 
 
 def usp_moss_forward(self, x, timestep, context, transformer_options={}, ref_latents=[], ref_latents_method=None, ref_kv=None, context_attention_bias=None, **kwargs):
@@ -58,6 +58,7 @@ def usp_moss_forward(self, x, timestep, context, transformer_options={}, ref_lat
     x = torch.cat([self.video_embedder(x.flatten(2).transpose(1, 2)), txt] + [self.video_embedder(r.flatten(2).transpose(1, 2)) for r in refs], dim=1)
     del txt, refs
 
+    transformer_options = dict(transformer_options or {}, raylight_key_lengths=(x.shape[1],) if ref_kv is None else (x.shape[1], ref_kv.shape[3]))
     world_size = get_sequence_parallel_world_size()
     rank = get_sequence_parallel_rank()
     local_len = -(-x.shape[1] // world_size)
