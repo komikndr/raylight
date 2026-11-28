@@ -1,6 +1,7 @@
 import functools
 import torch
 from comfy.ldm.modules.attention import optimized_attention
+import comfy_kitchen
 from xfuser.core.distributed import get_sequence_parallel_world_size, get_sp_group
 
 from xfuser.core.long_ctx_attention import (
@@ -10,7 +11,7 @@ from xfuser.core.long_ctx_attention import (
 from yunchang.kernels import AttnType
 from .sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_kernel
 from .inner_attention import INNER_ATTENTION_KEY, InnerAttentionDispatcher
-from .kitchen_attention import kitchen_attention
+from .kitchen_attention import kitchen_attention, kitchen_ring_available, kitchen_ring_step
 from .key_padding import active_key_length, key_length_scope, key_slices, select_rows
 
 _ATTN_TYPE = None
@@ -85,11 +86,13 @@ def make_xfuser_attention(attn_type, sync_ulysses):
 
     xfuser_attn = xFuserLongContextAttention(use_sync=sync_ulysses, attn_type=attn)
     if kitchen:
-        if torch.distributed.get_world_size(xfuser_attn.ring_pg) != 1:
-            raise ValueError("Comfy Kitchen INT8 requires ring_degree=1; its kernel does not return ring LSE.")
-        # Preserve Ulysses exchanges, replacing only the local computation. The
-        # model-specific dispatcher below uses Kitchen as its dense fallback.
-        xfuser_attn.ring_attn_fn = kitchen_attention
+        if torch.distributed.get_world_size(xfuser_attn.ring_pg) == 1:
+            xfuser_attn.ring_attn_fn = kitchen_attention
+        else:
+            if not kitchen_ring_available() or not comfy_kitchen.int8_attention_is_available():
+                raise ValueError("Comfy Kitchen INT8 ring attention requires a supported CUDA GPU and int8_attention_with_lse.")
+            xfuser_attn.attn_type = None
+            xfuser_attn.attn_processor = kitchen_ring_step
     inner_dispatcher = InnerAttentionDispatcher(xfuser_attn)
 
     def _attention_xfuser_unmask(

@@ -24,6 +24,7 @@ from yunchang.kernels import AttnType
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils  # type: ignore
 
+from .distributed_modules.kitchen_attention import kitchen_ring_available
 from .distributed_worker.ray_worker import (
     make_ray_actor_fn,
     actor_generation,
@@ -624,8 +625,9 @@ class RayInitializer:
             numa_bind=numa_bind,
         )
         config = RaylightConfig(loading=LoadingOptions(parallel_quant_load=parallel_quant_load), worker=worker_config)
-        if worker_config.attention_backend == "COMFY_KITCHEN_INT8" and worker_config.parallel.ring_degree != 1:
-            raise ValueError("Comfy Kitchen INT8 requires ring_degree=1.")
+        if (worker_config.attention_backend == "COMFY_KITCHEN_INT8" and worker_config.parallel.ring_degree > 1
+                and not kitchen_ring_available()):
+            raise ValueError("Comfy Kitchen INT8 ring attention requires a CUDA build with int8_attention_with_lse.")
 
         if ray_dashboard_address != "None":
             dashboard_host, dashboard_port = ray_dashboard_address.rsplit(":", 1)

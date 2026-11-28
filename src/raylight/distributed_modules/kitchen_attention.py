@@ -2,6 +2,20 @@ import torch
 import comfy_kitchen
 
 
+def kitchen_ring_available():
+    return torch.version.cuda is not None and callable(getattr(comfy_kitchen, "int8_attention_with_lse", None))
+
+
+def kitchen_ring_step(q, k, v, *, softmax_scale=None, causal=False, window_size=(-1, -1),
+                      alibi_slopes=None, dropout_p=0.0, return_softmax=False, return_attn_probs=False, **kwargs):
+    if causal or tuple(window_size) != (-1, -1) or alibi_slopes is not None or dropout_p or return_softmax or return_attn_probs:
+        raise ValueError("Comfy Kitchen INT8 ring requires non-causal, full attention without attention-probability output.")
+    out, lse = comfy_kitchen.int8_attention_with_lse(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), scale=softmax_scale,
+    )
+    return out.transpose(1, 2).contiguous(), lse
+
+
 def kitchen_attention(q, k, v, *args, softmax_scale=None, causal=False, window_size=(-1, -1),
                       alibi_slopes=None, dropout_p=0.0, return_attn_probs=False,
                       joint_tensor_key=None, joint_tensor_value=None, joint_strategy="none", **kwargs):
