@@ -739,6 +739,10 @@ class RayWorker:
         """
         import comfy.model_management as comfy_model_management
 
+        cleanup_vbar_casts = getattr(comfy_model_management, "cleanup_vbar_casts", None)
+        if cleanup_vbar_casts is not None:
+            cleanup_vbar_casts()
+
         try:
             comfy_model_management.unload_all_models()
         except Exception as e:
