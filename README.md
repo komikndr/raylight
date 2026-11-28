@@ -7,12 +7,6 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 ## UPDATE
 
-### Multi-GPU validation on `dev`
-
-- **Sequence parallelism (USP):** MiniMax H3, Qwen Image 2.1, Anima, and Krea2 completed representative two-GPU runs during integration of the uneven-padding changes. The Anima run did not use LLLite.
-- **Quantized FSDP loading:** MiniMax and Krea2 runs covered INT8 ConvRot, scaled FP8, MXFP8, NVFP4, W4A8, and W6A8. MiniMax H3 Ref2VA also ran with Ring2, CPU offload, and a speed LoRA. ConvRot W4A4, AWQ W4A16, and SVDQuant W4A4 remain experimental without GPU validation.
-- **Model limits:** PAN2 and MOSS-Image support is partial. Ming-Image, Z-Image PixelSpace, MageFlow, and Wan RelayVSR USP are experimental. Use CFG parallelism for **Wan 2.2 5B TI2V**; USP is disabled for that variant after a visual regression.
-
 <details><summary><strong>Click to expand changelog</strong></summary>
 
 - Experimental USP paths: Ming-Image, Z-Image PixelSpace, MageFlow, and Wan 2.2 RelayVSR. RelayVSR distributes spatial rows within each temporal chunk and retains native window attention.
@@ -269,31 +263,10 @@ This is experimental mode where all type of parallel group can work at a sime ti
 | Wan2.1 1.3B Causal AR | ✅ | ❌ | ✅ |
 | Wan2.1 Vace       | ✅  | ❌   | ✅  |
 | Wan2.1 Bernini R  | ✅  | ❌   | ✅  |
-| Wan2.1 FLF2V      | ❓  | ❓   | ❓  |
-| Wan2.1 Fun Control | ❓ | ❓   | ❓  |
-| Wan2.1 Fun Inpaint | ❓ | ❓   | ❓  |
-| Wan2.1 Camera     | ❓  | ❓   | ❓  |
-| Wan2.1 HuMo       | ❓  | ❓   | ❓  |
-| Wan2.1 FlowRVS    | ❓  | ❓   | ❓  |
-| Wan2.1 SCAIL      | ❓  | ❓   | ❓  |
-| Wan2.1 SCAIL-2    | ❓  | ❓   | ❓  |
 | Wan2.2 5B TI2V    | ❌  | ✅   | ✅  |
 | Wan2.2 14B I2V Hi-Lo | ✅ | ✅ | ✅ |
 | Wan2.2 14B T2V Hi-Lo | ✅ | ✅ | ✅ |
 | Wan2.2 SVI        | ✅  | ✅   | ✅  |
-| Wan2.2 Fun Control | ❓ | ❓   | ❓  |
-| Wan2.2 Camera     | ❓  | ❓   | ❓  |
-| Wan2.2 S2V        | ❓  | ❓   | ❓  |
-| Wan2.2 Animate    | ❓  | ❓   | ❓  |
-| Wan Animate 2     | ❓  | ❓   | ❓  |
-| Wan2.2 WanDancer  | ❓  | ❓   | ❓  |
-| Wan2.2 RelayVSR   | ❓  | ❓   | ❓  |
-| Wan Phantom       | ❓  | ❓   | ❓  |
-| Wan MultiTalk     | ❓  | ❓   | ❓  |
-| Wan InfiniteTalk  | ❓  | ❓   | ❓  |
-| WanMove           | ❓  | ❓   | ❓  |
-| Wan Uni3C         | ❓  | ❓   | ❓  |
-
 
 **Flux**
 | Model             | USP | FSDP | CFG |
@@ -327,9 +300,9 @@ This is experimental mode where all type of parallel group can work at a sime ti
 | Model             | USP | FSDP | CFG |
 |-------------------|-----|------|-----|
 | Z Image           | ✅  | ✅   | ✅  |
-| Z-Image PixelSpace | ❓ | ❓   | ❓  |
 | Lumina 2          | ✅  | ✅   | ✅  |
 | Ming-Image        | ❓  | ❓   | ❓  |
+| Z-Image PixelSpace | ❓ | ❓   | ❓  |
 
 
 **Hunyuan Video**
@@ -376,10 +349,15 @@ This is experimental mode where all type of parallel group can work at a sime ti
 | H3 Image           | ✅  | ✅   | ❓  |
 
 
-**PAN2 and MOSS Image**
+**PAN2**
 | Model        | USP | FSDP | CFG |
 |--------------|-----|------|-----|
 | PAN2         | ❓  | ❓   | ❓  |
+
+
+**MOSS Image**
+| Model        | USP | FSDP | CFG |
+|--------------|-----|------|-----|
 | MOSS Image   | ❓  | ❓   | ❓  |
 
 
@@ -413,7 +391,6 @@ This is experimental mode where all type of parallel group can work at a sime ti
 
 ## FSDP Supported Weight
 
-Status applies to diffusion checkpoint weights, not attention or compute dtype. ✅ = supported, ❓ = implemented but not GPU-validated, ❌ = unsupported.
 
 | DType | Status |
 |-------|--------|
@@ -430,6 +407,9 @@ Status applies to diffusion checkpoint weights, not attention or compute dtype. 
 | SVDQuant W4A4 | ❓ |
 | Grouped W3A8 / W5A8 | ❌ |
 | GGUF | ❌ |
+
+**Notes:**
+Status applies to diffusion checkpoint weights, not attention or compute dtype. ✅ = supported, ❓ = implemented but not GPU-validated, ❌ = unsupported.
 
 ## Attention
 
