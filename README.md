@@ -433,6 +433,15 @@ Status applies to diffusion checkpoint weights, not attention or compute dtype. 
 
 ## Attention
 
+### Custom attention
+
+| Option | How to enable | When it applies |
+|--------|---------------|-----------------|
+| Comfy Kitchen INT8 | Select `COMFY_KITCHEN_INT8` under `XFuser_attention` in Ray Init. | Dense INT8 attention after the Ulysses exchange on supported CUDA GPUs. Set `ring_degree=1`. |
+| MiniMax H3 SLA | Connect **MiniMax H3 SLA Attention (Ray)** between the Ray model loader and sampler. | Sparse attention for long H3 sequences with `ring_degree=1`. By default, sequences shorter than 8,192 tokens and the final sampling step use the selected dense backend. |
+
+### Backend benchmark
+
 | Attention Variant    | Time (s) |
 |----------------------|----------|
 | sage_fp8             | 10.75    |
