@@ -265,17 +265,34 @@ This is experimental mode where all type of parallel group can work at a sime ti
 |-------------------|-----|------|-----|
 | Wan2.1 14B T2V    | ✅  | ✅   | ✅  |
 | Wan2.1 14B I2V    | ✅  | ✅   | ✅  |
-| Wan2.2 14B I2V    | ✅  | ✅   | ✅  |
-| Wan2.2 14B I2V    | ✅  | ✅   | ✅  |
 | Wan2.1 1.3B T2V   | ✅  | ✅   | ✅  |
-| Wan2.1 1.3B AR    | ✅  | ❌   | ✅  |
-| Wan2.2 5B TI2V    | ❌  | ✅   | ✅  |
-| Wan2.2 RelayVSR   | ❓  | ❓   | ❓  |
+| Wan2.1 1.3B Causal AR | ✅ | ❌ | ✅ |
 | Wan2.1 Vace       | ✅  | ❌   | ✅  |
 | Wan2.1 Bernini R  | ✅  | ❌   | ✅  |
-| Wan2.2 I2V Hi-Lo  | ✅  | ✅   | ✅  |
-| Wan2.2 T2V Hi-Lo  | ✅  | ✅   | ✅  |
+| Wan2.1 FLF2V      | ❓  | ❓   | ❓  |
+| Wan2.1 Fun Control | ❓ | ❓   | ❓  |
+| Wan2.1 Fun Inpaint | ❓ | ❓   | ❓  |
+| Wan2.1 Camera     | ❓  | ❓   | ❓  |
+| Wan2.1 HuMo       | ❓  | ❓   | ❓  |
+| Wan2.1 FlowRVS    | ❓  | ❓   | ❓  |
+| Wan2.1 SCAIL      | ❓  | ❓   | ❓  |
+| Wan2.1 SCAIL-2    | ❓  | ❓   | ❓  |
+| Wan2.2 5B TI2V    | ❌  | ✅   | ✅  |
+| Wan2.2 14B I2V Hi-Lo | ✅ | ✅ | ✅ |
+| Wan2.2 14B T2V Hi-Lo | ✅ | ✅ | ✅ |
 | Wan2.2 SVI        | ✅  | ✅   | ✅  |
+| Wan2.2 Fun Control | ❓ | ❓   | ❓  |
+| Wan2.2 Camera     | ❓  | ❓   | ❓  |
+| Wan2.2 S2V        | ❓  | ❓   | ❓  |
+| Wan2.2 Animate    | ❓  | ❓   | ❓  |
+| Wan Animate 2     | ❓  | ❓   | ❓  |
+| Wan2.2 WanDancer  | ❓  | ❓   | ❓  |
+| Wan2.2 RelayVSR   | ❓  | ❓   | ❓  |
+| Wan Phantom       | ❓  | ❓   | ❓  |
+| Wan MultiTalk     | ❓  | ❓   | ❓  |
+| Wan InfiniteTalk  | ❓  | ❓   | ❓  |
+| WanMove           | ❓  | ❓   | ❓  |
+| Wan Uni3C         | ❓  | ❓   | ❓  |
 
 
 **Flux**
@@ -351,11 +368,12 @@ This is experimental mode where all type of parallel group can work at a sime ti
 | Anima Preview3     | ✅  | ✅   | ❌  |
 
 
-**Minimax**
+**MiniMax**
 | Model              | USP | FSDP | CFG |
 |--------------------|-----|------|-----|
 | H3 Ref2VA          | ✅  | ✅   | ❌  |
 | H3 FL2VA           | ✅  | ✅   | ❌  |
+| H3 Image           | ✅  | ✅   | ❓  |
 
 
 **PAN2 and MOSS Image**
@@ -382,7 +400,6 @@ This is experimental mode where all type of parallel group can work at a sime ti
 - V = Video
 
 **Notes:**
-- Non standard Wan variant (Phantom, etc...) is not tested
 - CFG parallel for Flux, Hunyuan, is technically supported by Raylight,
   but since these models do not support conditional batches (CFG = 1), enabling it has no effect.
 - MOSS Image USP is code-ready but awaiting parallel runtime validation. Padding rows from the joint and
