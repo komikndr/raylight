@@ -93,6 +93,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 - [Operation](#operation)
 - [Tested GPU](#gpu-architectures)
 - [Supported Models](#supported-models)
+- [FSDP Supported Weight](#fsdp-supported-weight)
 - [Scaled vs Non-Scaled Models](#scaled-vs-non-scaled-models)
 - [Attention](#attention)
 - [Example Wan](#wan-t2v-13b)
@@ -269,6 +270,7 @@ This is experimental mode where all type of parallel group can work at a sime ti
 | Wan2.1 1.3B T2V   | ✅  | ✅   | ✅  |
 | Wan2.1 1.3B AR    | ✅  | ❌   | ✅  |
 | Wan2.2 5B TI2V    | ❌  | ✅   | ✅  |
+| Wan2.2 RelayVSR   | ❓  | ❓   | ❓  |
 | Wan2.1 Vace       | ✅  | ❌   | ✅  |
 | Wan2.1 Bernini R  | ✅  | ❌   | ✅  |
 | Wan2.2 I2V Hi-Lo  | ✅  | ✅   | ✅  |
@@ -300,6 +302,7 @@ This is experimental mode where all type of parallel group can work at a sime ti
 |-----------------------|-----|------|-----|
 | Qwen Image/Edit       | ✅  | ✅   | ✅  |
 | Qwen Image 2.1 (BETA) | ✅  | ❌   | ❓  |
+| MageFlow              | ❓  | ❓   | ❓  |
 | ControlNet            | ✅  | ✅   | ✅  |
 
 
@@ -307,7 +310,9 @@ This is experimental mode where all type of parallel group can work at a sime ti
 | Model             | USP | FSDP | CFG |
 |-------------------|-----|------|-----|
 | Z Image           | ✅  | ✅   | ✅  |
+| Z-Image PixelSpace | ❓ | ❓   | ❓  |
 | Lumina 2          | ✅  | ✅   | ✅  |
+| Ming-Image        | ❓  | ❓   | ❓  |
 
 
 **Hunyuan Video**
@@ -353,10 +358,11 @@ This is experimental mode where all type of parallel group can work at a sime ti
 | H3 FL2VA           | ✅  | ✅   | ❌  |
 
 
-**MOSS Image**
+**PAN2 and MOSS Image**
 | Model        | USP | FSDP | CFG |
 |--------------|-----|------|-----|
-| MOSS Image   | ❓  | ❌   | ❓  |
+| PAN2         | ❓  | ❓   | ❓  |
+| MOSS Image   | ❓  | ❓   | ❓  |
 
 
 **UNet**
@@ -369,7 +375,7 @@ This is experimental mode where all type of parallel group can work at a sime ti
 - ✅ = Supported
 - ❌ = Not currently supported.
 - ✅† = Code-ready, awaiting ControlNet model weights.
-- ❓ = Logically supported, awaiting for testing.
+- ❓ = Unverified for this model and mode.
 - T = Text
 - I = Image
 - A = Audio
@@ -387,6 +393,26 @@ This is experimental mode where all type of parallel group can work at a sime ti
 - Only one ControlNet model per workflow is supported. To apply the same model with
   different images or strengths, use multiple Apply ControlNet (Ray) nodes connected
   to a single Load ControlNet (Ray) node.
+
+## FSDP Supported Weight
+
+Status applies to diffusion checkpoint weights, not attention or compute dtype. ✅ = supported, ❓ = implemented but not GPU-validated, ❌ = unsupported.
+
+| DType | Status |
+|-------|--------|
+| Dense FP32, FP16, BF16 | ✅ |
+| INT8 tensorwise (ConvRot) | ✅ |
+| Scaled FP8 E4M3 | ✅ |
+| FP8 E5M2 | ❓ |
+| MXFP8 | ✅ |
+| NVFP4 | ✅ |
+| Grouped W4A8 INT8 | ✅ |
+| W6A8 INT8 | ✅ |
+| ConvRot W4A4 | ❓ |
+| AWQ W4A16 | ❓ |
+| SVDQuant W4A4 | ❓ |
+| Grouped W3A8 / W5A8 | ❌ |
+| GGUF | ❌ |
 
 ## Attention
 
