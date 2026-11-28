@@ -7,6 +7,12 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 ## UPDATE
 
+### Multi-GPU validation on `dev`
+
+- **Sequence parallelism (USP):** MiniMax H3, Qwen Image 2.1, Anima, and Krea2 completed representative two-GPU runs during integration of the uneven-padding changes. The Anima run did not use LLLite.
+- **Quantized FSDP loading:** MiniMax and Krea2 runs covered INT8 ConvRot, scaled FP8, MXFP8, NVFP4, W4A8, and W6A8. MiniMax H3 Ref2VA also ran with Ring2, CPU offload, and a speed LoRA. ConvRot W4A4, AWQ W4A16, and SVDQuant W4A4 remain experimental without GPU validation.
+- **Model limits:** PAN2 and MOSS-Image support is partial. Ming-Image, Z-Image PixelSpace, MageFlow, and Wan RelayVSR USP are experimental. Use CFG parallelism for **Wan 2.2 5B TI2V**; USP is disabled for that variant after a visual regression.
+
 <details><summary><strong>Click to expand changelog</strong></summary>
 
 - Experimental USP paths: Ming-Image, Z-Image PixelSpace, MageFlow, and Wan 2.2 RelayVSR. RelayVSR distributes spatial rows within each temporal chunk and retains native window attention.
